@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P.A.R.</title>
+    <link rel="icon" type="image/webp" href="/favicon.webp">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css" integrity="sha512-Evv84Mr4kqVGRNSgIGL/F/aIDqQb7xQ2vcrdIwxfjThSH8CSR7PBEakCr51Ck+w+/U6swU2Im1vVX0SVk9ABhg==" crossorigin="anonymous" referrerpolicy="no-referrer">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <!-- Navbar -->
+    <nav class="navbar">
+        <div class="navbar-container">
+            <div class="navbar-brand">P.A.R.</div>
+            <ul class="navbar-menu">
+                <li><a href="/livestream" class="nav-link" data-tab="livestream">Livestream</a></li>
+                <li><a href="/upload" class="nav-link" data-tab="upload">Upload</a></li>
+                <li><a href="/gallery" class="nav-link" data-tab="gallery">Gallery</a></li>
+                <li><a href="/about" class="nav-link" data-tab="about">About</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <!-- Livestream Tab -->
+        <section id="livestream" class="tab-content active">
+            <div class="livestream-container">
+            </div>
+            <p class="livestream-links">
+                <a href="/upload" class="nav-link" data-tab="upload">Upload your own pixel art</a>, stay here to watch, <a href="/gallery" class="nav-link" data-tab="gallery">explore the gallery</a>, or <a href="/about" class="nav-link" data-tab="about">find out more about P.A.R.</a>.
+            </p>
+        </section>
+
+        <!-- Upload Tab -->
+        <section id="upload" class="tab-content">
+            <div id="uploadRotatePrompt" class="upload-rotate-prompt hidden" aria-hidden="true">
+                <div class="upload-rotate-card">
+                    <div class="upload-rotate-icon" aria-hidden="true">
+                        <i class="fa-solid fa-mobile-screen upload-rotate-phone"></i>
+                        <i class="fa-solid fa-arrows-spin upload-rotate-arrows"></i>
+                    </div>
+                    <p>Rotate your phone for better experience</p>
+                </div>
+            </div>
+            <div class="upload-container">
+                <!-- Pixel Art Maker -->
+                <div class="pixel-art-maker">
+                    <div id="pixelGrid" class="pixel-grid"></div>
+                    <div class="art-controls">
+                        <div class="control-group" role="radiogroup" aria-label="Tool">
+                            <span class="control-label">Tool</span>
+                            <button type="button" class="tool-btn active" data-tool="pencil" aria-label="Pencil" title="Pencil"><i class="fa-solid fa-pencil"></i></button>
+                            <button type="button" class="tool-btn" data-tool="line" aria-label="Line" title="Line"><i class="fa-solid fa-slash"></i></button>
+                            <button type="button" class="tool-btn" data-tool="fill" aria-label="Fill" title="Fill"><i class="fa-solid fa-fill-drip"></i></button>
+                        </div>
+                        <div class="control-group" aria-label="Pen size">
+                            <span class="control-label">Size</span>
+                            <input type="range" id="penSizeSlider" class="pen-size-slider" min="1" max="20" value="1" aria-label="Pen size">
+                            <span id="penSizeValue" class="pen-size-value">1</span>
+                        </div>
+                        <div class="control-group" aria-label="History">
+                            <span class="control-label">History</span>
+                            <button id="undoBtn" type="button" class="tool-btn" aria-label="Undo" title="Undo"><i class="fa-solid fa-rotate-left"></i></button>
+                            <button id="redoBtn" type="button" class="tool-btn" aria-label="Redo" title="Redo"><i class="fa-solid fa-rotate-right"></i></button>
+                        </div>
+                        <div class="control-group" role="radiogroup" aria-label="Color">
+                            <span class="control-label">Color</span>
+                            <button type="button" class="color-btn color-blue active" data-color="blue" aria-label="Blue" title="Blue"></button>
+                            <button type="button" class="color-btn color-black" data-color="black" aria-label="Black" title="Black"></button>
+                            <button type="button" class="color-btn color-dither" data-color="dither" aria-label="Dither" title="Dither"><i class="fa-solid fa-chess-board" style="color: #02b2d9;"></i></button>
+                        </div>
+                        <button id="clearPixels" class="clear-button" type="button">Clear</button>
+                    </div>
+                </div>
+
+                <!-- Clear Confirmation Modal -->
+                <div id="clearConfirmModal" class="upload-modal hidden">
+                    <div class="modal-content name-modal-content">
+                        <h2 class="name-modal-title">Clear the canvas?</h2>
+                        <p class="clear-modal-text">This will erase your pixel art. This can be undone with the undo.</p>
+                        <div class="name-modal-actions">
+                            <button id="cancelClearModal" type="button" class="queue-modal-button queue-modal-cancel">Cancel</button>
+                            <button id="confirmClearModal" type="button" class="queue-modal-button clear-modal-confirm">Clear</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="upload-actions">
+                    <button id="uploadBtn" class="upload-button">Upload Image</button>
+                    <button id="sendQueueBtn" class="upload-button queue-button">Send to P.A.R. Queue</button>
+                </div>
+                <p id="queueStatus" class="queue-status" aria-live="polite"></p>
+                <input type="file" id="fileInput" accept="image/*,.heic,.heif" style="display: none;">
+
+                <!-- Crop Modal -->
+                <div id="cropModal" class="upload-modal hidden">
+                    <div class="modal-content">
+                        <!-- Action Buttons -->
+                        <div class="modal-actions">
+                            <button id="confirmCrop" class="confirm-button" title="Confirm Crop">✓</button>
+                            <button id="cancelCrop" class="cancel-button" title="Cancel Crop">✕</button>
+                        </div>
+
+                        <!-- Crop Container -->
+                        <div class="crop-frame-container">
+                            <canvas id="cropCanvas" class="crop-canvas"></canvas>
+                        </div>
+
+                        <!-- Crop Instructions -->
+                        <div class="crop-instructions">
+                            <p>Drag to move • Scroll to zoom</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Upload Preview Modal -->
+                <div id="uploadModal" class="upload-modal hidden">
+                    <div class="modal-content">
+                        <!-- Action Buttons -->
+                        <div class="modal-actions">
+                            <button id="confirmUpload" class="confirm-button" title="Confirm Upload">✓</button>
+                            <button id="cancelUpload" class="cancel-button" title="Cancel Upload">✕</button>
+                        </div>
+
+                        <!-- Preview Grid -->
+                        <div id="previewGrid" class="preview-grid"></div>
+
+                        <!-- Black Point Slider -->
+                        <div class="slider-container">
+                            <label for="blackPointSlider">Black Point: <span id="blackPointValue">127</span></label>
+                            <input type="range" id="blackPointSlider" min="0" max="255" value="127" class="slider">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Name Modal -->
+                <div id="nameModal" class="upload-modal hidden">
+                    <div class="modal-content name-modal-content">
+                        <h2 class="name-modal-title">Add a name for your picture</h2>
+                        <input type="text" id="pictureName" class="name-modal-input" placeholder="Enter a name..." maxlength="100" autocomplete="off">
+                        <p id="pictureNameError" class="name-modal-error hidden">A name is required.</p>
+                        <div id="nameModalPreview" class="preview-grid name-modal-preview" aria-hidden="true"></div>
+                        <div class="name-modal-actions">
+                            <button id="cancelNameModal" class="queue-modal-button queue-modal-cancel">Cancel</button>
+                            <button id="confirmNameModal" class="queue-modal-button queue-modal-confirm">Upload</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Gallery Tab -->
+        <section id="gallery" class="tab-content">
+            <div class="gallery-container" id="galleryContainer"></div>
+
+            <!-- Gallery Item Modal -->
+            <div id="galleryItemModal" class="upload-modal hidden">
+                <div class="modal-content gallery-item-modal-content">
+                    <div class="modal-actions">
+                        <button id="closeGalleryModal" class="cancel-button" title="Close">✕</button>
+                    </div>
+                    <p id="galleryModalName" class="gallery-modal-name"></p>
+                    <canvas id="galleryModalImage" class="gallery-modal-image"></canvas>
+                    <img id="galleryModalSnapshot" class="gallery-modal-snapshot hidden" alt="P.A.R. photo">
+                    <p id="galleryModalNoSnapshot" class="gallery-modal-no-snapshot hidden">No P.A.R. image available.</p>
+                    <p id="galleryModalPending" class="gallery-modal-pending hidden">In progress &mdash; <a id="galleryModalLivestreamLink" href="/livestream">view livestream</a></p>
+                </div>
+            </div>
+        </section>
+
+        <!-- About Tab -->
+        <section id="about" class="tab-content">
+            <div class="about-container">
+                <!-- Written about section -->
+                <section class="about-section">
+                    <h2>About P.A.R.</h2>
+                    <p>P.A.R. is a robot that draws 37x18 monochrome pixel art by flipping <i>squisks</i> (square discs).</p>
+                    <p>It was designed to provide a unique art experience, letting the artist watch their art get made physically, through an interesting process.</p>
+                </section>
+
+                <!-- FAQ section -->
+                <section class="about-faq">
+                    <h2>FAQ</h2>
+                    <div class="faq-item">
+                        <h3>What does P.A.R. stand for?</h3>
+                        <p>P.A.R. stands for <b>P</b>ixel <b>A</b>rt <b>R</b>obot.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h3>How much does it cost to submit art to P.A.R.??</h3>
+                        <p>Submitting art to P.A.R. is completely free. There are no fees or ads.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h3>How does P.A.R. work?</h3>
+                        <p>P.A.R. is basically a CNC machine with a special toolhead. It has a color sensor, a servo motor, and a pin, or pusher. The robot first scans the grid with the color sensor. Then it grabs the next pixel art piece from the server. Once it has the art, it starts flipping squisks. Here's an animation of how a squisk is flipped:</p>
+                        <video class="faq-video" controls width="100%" height="auto" style="padding-top: 1rem;">
+                            <source src="/flip_animation.mp4" type="video/mp4">
+                            Your browser does not support the video tag.
+                        </video>
+                        <p> Next, it rescans the grid to check which squisks it failed to flip. It finally fixes any errors it finds.</p>
+                    </div>
+                    <div class="faq-item">
+                        <h3>Can I build it myself?</h3>
+                        <p>Yes! If you want to subject yourself to weeks or months of pain and suffering, you can access the <a href="https://cad.onshape.com/documents/f53ad3e9ce30d5497e995b42" target="_blank">full CAD model</a> for free, and 3D print all the parts. You'll also need all of the items on <a href="https://docs.google.com/spreadsheets/d/1KDJ_dTGv3_-FfAlu_G02fjJiUnLSrUQJU5qLMHbVO0g/edit?gid=0#gid=0">this material list.</a> You can find the code <a href="https://github.com/Z-Coder672/P.A.R.">on my GitHub</a>.<br><br> Disclaimer: the material list and other documents that regard building a P.A.R. are not necesarily complete yet. I am not responsible for any harm or damage caused by attempting to build a P.A.R.</p>
+                    </div>
+                </section>
+            </div>
+        </section>
+    </main>
+
+    <script src="/script.js"></script>
+</body>
+</html>

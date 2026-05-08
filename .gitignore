@@ -1,0 +1,22 @@
+# Secrets & environment
+.env
+**/.env
+**/env.h
+*.dmg
+
+# macOS
+.DS_Store
+
+# Runtime data
+queue.txt
+gallery/*/
+locks/*.lock
+
+# Logs
+stream.log
+YT-Streamer/stream.log
+
+# Python virtualenv & caches
+YT-Streamer/venv/
+**/venv/
+**/__pycache__/

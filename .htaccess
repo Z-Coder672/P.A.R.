@@ -1,0 +1,21 @@
+<FilesMatch "^(\.env|queue\.txt|stream\.log|router\.php|\.DS_Store|snapshot-pending\.flag)$">
+    Require all denied
+</FilesMatch>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Block the locks directory
+    RewriteRule ^locks(/|$) - [F,L]
+
+    # If the requested URI is exactly /gallery or /gallery/, route to SPA
+    RewriteRule ^gallery/?$ index.html [L]
+
+    # If the requested file or directory exists, serve it as-is
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Otherwise, route all requests to index.html
+    RewriteRule ^ index.html [L]
+</IfModule>
