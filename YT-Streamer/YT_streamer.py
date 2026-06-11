@@ -447,11 +447,19 @@ def _list_avfoundation_devices() -> tuple[list[tuple[str, str]], list[tuple[str,
     expected, so we ignore the return code and parse stderr. Each device line
     looks like `[AVFoundation indev @ 0x..] [1] Brio 100`; the FIRST bracketed
     integer is the indev handle, the SECOND is the device index we want."""
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-f", "avfoundation",
-         "-list_devices", "true", "-i", ""],
-        capture_output=True, text=True, timeout=15,
-    )
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=15,
+        )
+    except FileNotFoundError as e:
+        # The camera is fine; ffmpeg itself isn't on PATH. Surface that plainly
+        # so it doesn't get logged as "no device matching CAMERA_NAME found".
+        raise RuntimeError(
+            "ffmpeg not found on PATH — install it (e.g. `brew install ffmpeg`). "
+            "The camera cannot be enumerated without it."
+        ) from e
     video: list[tuple[str, str]] = []
     audio: list[tuple[str, str]] = []
     section: str | None = None
@@ -499,8 +507,8 @@ def _refresh_camera() -> str | None:
 
     vmatch = _match_device(video, CAMERA_NAME)
     if vmatch is None:
-        log.debug(f"[camera] no video device starting with {CAMERA_NAME!r}; "
-                  f"present: {[n for _, n in video]}")
+        log.warning(f"[camera] no device matching {CAMERA_NAME!r} found "
+                    f"(present: {[n for _, n in video]})")
         return None
     vidx, vname = vmatch
 
@@ -536,8 +544,8 @@ def camera_keeper() -> None:
     while True:
         if not _recording_active.is_set():
             try:
-                if _refresh_camera() is None:
-                    log.warning(f"[camera] no device matching {CAMERA_NAME!r} found")
+                _refresh_camera()  # logs its own failure reason (missing ffmpeg
+                                   # vs. missing camera); no extra line needed
             except Exception as e:
                 log.warning(f"[camera] keeper probe error: {e!r}")
         time.sleep(CAMERA_POLL_INTERVAL)
