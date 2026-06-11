@@ -332,7 +332,14 @@ void drainResponses() {
         lastErrorCmd[0] = '\0';
       }
     } else if (resp.startsWith("ALARM")) {
-      plog::logf("GRBL ALARM: %.40s", resp.c_str());
+      // Log the command GRBL was processing when it alarmed — for ALARM:2
+      // (soft-limit) this is the move whose target left the envelope, which is
+      // exactly what we need to pinpoint the offending coordinate.
+      if (qHead != qTail) {
+        plog::logf("GRBL ALARM: %.16s on '%.18s'", resp.c_str(), cmdTexts[qHead]);
+      } else {
+        plog::logf("GRBL ALARM: %.34s (queue empty)", resp.c_str());
+      }
       if (inStartupPhase) {
         grblStartupFault = true;
         return;
@@ -509,6 +516,16 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
 const float SCAN_OFFSET_X = -23.0f;
 const float SCAN_OFFSET_Y = 4.0f;
 
+// The sensor sits +SCAN_OFFSET_Y in Y from the flip head, so reading the top
+// bitmap row (grid Y ≈ -1.895) would command the gantry to ≈ +2.105 — past the
+// Y=0 soft-limit edge, which GRBL rejects with ALARM:2 ($20=1). Clamp every scan
+// target's Y to stay just inside the envelope; the top row then reads ~2 mm low
+// (still well within the ~16 mm disc), every lower row is strongly negative and
+// untouched. NOTE: raising $131 does NOT help — that extends the -Y end, while
+// this overrun is on the +Y (Y=0) end, which GRBL caps at 0 regardless of $131.
+const float SCAN_Y_MAX = -0.05f;
+static inline float clampScanY(float y) { return y > SCAN_Y_MAX ? SCAN_Y_MAX : y; }
+
 // Squisk faces: 1 = blue (#40ccdb), 0 = black.
 // Tiny ternary transformer (~99.85% test acc on 5-step averaged RGBC). Replaces
 // the prior B/C ratio threshold; weights live in model_weights.h, regenerate
@@ -536,14 +553,14 @@ void scanGrid() {
   // between rows happens at an X soft-limit (handled by moveToYSafe).
   bool ltr = true;
   moveToYSafe(grid[0][0].x + SCAN_OFFSET_X,
-              grid[0][0].y + SCAN_OFFSET_Y);
+              clampScanY(grid[0][0].y + SCAN_OFFSET_Y));
   for (int y = 0; y < GRID_H; y++) {
     int startCol = ltr ? 0 : GRID_W - 1;
     int endCol = ltr ? GRID_W - 1 : 0;
     int step = ltr ? +1 : -1;
     for (int x = startCol; x != endCol + step; x += step) {
       moveTo(grid[y][x].x + SCAN_OFFSET_X,
-             grid[y][x].y + SCAN_OFFSET_Y);
+             clampScanY(grid[y][x].y + SCAN_OFFSET_Y));
       waitForMotion();
 
       unsigned long r, g, b, c;
@@ -556,7 +573,7 @@ void scanGrid() {
       // skew the rest of the scan.
       if (y == 8) rehome();
       moveToYSafe(grid[y + 1][endCol].x + SCAN_OFFSET_X,
-                  grid[y + 1][endCol].y + SCAN_OFFSET_Y);
+                  clampScanY(grid[y + 1][endCol].y + SCAN_OFFSET_Y));
       ltr = !ltr;
     }
   }
