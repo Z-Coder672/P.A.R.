@@ -21,5 +21,11 @@ if ($secret === '' || !hash_equals($secret, $provided)) {
     exit;
 }
 
-touch(__DIR__ . '/snapshot-pending.flag');
+// Write the gallery id into the flag so snapshot-next.php can hand it to the
+// poller (which uploads to gallery/<id>/image.jpg). The Arduino POSTs id=<N>
+// after its check pass; an absent/invalid id falls back to the legacy empty
+// flag (IDless ad-hoc capture).
+$id = $_POST['id'] ?? '';
+$contents = (is_string($id) && ctype_digit($id)) ? $id : '';
+file_put_contents(__DIR__ . '/snapshot-pending.flag', $contents);
 http_response_code(204);

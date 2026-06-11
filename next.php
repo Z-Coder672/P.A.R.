@@ -141,7 +141,10 @@ if (mkdir($entryDir, 0777, true)) {
             json_encode(['name' => $itemName, 'bitmap' => $bitmapBase64], JSON_UNESCAPED_UNICODE)
         );
         header('X-Gallery-Id: ' . $galleryIndex);
-        file_put_contents(__DIR__ . '/snapshot-pending.flag', (string)$galleryIndex);
+        // Snapshot flag is NOT armed here — the Arduino POSTs
+        // /snapshot-request.php with the gallery id after its check (fix)
+        // pass finishes, so the photo captures the corrected board instead
+        // of a mid-draw state.
         // Stream-restart flag: YT-Streamer polls this to retitle the
         // YouTube broadcast with the art-piece name when a new print
         // starts. Stale flags (>10 min) get dropped on the next write or
