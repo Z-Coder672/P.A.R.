@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-P.A.R. is a website for a custom 37×18 pixel LED matrix display. Users draw pixel art (or upload/crop photos), send them to a queue, and an Arduino device polls the queue and displays each image. A YouTube livestream shows the device live.
+P.A.R. is a website for a custom 37×18 pixel LED matrix display. Users draw pixel art (or upload/crop photos), send them to a queue, and an Arduino device polls the queue and displays each image. The Mac Mini records the camera feed for each print and uploads the recording to YouTube; the website's Latest tab embeds the most recent upload and the gallery modal embeds each print's recording.
+
+## Repo
+
+GitHub repo name has a **trailing dot**: `Z-Coder672/P.A.R.` Git URL is `https://github.com/Z-Coder672/P.A.R..git` (literal `.` then `.git`). `gh` CLI is not installed on this machine — use raw `git` + `curl` for repo checks.
 
 ## Running locally
 
@@ -12,42 +16,53 @@ P.A.R. is a website for a custom 37×18 pixel LED matrix display. Users draw pix
 php -S localhost:8000 router.php
 ```
 
-`router.php` is a PHP dev-server router: it handles PHP files directly, serves static files as-is, and falls back to `index.html` for client-side routes (`/livestream`, `/upload`, `/gallery`).
+`router.php` is a PHP dev-server router: it handles PHP files directly, serves static files as-is, and falls back to `index.html` for client-side routes (`/latest`, `/upload`, `/gallery`, `/about`).
 
 In production, Apache + `mod_rewrite` in `.htaccess` handles the same routing.
 
 ## Architecture
 
 ### Frontend (SPA)
-`index.html` + `script.js` — a single-page app with three tabs (Livestream, Upload, Gallery) routed via `window.history.pushState`. No build step, no framework; pure vanilla JS.
+`index.html` + `script.js` — a single-page app with four tabs (Latest, Upload, Gallery, About) routed via `window.history.pushState`. No build step, no framework; pure vanilla JS. The Latest tab embeds the most recent upload by reading `latest-video.php` (server-stored, written by `stream-video-id.php`). No YT Data API call from the Latest tab.
 
 ### PHP backend endpoints
 | File | Method | Purpose |
 |---|---|---|
 | `enqueue.php` | POST | Accepts `{item: base64, name: string}`, appends to `queue.txt`. Max 20 items (429 `queue_full`); duplicate bitmaps rejected (409 `duplicate_queue_item`); name truncated to 100 chars. |
-| `next.php` | GET | Pops first item from `queue.txt`, creates `gallery/<N>/pending.json`, sets `X-Gallery-Id` response header, writes `snapshot-pending.flag` containing `<N>`, returns base64 bitmap (called by Arduino) |
+| `next.php` | POST | Pops first item from `queue.txt`, creates `gallery/<N>/pending.json`, sets `X-Gallery-Id` response header, writes `snapshot-pending.flag` containing `<N>` and `stream-pending.flag` containing `{"id":N,"name":"..."}`, returns base64 bitmap (called by Arduino). **Must be POST**, not GET — Cloudflare/intermediates may silently retry GETs to origin on connect-fail or 5xx, and each retry would pop another queue item the Arduino never sees, leaving orphan `gallery/<N>/pending.json` entries. |
 | `complete.php` | GET | Renames `gallery/<N>/pending.json` → `info.json` once Arduino confirms display (`?id=N`) |
-| `gallery.php` | GET | Returns JSON list of `gallery/<N>/` entries — each has `id`, `pending`, `bitmap`, `name`, and `image` (URL to `image.jpg`/`.png` with `?v=<mtime>` cache-bust, or `null`) |
-| `livestream-api.php` | GET | Queries YouTube Data API for live stream from the P.A.R. channel |
+| `gallery.php` | GET | Returns JSON list of `gallery/<N>/` entries — each has `id`, `pending`, `bitmap`, `name`, `image` (URL to `image.jpg`/`.png` with `?v=<mtime>` cache-bust, or `null`), and `video_id` (11-char YT id of the uploaded recording for this print, or `null`) |
+| `video-status.php` | GET | `?id=<videoId>` → `{exists, live, state}` via YT Data API `videos.list`. Used by the gallery modal and the Latest tab to decide whether to embed: skip when the video doesn't exist (deleted) or is still `live` (legacy broadcast rows). |
 | `snapshot-request.php` | POST | Legacy ad-hoc trigger — touches `snapshot-pending.flag` empty (auth: `X-Snapshot-Secret`). The normal flow uses `next.php` to write the flag with a gallery id; this endpoint is only useful for IDless captures. |
 | `snapshot-next.php` | POST | Atomically pops `snapshot-pending.flag`, returns `{ok, entry, id}` where `id` is the gallery id from the flag's contents (or `null` for legacy/empty flags). Auth required. |
 | `snapshot-clear.php` | POST | Unconditionally removes `snapshot-pending.flag` (auth required) |
+| `stream-start.php` | POST | Atomically pops `stream-pending.flag`, returns `{ok, id, name}`. Flags older than 10 min are deleted and treated as empty so a queued-but-never-picked-up print can't trigger a much-later recording. Auth: `SNAPSHOT_SECRET`. |
+| `stream-end-set.php` | POST | `{id}` → writes `stream-end.flag` containing `{"id":N}`. Called by the Arduino after its 10-min post-display linger to tell the Mac Mini to stop recording. Stale-flag prophylactic: an existing flag older than 10 min is removed first. Auth: `SNAPSHOT_SECRET`. |
+| `stream-end.php` | POST | Atomically pops `stream-end.flag`, returns `{ok, id, entry}`. Flags older than 10 min are deleted and treated as empty (`204`). Auth: `SNAPSHOT_SECRET`. |
+| `stream-video-id.php` | POST | `{id, video_id}` → merges `video_id` (11-char `[A-Za-z0-9_-]`) into `gallery/<id>/pending.json` or `info.json`, AND atomically rewrites `latest-video.json` so the Latest tab can find the newest upload without scanning the gallery or hitting the YT Data API. Called by YT-Streamer right after `videos.insert` completes. Auth: `SNAPSHOT_SECRET`. |
+| `latest-video.php` | GET | Returns `{video_id, name, id}` from `latest-video.json`, or `204` when no upload has happened yet. No YT Data API call — the answer is whatever YT-Streamer last reported. Public (the Latest tab fetches this on every page load). |
 
 ### Bitmap format
 37×18 = 666 pixels packed as bits into **84 bytes** (the last byte holds 6 padding bits in its low half), transmitted as base64 (112 chars). Bit 1 = cyan (#02b2d9, "on"), bit 0 = black ("off"). The bit order within each byte is MSB-first.
 
 ### Data storage
 - `queue.txt` — one JSON entry per line: `{"item":"<base64>","name":"<name>"}`
-- `gallery/<N>/pending.json` — `{"name":"...","bitmap":"<base64>"}` (present while item is awaiting confirmation)
+- `gallery/<N>/pending.json` — `{"name":"...","bitmap":"<base64>","video_id":"<11-char>"?}` (present while item is awaiting confirmation; `video_id` added asynchronously by `stream-video-id.php` after YT-Streamer finishes uploading the recording)
 - `gallery/<N>/info.json` — same schema as pending.json; renamed from pending.json by `complete.php` once confirmed
 - `gallery/<N>/image.jpg` (or `.png`) — real photo of the LED matrix displaying entry `N`, captured by YT-Streamer and SFTP'd in
 - `snapshot-pending.flag` — exists ⇒ a snapshot is owed; file contents = the gallery id the snapshot belongs to (empty for legacy/ad-hoc captures)
+- `stream-pending.flag` — exists ⇒ a per-print recording should be started; file contents = JSON `{"id":N,"name":"..."}`. Written by `next.php`, popped by `stream-start.php`, expires after 10 min.
+- `stream-end.flag` — exists ⇒ an in-flight recording should be stopped; file contents = JSON `{"id":N}`. Written by `stream-end-set.php` (called by Arduino), popped by `stream-end.php` (called by YT-Streamer), expires after 10 min.
+- `latest-video.json` — `{"id":N,"video_id":"...","name":"...","ts":<unix>}` of the most recent upload YT-Streamer reported. Rewritten atomically by `stream-video-id.php` on every upload; read by `latest-video.php` for the Latest tab. The Latest tab reads only this file — it never asks the YT Data API for the latest video id.
 - `locks/` — file-based concurrency slots (`enqueue.N.lock`, `next.N.lock`); up to 5 concurrent requests per endpoint
 
 ### Snapshot ↔ gallery flow
-End-to-end: `next.php` pops a queue item → creates `gallery/<N>/` + `pending.json` → writes `snapshot-pending.flag` with content `<N>` → returns bitmap with `X-Gallery-Id: <N>` header. Arduino displays for 1s, then `GET /complete.php?id=<N>` (renames `pending.json` → `info.json`). YT-Streamer's snapshot poller hits `snapshot-next.php` every 5s, gets `{id: <N>}`, grabs an RTSP frame via ffmpeg, SFTPs it to `gallery/<N>/image.jpg` (creating that subdir over SFTP if missing). `gallery.php` exposes the photo via `image` URL; the modal renders the cyan bitmap + the real photo side-by-side, falling back to "No P.A.R. image available." when no photo exists yet.
+End-to-end: `next.php` pops a queue item → creates `gallery/<N>/` + `pending.json` → writes `snapshot-pending.flag` with content `<N>` → returns bitmap with `X-Gallery-Id: <N>` header. Arduino displays for 1s, then `GET /complete.php?id=<N>` (renames `pending.json` → `info.json`). YT-Streamer's snapshot poller hits `snapshot-next.php` every 5s, gets `{id: <N>}`, grabs a frame from the local USB webcam via ffmpeg avfoundation — or, while a print is recording, copies the recorder's live JPEG sidecar (`/tmp/recordings/latest_frame.jpg`), since a USB cam allows only one opener — SFTPs it to `gallery/<N>/image.jpg` (creating that subdir over SFTP if missing). `gallery.php` exposes the photo via `image` URL; the modal renders the cyan bitmap + the real photo side-by-side, falling back to "No P.A.R. image available." when no photo exists yet.
 
 **Timing caveat:** Arduino display duration is 1s but the snapshot poller interval is 5s + ffmpeg grab takes ~1s. With a busy queue, the captured photo can be of a *later* entry than the gallery id it gets attached to. Workarounds (not implemented): bump display duration; have Arduino wait until `image.jpg` for that id appears.
+
+### Per-print recording flow
+Every print gets its own YouTube upload titled `"<name>" printing - P.A.R.` (no timestamp). End-to-end: `next.php` writes `stream-pending.flag` with `{id,name}` → YT-Streamer's record orchestrator hits `stream-start.php` every `STREAM_POLL_INTERVAL`s, gets `{id,name}`, spawns ffmpeg recording the local USB webcam (avfoundation, **video-only — never audio**) → `/tmp/recordings/<id>_<ts>.mp4` (fragmented mp4, 1.5h hard cap via `-t` on the input; a second output writes the ~1fps `latest_frame.jpg` sidecar) → polls `stream-end.php` every interval; after the Arduino's 10-min post-display linger it POSTs `stream-end-set.php` which writes `stream-end.flag` with `{id}` → YT-Streamer sees the stop signal, sends `q\n` to ffmpeg's stdin for a clean moov flush, then hands the mp4 to a background uploader thread (so the *next* print can start recording immediately) → uploader calls `videos.insert` with `resumable=True`, gets the 11-char video id back, POSTs `{id, video_id}` to `stream-video-id.php` (merges into `gallery/<id>/{pending,info}.json`), and unlinks the local mp4. The gallery modal and the Latest tab both read `video_id` from `gallery.php`, ask `video-status.php` if it exists / isn't still processing, and embed an `<iframe>` of the recording. If the upload fails the mp4 stays in `/tmp/recordings/` for manual recovery.
 
 ### Environment (`.env`)
 ```
@@ -59,11 +74,30 @@ Format uses ` = ` with spaces, parsed line-by-line in PHP (not `parse_ini_file()
 
 ## YT-Streamer (Python)
 
-`YT-Streamer/YT_streamer.py` — a 24/7 process that:
-1. Streams RTSP from a Eufy camera to YouTube Live via ffmpeg (main thread, auto-reconnects)
-2. Polls `snapshot-next.php` every 5 seconds for pending snapshot requests (background thread), grabs a frame with ffmpeg, and uploads it to the server via SFTP
+`YT-Streamer/YT_streamer.py` — a Mac Mini daemon that records per-print video and uploads to YouTube. Three concurrent subsystems:
 
-Entirely configured via environment variables (`RTSP_URL`, `YT_STREAM_KEY`, `SNAPSHOT_SECRET`, `SNAPSHOT_REQUEST_URL`, `SFTP_HOST`, `SFTP_USER`, `SFTP_REMOTE_DIR`, `SFTP_PORT` (default 22), `SFTP_KEY_PATH` (default `~/.ssh/id_rsa`), `SFTP_PASSWORD` (optional; key auth used if unset)).
+1. **Record orchestrator** (`record_orchestrator`): polls `stream-start.php` every `STREAM_POLL_INTERVAL` seconds for a `(gallery_id, name)`. On a hit, verifies the camera, spawns ffmpeg recording the local USB webcam (avfoundation, **video-only — `-an` is hard-coded, audio is never captured**) → `/tmp/recordings/<id>_<ts>.mp4` with fragmented-mp4 muxing (`+empty_moov+default_base_moof+frag_keyframe+faststart`) and a 1.5h `-t` cap, **plus a second output writing `/tmp/recordings/latest_frame.jpg` at ~1fps** (the snapshot poller's no-contention source). Then polls `stream-end.php` until the matching stop signal arrives or the cap fires. Graceful stop: `q\n` on stdin → SIGTERM → SIGKILL. The finished mp4 is handed to a *background* uploader thread (so the next print can start recording immediately while a slow upload is still in flight); the uploader calls `videos.insert` with `resumable=True, chunksize=8MiB`, POSTs the resulting 11-char id to `stream-video-id.php`, then unlinks the mp4. Failed uploads stay on disk for manual recovery.
+2. **Snapshot poller** (`poll_snapshot_queue`): polls `snapshot-next.php` every 5 s, grabs a webcam frame with ffmpeg avfoundation (or copies `latest_frame.jpg` while a recording holds the cam), SFTPs to `gallery/<id>/image.jpg`.
+3. **Moderation poller** (`poll_mod_queue`): polls the mod queue, runs each submission through two Claude SDK calls (image + name).
+
+YouTube auth uses OAuth 2.0 with the `youtube` scope (covers `videos.insert`). Client secrets and refresh token live in an encrypted DMG vault (`YT_streamer_vault.dmg`) protected by a Keychain-stored passphrase — see `_vault_*` and `get_youtube_service`. Auth is lazy: the vault is only mounted when the first recording arrives.
+
+Configured via environment variables: `CAMERA_NAME` (default `Brio 100` — matched case-insensitively against the *start* of each avfoundation video-device name), `CAMERA_FRAMERATE` (default 30), `CAMERA_POLL_INTERVAL` (keeper re-scan cadence, default 15), `SNAPSHOT_SECRET`, `SNAPSHOT_REQUEST_URL`, `STREAM_START_URL`, `STREAM_END_URL`, `STREAM_VIDEO_ID_URL`, `STREAM_POLL_INTERVAL` (default 10), `SFTP_HOST`, `SFTP_USER`, `SFTP_REMOTE_DIR` (chrooted; empty string is valid), `SFTP_PORT` (default 21), `SFTP_PASS_FILE` (default `SFTP-pass.txt`, read from the vault), plus the moderation block (`MOD_QUEUE_URL`, `MOD_ACTION_URL`, `MOD_SECRET`, SMTP creds, etc.).
+
+**Camera is a local USB webcam via ffmpeg avfoundation, NOT RTSP** (refactored away; the RTSP version is archived at `YT-Streamer/archive/`). Gotchas, do not re-litigate:
+- **No audio, ever** — the user explicitly never wants audio broadcast. `build_record_cmd` hard-codes `-an`; the input is the bare video index. Don't add audio capture.
+- **A USB webcam allows only ONE opener at a time** (unlike RTSP's concurrent readers). The recording owns the device, so the snapshot path must NOT open it during a recording — it copies the recorder's `latest_frame.jpg` sidecar instead (`_read_live_frame`, PIL-validated against torn reads). The orchestrator unlinks the sidecar on stop so stale frames aren't served.
+- **Device discovery** = `ffmpeg -f avfoundation -list_devices true -i ""` (writes the list to **stderr** and exits non-zero — both expected). `_refresh_camera` parses it for the video device whose name starts with `CAMERA_NAME` and caches its index; the keeper re-runs this every `CAMERA_POLL_INTERVAL`s whenever not recording (no "warm knocks" — that RTSP-era path is gone). Enumerating doesn't open the cam, so the privacy LED stays off and it never contends with a recording.
+- **Test with `./venv/bin/python`** (the venv has `requests`/`PIL`/etc.; system `python3` does not). Importing `YT_streamer` runs the required-env check, so the `.env` must be populated.
+
+**Snapshot upload is FTPS, not SFTP, even though the env var names start with `SFTP_`.** The env-var prefix is historical — the actual transport is `ftplib.FTP_TLS` (explicit TLS on port 21). Reasons, all hit during prior debugging:
+
+- The Site5 *addon* FTP account `yt-streamer@par.zimmzimm.com` is FTP/FTPS only — SSH/SFTP on :22 only accepts the main cPanel user (`zcoder`), so paramiko-as-`yt-streamer` always gets `Authentication failed` regardless of password. cPanel → FTP Accounts → *Configure FTP Client* confirms the documented client config is FTPS on :21, not SFTP.
+- `SFTP_HOST` must be the Site5 origin (`shared187.accountservergroup.com`), NOT `par.zimmzimm.com` or `ftp.zimmzimm.com`. Both customer-facing hostnames resolve to Cloudflare (104.21.x / 172.67.x), which proxies 80/443 but does NOT tunnel 21 or 22 — connections to those ports silently time out after ~60s (`Errno 60 Operation timed out`). The HTTP endpoints in `.env` (`SNAPSHOT_REQUEST_URL` etc.) still use `par.zimmzimm.com` because those go over 443. The origin hostname is the same one already used for `SMTP_HOST`.
+- TLS verification is disabled (`ssl.CERT_NONE`) because the shared host presents a wildcard cert that doesn't match `shared187.accountservergroup.com`. TLS still encrypts the password and data channels — only authenticity is sacrificed.
+- The FTP account is chrooted to the gallery directory, so `SFTP_REMOTE_DIR` is `""` and remote paths are bare `<id>/image.jpg`. Don't reintroduce the full `/home1/zcoder/...` path — the account can't reach above its chroot anyway.
+- The password lives in the encrypted DMG vault as `SFTP-pass.txt`, **not** in `.env`. It's read lazily on the first snapshot upload via `_vault_read_sftp_password()` (same vault-mount-then-unmount pattern as the YouTube client secret) and cached in `_sftp_password_cache` for the rest of the process. cPanel → FTP Accounts → Change Password is the place to rotate; update vault file to match.
+- Per `upload_snapshot()`: `mkd <id>` is best-effort — `error_perm 550` (already exists) is swallowed, anything else re-raised. `STOR <id>/image.jpg` is the actual upload; success → local mp4/jpg unlinked.
 
 ```bash
 cd YT-Streamer
@@ -73,9 +107,9 @@ python YT_streamer.py
 
 ## Arduino
 
-`Arduino Code/P.A.R.Main/P.A.R.Main.ino` — polls `GET /next.php` over HTTPS, decodes the base64 bitmap, drives the display, then polls again. Waits 10 seconds between polls when the queue is empty; waits 10 minutes after a successful display + verify before polling again. WiFi credentials live in `env.h` (not committed).
+`Arduino Code/PARMain/PARMain.ino` — polls `POST /next.php` over HTTPS, decodes the base64 bitmap, drives the display, then polls again. Waits 10 seconds between polls when the queue is empty; waits 10 minutes after a successful display before polling again, and at the end of that linger POSTs `/stream-end-set.php` with the gallery id so the Mac Mini stops recording (`sendStreamEnd()`). WiFi credentials live in `env.h` (not committed). **Naming:** on-disk dir is `PARMain`.
 
-`Arduino Code/P.A.R.Main/FLOW.md` — concise per-step walkthrough of boot, main loop, color classification, and GRBL streaming for quick reference. **Drifts independently from the .ino** — when you change `flipDisc`, the scan offsets, servo timings, or the post-display delay, update FLOW.md in the same edit. Trust the .ino over FLOW.md when they disagree.
+`Arduino Code/PARMain/FLOW.md` — concise per-step walkthrough of boot, main loop, color classification, and GRBL streaming for quick reference. **Drifts independently from the .ino** — when you change `flipDisc`, the scan offsets, servo timings, or the post-display delay, update FLOW.md in the same edit. Trust the .ino over FLOW.md when they disagree.
 
 `Arduino Code/SerialBridge/` — USB↔Serial1 passthrough; flash to the Nano RP2040 to send raw G-code to the GRBL Mega from a PC serial monitor.
 
@@ -84,14 +118,17 @@ python YT_streamer.py
 ### Hardware
 - **Main MCU:** Arduino Nano RP2040 Connect (WiFiNINA for HTTPS, Servo on D9, TCS3200 color sensor S0–S3 + OUT on D4–D8).
 - **Motion controller:** Arduino Mega running a slightly modified [grbl-Mega](https://github.com/gnea/grbl-Mega) — `cpu_map` patched for the CNC Shield V3 pinout. Source lives at `~/Documents/Arduino/libraries/grbl-Mega` (additional working dir). Talks to the main MCU over `Serial1` @ 115200 using GRBL's character-counting streaming protocol.
-- **Coordinate system:** CNC homes to full negatives, so the work area lives in negative coords. `X_TRAVEL = 777.695`, `Y_TRAVEL = 399.695`; `initGrid()` origins to `(-X_TRAVEL + 25.0, -Y_TRAVEL + 0.0)`. Cell pitch is **20 mm in X, 22 mm in Y**; bitmap `y=0` is the top row, but physical Y increases upward, so Y is mirrored (`(GRID_H-1) - y`) when computing coords.
-- **Flip motion:** `flipDisc(x,y)` does a two-stage 180° rotation. Stage 1: servo to 80° (`SERVO_US_ENGAGE`) rotates the squisk 90°, then back to 0° (`SERVO_US_REST`). Stage 2: arc the gantry around the squisk (Y ±20 mm, X +16.8 mm, Y ∓20 mm) so the arm clears the disc, drop the arm to 30° (`SERVO_US_RELEASE`), and slide X −16.8 mm — the 30° arm catches the half-rotated squisk during the slide and pushes it through the final 90°. The Y excursion direction inverts on the bottom row (`gy == GRID_H-1`, at the −Y soft limit); the X excursion is capped per-flip so it never commands past `X=0`. Servo settle: `SERVO_80_DEG_SETTLE_MS = 300` ms for the 80° moves, `SERVO_30_DEG_SETTLE_MS = 100` ms for the 30° moves; `writeServoUs(us, settle_ms)` takes settle as a second arg.
-- **FlipCheckerboardTest sync:** `Arduino Code/FlipCheckerboardTest/FlipCheckerboardTest.ino` mirrors motion constants (grid origin/pitch, servo pulse widths, settle times, flip offsets) and shared motion helpers (`moveToYSafe`, `releaseSweep`) from `P.A.R.Main.ino`. Keep both in sync when changing any of these.
+- **Coordinate system:** CNC homes to full negatives, so the work area lives in negative coords. `X_TRAVEL = 777.695`, `Y_TRAVEL = 399.695`; `initGrid()` origins to `(-X_TRAVEL + 25.0, -Y_TRAVEL + 0.0)`. Cell pitch is **20.045 mm in X, 23.40 mm in Y**; bitmap `y=0` is the top row, but physical Y increases upward, so Y is mirrored (`(GRID_H-1) - y`) when computing coords.
+- **Flip motion:** `flipDisc(x,y,catchByNextMove)` does a two-stage 180° rotation. Stage 1: servo to 90° (`SERVO_US_ENGAGE`) rotates the squisk 90°, then back to 0° (`SERVO_US_REST`). Stage 2: slide X +16.8 mm so the arm clears the disc column, drop the arm to 50° (`SERVO_US_RELEASE`), and slide X −16.8 mm — the 50° arm catches the half-rotated squisk during the return slide and pushes it through the final 90°. The X excursion is capped per-flip so it never commands past `X=0`. Servo settle: `SERVO_90_DEG_SETTLE_MS = 300` ms for the 90° moves, `SERVO_50_DEG_SETTLE_MS = 100` ms for the 50° moves; `writeServoUs(us, settle_ms)` takes settle as a second arg.
+- **Second-catch pass (`#define FLIP_SECOND_CATCH`, default OFF):** an optional step 3 after Stage 2 — drop the arm a further ~10° (`SERVO_US_RELEASE2`, ~28°) and sweep +X again to push back any disc the first catch left over/under-rotated. Gated behind a commented-out `//#define FLIP_SECOND_CATCH` near `FLIP_OFFSET_X`; **uncomment to re-enable**. When OFF the arm is parked at REST after Stage 2 and `catchByNextMove` is ignored (the `(void)catchByNextMove;` in the `#else`). When ON, `catchByNextMove=true` leaves the arm down at `RELEASE2` so the caller's next +X move performs the sweep (no extra G-code); `false` emits an explicit +X stroke and re-parks at REST. The same `#define` + `#ifdef`/`#else` block is mirrored in `FlipCheckerboardTest.ino` — keep both in sync. `FlipCornersTest.ino` has no second-catch pass (its `flipDisc` is the simpler 2-arg form).
+- **FlipCheckerboardTest sync:** `Arduino Code/FlipCheckerboardTest/FlipCheckerboardTest.ino` mirrors motion constants (grid origin/pitch, servo pulse widths, settle times, flip offsets), the `FLIP_SECOND_CATCH` toggle, and shared motion helpers (`moveToYSafe`, `releaseSweep`) from `PARMain.ino`. Keep both in sync when changing any of these.
 
-### Display flow (post-display verify)
-After `displayBitmap`, `loop()` runs `verifyAndFix(bitmap)` in a loop (max 10 passes): scan cells with the TCS3200 (offset `(-23.0, +4.0)` from the flip head), classify blue (`#40ccdb`) vs black via `classifyDisc()` → `classifier_is_blue()` (a tiny ternary transformer; weights in `classifier.h`/`model_weights.h`), re-flip mismatches. **The scan pass iterates `x = 0..GRID_W-2` — the rightmost column is skipped, and the existing `SCAN_OFFSET_X` is set up so the leftmost falls outside the sensor sweep too.** The fix sub-pass still iterates the full grid (the rightmost just never has any wrong bits set). **Only call `complete.php` when the verify pass returns 0 mismatches** — if the cap is hit, leave the gallery entry pending. Boot also runs `$H` then a full `scanGrid()` to seed `gridState[]` (same skip-rightmost rule). The classifier is fed a **5-frame running average of 2 ms-paced RGBC reads** (`tcsReadRGBC` averages 5 frames; matches the train-time distribution).
+### Display flow
+Each job in `loop()` runs: `scanGrid()` (re-home + re-read every cell to reseed `gridState[]` after the 10-min idle) → `displayBitmap(bitmap)` → **check pass** (`scanGrid()` + `displayBitmap(bitmap)` again) → `onDisplayComplete()` → `delay(10 min)`. The check pass re-scans the physical board after the first draw — reseeding `gridState[]` so any disc that didn't flip cleanly or was misclassified is caught — then re-runs `displayBitmap`, whose diff-against-`gridState` logic re-flips only the cells still wrong. One pass, not a loop-until-clean. Boot also runs `$H` then a full `scanGrid()` to seed `gridState[]`.
 
-`releaseSweep()` runs **once after `displayBitmap()` and before the verify-fix loop** (so half-rotated discs settle before the sensor reads them). With the servo parked at `SERVO_US_REST`, it does a serpentine top-to-bottom traverse — no Y-wiggle, no servo movement during the sweep — and routes inter-row Y travel through `moveToYSafe`. Same function in `FlipCheckerboardTest.ino` (called after the checkerboard finishes); keep them in sync.
+Cell scanning uses the TCS3200 (offset `(-23.0, +4.0)` from the flip head), classifying blue (`#40ccdb`) vs black via `classifyDisc()` → `classifier_is_blue()` (a tiny ternary transformer; weights in `classifier.h`/`model_weights.h`). The classifier is fed a **5-frame running average of 2 ms-paced RGBC reads** (`tcsReadRGBC` averages 5 frames; matches the train-time distribution).
+
+`releaseSweep()` runs **once after `displayBitmap()`** so half-rotated discs settle before the snapshot photo is taken. With the servo parked at `SERVO_US_REST`, it does a serpentine top-to-bottom traverse — no Y-wiggle, no servo movement during the sweep — and routes inter-row Y travel through `moveToYSafe`. Same function in `FlipCheckerboardTest.ino` (called after the checkerboard finishes); keep them in sync.
 
 Sanity-check the live classifier with `Arduino Code/ColorSensorTest/ColorSensorTest.ino` — it prints raw RGBC, `logit`, and `blue`/`black` guess once the 5-frame ring is full. To actually retrain (rather than tweak a threshold), collect new data via `Color Sensor ML/collect.py` (manual `b`/`k` keys) or `Arduino Code/CollectColorTrainingData/` (auto-labeled sweep over a known-pattern board) → `train.py` → `export_header.py` to regenerate `model_weights.h`.
 
@@ -122,7 +159,7 @@ python train.py --data /tmp/color_data_avg5.json --d-model 16 --d-ff 32 --epochs
 # 3. Export to all four sketch folders
 python export_header.py \
   --out ColorClassifier/model_weights.h \
-  --out "../Arduino Code/P.A.R.Main/model_weights.h" \
+  --out "../Arduino Code/PARMain/model_weights.h" \
   --out "../Arduino Code/ColorSensorTest/model_weights.h" \
   --out "../Arduino Code/ValidateColorModel/model_weights.h"
 # 4. Verify
@@ -134,12 +171,12 @@ python verify_export.py
 python -c "import json,numpy as np; d=json.load(open('color_data.json')); b=np.array(d['blue']); k=np.array(d['black']); print('blue B/C',np.median(b[:,2]/(b[:,3]+1))); print('black B/C',np.median(k[:,2]/(k[:,3]+1)))"
 ```
 
-**export_header.py defaults** write only 3 paths (ColorClassifier, P.A.R.Main, ColorSensorTest) — always pass all four `--out` args explicitly to also cover ValidateColorModel.
+**export_header.py defaults** write only 3 paths (ColorClassifier, PARMain, ColorSensorTest) — always pass all four `--out` args explicitly to also cover ValidateColorModel.
 
 ### Sketch conventions
 - **Pure-Y motion only at X soft-limits.** Any vertical travel outside `flipDisc` must happen with X pinned at `0` or `-X_TRAVEL`. Use `moveToYSafe(x, y)` (emits `G0 X<limit>` → `G0 Y<targetY>` → `G0 X<targetX>`) for phase entry and any cross-row transition. Row sweeps (`scanGrid`, `displayBitmap`, `verifyAndFix`, `releaseSweep`, the `FlipCheckerboardTest` flip loop) are serpentine — end-of-row X equals start-of-next-row X, so the inter-row leg through `moveToYSafe` lands a pure-Y move at the limit.
 - **G0 with one axis omitted holds that axis** in GRBL — `G0 Y<n>` is a pure-Y move at the current X. That's what lets `moveToYSafe` work without tracking gantry position.
-- **Recovery from wedged comms:** `sendGcode`/`waitForIdle` carry a 60 s no-progress watchdog that calls `NVIC_SystemReset()` (RP2040 mbed-core CMSIS) — match that pattern for any new long-blocking loop. The legacy `while (true);` on `error`/`ALARM` in `drainResponses` is the one outlier and stays as a deliberate hard-halt for safety-relevant faults.
+- **Recovery from wedged comms:** `sendGcode`/`waitForIdle` carry a 60 s no-progress watchdog that calls `NVIC_SystemReset()` (RP2040 mbed-core CMSIS) — match that pattern for any new long-blocking loop. `drainResponses` no longer hard-halts on GRBL faults: `ALARM` triggers `grblAlarmRecover()` (Ctrl-X soft reset → `$H` → reassert modals → clear queue → force re-scan next job), and `error:N` is retried up to 10× with 3 s spacing per same-command run before falling back to MCU reset. `errorRetryCount` resets on any clean `ok`. The command queue stores text per slot (`cmdTexts[QUEUE_SIZE][MAX_CMD_LEN]`) so retries can re-send.
 - **No Arduino `String` for globals.** Heap fragments over weeks of uptime. Stack-locals inside one HTTP call are fine; module-level state goes in `char[N]` (see `pendingGalleryId`).
 - **Server-derived strings used in URLs/headers must be validated** before interpolation (see `isDigitsOnlyId`) — defense-in-depth against header injection if the server is ever compromised.
 
@@ -172,7 +209,7 @@ The poll path uses raw `WiFiSSLClient` with a hand-written HTTP request, not `Ar
 - **Modal renders bitmap + name unconditionally**, then layers status (pending / snapshot photo / "No image available") on top. Don't reintroduce branches that hide the bitmap during pending — the bitmap is in `pending.json` from the moment `next.php` fires, so it should always show.
 - **`gallery.php` rename TOCTOU race:** `complete.php` does `rename(pending.json, info.json)`. There's a small window where `gallery.php` sees `pending.json` exists, then `file_get_contents` returns `false` because the file just got renamed. The endpoint silently `continue`s past such entries, so a single fetch can briefly miss an item mid-transition. The 5s polling masks this in practice.
 - **Adding a new SPA tab** takes three edits: nav link `<a data-tab="X">` in `index.html`, `<section id="X" class="tab-content">` in `index.html`, and an `if (pathname === '/X') return 'X';` branch in `getActiveTabFromUrl()`. No server changes — both `router.php` and `.htaccess` fall back to `index.html` for unknown paths.
-- **`.tab-content.active` is flex-row by default** — sibling children inside an active tab sit side-by-side. Add `#tabid.tab-content.active { flex-direction: column; }` if you need stacked content (livestream and about already do this).
-- **`loadPARLivestream()` clears `.livestream-container.innerHTML`** on every load. Static content for the livestream tab (e.g. taglines, links) must be a sibling of `.livestream-container`, not a child, or it will be wiped.
+- **`.tab-content.active` is flex-row by default** — sibling children inside an active tab sit side-by-side. Add `#tabid.tab-content.active { flex-direction: column; }` if you need stacked content (latest and about already do this).
+- **`loadLatestRecording()` clears `.latest-container.innerHTML`** on every load. Static content for the latest tab (e.g. taglines, links) must be a sibling of `.latest-container`, not a child, or it will be wiped.
 - **In-page links to other tabs** should use `class="nav-link" data-tab="X"` so the existing `navLinks.forEach` click handler in `script.js` routes them via `pushState` instead of triggering a full page load. They must be present at script load time (the handler captures `navLinks` once).
 - **Don't move gallery-entry creation to `enqueue.php`.** Tried this once to make the bitmap appear in the gallery as soon as it was uploaded; user pushed back — they want the bitmap visible only once the Arduino actually picks the item up. Keep entry creation in `next.php`.

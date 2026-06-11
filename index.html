@@ -14,7 +14,7 @@
         <div class="navbar-container">
             <div class="navbar-brand">P.A.R.</div>
             <ul class="navbar-menu">
-                <li><a href="/livestream" class="nav-link" data-tab="livestream">Livestream</a></li>
+                <li><a href="/latest" class="nav-link" data-tab="latest">Latest</a></li>
                 <li><a href="/upload" class="nav-link" data-tab="upload">Upload</a></li>
                 <li><a href="/gallery" class="nav-link" data-tab="gallery">Gallery</a></li>
                 <li><a href="/about" class="nav-link" data-tab="about">About</a></li>
@@ -24,12 +24,12 @@
 
     <!-- Main Content -->
     <main class="main-content">
-        <!-- Livestream Tab -->
-        <section id="livestream" class="tab-content active">
-            <div class="livestream-container">
+        <!-- Latest Tab -->
+        <section id="latest" class="tab-content active">
+            <div class="latest-container">
             </div>
-            <p class="livestream-links">
-                <a href="/upload" class="nav-link" data-tab="upload">Upload your own pixel art</a>, stay here to watch, <a href="/gallery" class="nav-link" data-tab="gallery">explore the gallery</a>, or <a href="/about" class="nav-link" data-tab="about">find out more about P.A.R.</a>.
+            <p class="latest-links">
+                <a href="/upload" class="nav-link" data-tab="upload">Upload your own pixel art</a>, watch the latest recording above, <a href="/gallery" class="nav-link" data-tab="gallery">explore the gallery</a>, or <a href="/about" class="nav-link" data-tab="about">find out more about P.A.R.</a>.
             </p>
         </section>
 
@@ -152,7 +152,17 @@
 
         <!-- Gallery Tab -->
         <section id="gallery" class="tab-content">
+            <div class="gallery-search-wrap">
+                <i class="fa-solid fa-magnifying-glass gallery-search-icon" aria-hidden="true"></i>
+                <input type="search" id="gallerySearch" class="gallery-search" placeholder="Search by name" autocomplete="off" aria-label="Search gallery by name">
+            </div>
+            <div class="gallery-subtabs-sentinel" aria-hidden="true"></div>
+            <div class="gallery-subtabs" role="tablist" aria-label="Gallery sections">
+                <button type="button" class="gallery-subtab active" data-subtab="gallery" role="tab" aria-selected="true">Gallery</button>
+                <button type="button" class="gallery-subtab" data-subtab="queue" role="tab" aria-selected="false">Queue</button>
+            </div>
             <div class="gallery-container" id="galleryContainer"></div>
+            <div class="gallery-container hidden" id="queueContainer"></div>
 
             <!-- Gallery Item Modal -->
             <div id="galleryItemModal" class="upload-modal hidden">
@@ -164,7 +174,9 @@
                     <canvas id="galleryModalImage" class="gallery-modal-image"></canvas>
                     <img id="galleryModalSnapshot" class="gallery-modal-snapshot hidden" alt="P.A.R. photo">
                     <p id="galleryModalNoSnapshot" class="gallery-modal-no-snapshot hidden">No P.A.R. image available.</p>
-                    <p id="galleryModalPending" class="gallery-modal-pending hidden">In progress &mdash; <a id="galleryModalLivestreamLink" href="/livestream">view livestream</a></p>
+                    <p id="galleryModalPending" class="gallery-modal-pending hidden">In progress &mdash; check back once printing finishes.</p>
+                    <p id="galleryModalQueue" class="gallery-modal-pending hidden"></p>
+                    <div id="galleryModalVideo" class="gallery-modal-video hidden"></div>
                 </div>
             </div>
         </section>

@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 const EXPECTED_BITMAP_BYTES = 84;
 const MAX_QUEUE_LENGTH = 20;
+const MAX_MOD_QUEUE_LENGTH = 50;
 const MAX_CONCURRENT_REQUESTS = 5;
 
 /**
@@ -96,7 +97,12 @@ if (isset($data['name']) && is_string($data['name'])) {
     $name = mb_substr(trim($data['name']), 0, 100);
 }
 
-$queueFile = __DIR__ . '/queue.txt';
+// Submissions now land in the moderation queue first. An external daemon
+// (YT-Streamer/YT_streamer.py) runs Claude-based image + name checks and
+// either auto-approves (promoting the entry into queue.txt via
+// mod-action.php) or emails a human moderator.
+$queueFile = __DIR__ . '/mod_queue.txt';
+$mainQueueFile = __DIR__ . '/queue.txt';
 
 if (!file_exists($queueFile)) {
     file_put_contents($queueFile, '');
@@ -125,7 +131,14 @@ $existingBitmaps = array_map(static function (string $line): string {
     return is_array($decoded) ? ($decoded['item'] ?? $line) : $line;
 }, $lines);
 
-if (in_array($data['item'], $existingBitmaps, true)) {
+// Also reject if the same bitmap is already approved & waiting in the main queue.
+$mainBitmaps = [];
+foreach (@file($mainQueueFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $mline) {
+    $decoded = json_decode($mline, true);
+    $mainBitmaps[] = is_array($decoded) ? ($decoded['item'] ?? $mline) : $mline;
+}
+
+if (in_array($data['item'], $existingBitmaps, true) || in_array($data['item'], $mainBitmaps, true)) {
     flock($handle, LOCK_UN);
     fclose($handle);
     http_response_code(409);
@@ -133,7 +146,7 @@ if (in_array($data['item'], $existingBitmaps, true)) {
     exit;
 }
 
-if (count($lines) >= MAX_QUEUE_LENGTH) {
+if (count($lines) >= MAX_MOD_QUEUE_LENGTH) {
     flock($handle, LOCK_UN);
     fclose($handle);
     http_response_code(409);
@@ -141,7 +154,14 @@ if (count($lines) >= MAX_QUEUE_LENGTH) {
     exit;
 }
 
-$queueEntry = json_encode(['item' => $data['item'], 'name' => $name], JSON_UNESCAPED_UNICODE);
+$queueEntry = json_encode([
+    'id'        => uniqid('', true),
+    'item'      => $data['item'],
+    'name'      => $name,
+    'ts'        => time(),
+    'status'    => 'pending',
+    'status_ts' => time(),
+], JSON_UNESCAPED_UNICODE);
 
 fseek($handle, 0, SEEK_END);
 fwrite($handle, $queueEntry . PHP_EOL);

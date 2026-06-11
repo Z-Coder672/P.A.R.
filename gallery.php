@@ -39,10 +39,12 @@ if (is_dir($galleryDir)) {
         }
 
         $entry = [
-            'id'      => (int)$id,
-            'pending' => $isPending,
-            'bitmap'  => (string)($info['bitmap'] ?? ''),
-            'name'    => (string)($info['name'] ?? ''),
+            'id'       => (int)$id,
+            'pending'  => $isPending,
+            'bitmap'   => (string)($info['bitmap'] ?? ''),
+            'name'     => (string)($info['name'] ?? ''),
+            'video_id' => isset($info['video_id']) && is_string($info['video_id'])
+                ? $info['video_id'] : null,
         ];
 
         $entry['image'] = null;

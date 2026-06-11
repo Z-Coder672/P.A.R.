@@ -2,10 +2,8 @@
 """
 Per-print Recorder + Snapshot/Moderation Pollers.
 
-Records a locally-attached USB webcam (a Logitech "Brio 100", matched by name
-prefix) to a local mp4 while a print is active via ffmpeg's avfoundation input,
-then uploads to YouTube via the Data API and attaches the resulting video id to
-the gallery entry.
+Records RTSP to a local mp4 while a print is active, then uploads to YouTube
+via the Data API and attaches the resulting video id to the gallery entry.
 
 A recording starts when stream-start.php hands us a (gallery_id, name) and
 stops when either stream-end.php fires (Arduino's signal after its 10-min
@@ -21,8 +19,6 @@ import logging
 import sys
 import threading
 import json
-import re
-import shutil
 import requests
 import ftplib
 import ssl
@@ -32,6 +28,8 @@ import base64
 import io
 import concurrent.futures
 import anyio
+import socket
+from urllib.parse import urlparse
 from PIL import Image
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -59,15 +57,7 @@ from googleapiclient.http import MediaFileUpload
 load_dotenv(Path(__file__).parent / ".env")
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-# Locally-attached USB webcam, accessed through ffmpeg's avfoundation input.
-# CAMERA_NAME is matched case-insensitively against the START of each
-# avfoundation VIDEO-device name, so "brio 100" matches "Brio 100", "Brio 100
-# (1234)", etc. Recording is ALWAYS video-only — audio is never captured or
-# broadcast (build_record_cmd hard-codes -an and the input is video-only).
-CAMERA_NAME            = os.getenv("CAMERA_NAME", "Brio 100")
-CAMERA_FRAMERATE       = os.getenv("CAMERA_FRAMERATE", "30")
-# Keeper re-enumerates the device list this often (when not recording).
-CAMERA_POLL_INTERVAL   = int(os.getenv("CAMERA_POLL_INTERVAL", "15"))
+RTSP_URL      = os.getenv("RTSP_URL")
 SNAPSHOT_SECRET        = os.getenv("SNAPSHOT_SECRET")
 
 SNAPSHOT_REQUEST_URL   = os.getenv("SNAPSHOT_REQUEST_URL")
@@ -82,11 +72,6 @@ STREAM_POLL_INTERVAL   = int(os.getenv("STREAM_POLL_INTERVAL", "10"))
 # Local working dir for in-flight mp4 recordings. Uploads delete on success;
 # failed uploads are left here for manual recovery.
 RECORDING_DIR          = Path("/tmp/recordings")
-# While a recording is in flight, the recording ffmpeg also writes a ~1fps JPEG
-# here (a second output of the same capture). The snapshot poller copies THIS
-# instead of opening the camera, because a USB webcam allows only one opener at
-# a time and the recording owns it.
-LATEST_FRAME_PATH      = RECORDING_DIR / "latest_frame.jpg"
 # 1.5h hard cap on a single recording (safety net if the stop signal is lost).
 RECORD_MAX_SECONDS     = 90 * 60
 
@@ -139,6 +124,7 @@ YT_VAULT_SECRET_FILE   = os.getenv("YT_VAULT_SECRET_FILE", "")
 YT_VAULT_TOKEN_FILE    = "yt_token.json"
 
 _required = {
+    "RTSP_URL": RTSP_URL,
     "SNAPSHOT_SECRET": SNAPSHOT_SECRET,
     "SNAPSHOT_REQUEST_URL": SNAPSHOT_REQUEST_URL,
     "SFTP_HOST": SFTP_HOST,
@@ -153,18 +139,32 @@ if _missing:
     sys.exit(1)
 
 VIDEO_BITRATE        = "2500k"
+AUDIO_BITRATE        = "128k"
 CAMERA_RETRY_DELAY   = 30   # seconds between camera-availability re-checks
 # Total window to keep retrying the camera after a start signal before giving
-# up on a print. A cam that comes up any time inside this window gets recorded.
+# up on a print. A cam that wakes up any time inside this window gets recorded.
 CAMERA_WAIT_SECONDS  = 10 * 60
 
-# Cached avfoundation video-device index from the last successful enumeration
-# (e.g. "1"). Audio is never captured. None = not currently present. The keeper
-# refreshes this every CAMERA_POLL_INTERVAL seconds.
-_camera_lock = threading.Lock()
-_camera_spec: str | None = None
+# Cross-subnet cam discovery. The Mac sits on a different SSID/subnet than the
+# cam so mDNS doesn't traverse and ARP can't see the cam's MAC. Instead we do a
+# concurrent TCP-554 sweep of the cam's /24 — first IP that accepts the connect
+# is the cam (only RTSP devices answer on :554). CAM_SCAN_SUBNET is the first
+# three octets, e.g. "192.168.87". MUST be the guest subnet — scanning main
+# could turn up an unrelated :554 listener. Discovery runs only while
+# disconnected; once the keeper marks us connected we trust the cached IP
+# until a knock fails. If CAM_SCAN_SUBNET is unset we fall back to RTSP_URL
+# as-written (mDNS / hosts).
+CAM_SCAN_SUBNET = os.getenv("CAM_SCAN_SUBNET")
+CAM_SCAN_PORT   = int(os.getenv("CAM_SCAN_PORT", "554"))
+# Persisted IP from last successful discovery — seeds _cam_host on startup so
+# cold start doesn't need a /24 sweep before the first probe. The streamer
+# rewrites this line in .env whenever discovery finds a new IP.
+CAM_LAST_KNOWN_IP = os.getenv("CAM_LAST_KNOWN_IP") or None
+_ENV_PATH = Path(__file__).parent / ".env"
+_cam_host_lock = threading.Lock()
+_cam_host: str | None = CAM_LAST_KNOWN_IP  # last-discovered cam IP; None = use RTSP_URL as-is
 # Set while ffmpeg is actively recording a print — pauses the camera keeper so
-# it doesn't re-enumerate devices while a recording holds the cam.
+# its probes don't contend with the recording's RTSP session.
 _recording_active = threading.Event()
 # Tracks the currently in-flight recording (ffmpeg proc + its mp4 path) so a
 # Ctrl+C handler can stop ffmpeg cleanly and delete the partial file. Guarded
@@ -173,6 +173,10 @@ _recording_active = threading.Event()
 _inflight_lock = threading.Lock()
 _inflight_proc: subprocess.Popen | None = None
 _inflight_path: Path | None = None
+# Tracks whether the camera path is currently confirmed reachable. The keeper
+# does a full frame-pull while disconnected and only the lightweight port knock
+# once connected, dropping back to frame-pull the moment a knock fails.
+_camera_connected = threading.Event()
 # ───────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -186,28 +190,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def build_record_cmd(out_path: Path, cam_spec: str) -> list[str]:
-    """Webcam (avfoundation) -> local mp4, plus a ~1fps JPEG sidecar, from one
-    capture. `cam_spec` is the avfoundation VIDEO index from _refresh_camera().
-
-    Two outputs:
-      1. the fragmented mp4 (a SIGKILL still leaves a playable file),
-      2. LATEST_FRAME_PATH, overwritten ~once a second, so the snapshot poller
-         can grab a still WITHOUT opening the camera (a USB cam allows only one
-         opener, and the recording owns the device).
-
-    Audio is NEVER captured: the input is video-only and -an is hard-coded.
-    -t on the INPUT caps total capture at RECORD_MAX_SECONDS, stopping both
-    outputs together (a safety net if the stop signal is lost)."""
+def build_record_cmd(out_path: Path) -> list[str]:
+    """RTSP -> local mp4. Fragmented mp4 so a SIGKILL still leaves a playable
+    file; -t caps the recording at RECORD_MAX_SECONDS as a safety net."""
     return [
         "ffmpeg",
         "-loglevel", "warning",
-        "-f", "avfoundation",
-        "-framerate", CAMERA_FRAMERATE,
-        "-t", str(RECORD_MAX_SECONDS),
-        "-i", cam_spec,
-        # ── output 1: the recording ──────────────────────────────────────────
-        "-map", "0:v",
+        "-rtsp_transport", "tcp",
+        "-fflags", "nobuffer",
+        "-i", _rtsp_url(),
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
@@ -215,17 +206,12 @@ def build_record_cmd(out_path: Path, cam_spec: str) -> list[str]:
         "-maxrate", VIDEO_BITRATE,
         "-bufsize", str(int(VIDEO_BITRATE[:-1]) * 2) + "k",
         "-g", "30",
-        "-an",
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
         "-movflags", "+empty_moov+default_base_moof+frag_keyframe+faststart",
+        "-t", str(RECORD_MAX_SECONDS),
         "-f", "mp4",
         str(out_path),
-        # ── output 2: the live snapshot frame ────────────────────────────────
-        "-map", "0:v",
-        "-r", "1",
-        "-update", "1",
-        "-q:v", "2",
-        "-f", "image2",
-        str(LATEST_FRAME_PATH),
     ]
 
 
@@ -438,168 +424,218 @@ def upload_recording(youtube, out_path: Path, title: str) -> str | None:
 
 # ── CAMERA ─────────────────────────────────────────────────────────────────────
 
-def _list_avfoundation_devices() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """Enumerate ffmpeg's avfoundation devices. Returns (video, audio), each a
-    list of (index, name) tuples in the order ffmpeg reports them.
-
-    `ffmpeg -f avfoundation -list_devices true -i ""` writes the device list to
-    stderr and exits non-zero (it treats the empty input as an error) — that's
-    expected, so we ignore the return code and parse stderr. Each device line
-    looks like `[AVFoundation indev @ 0x..] [1] Brio 100`; the FIRST bracketed
-    integer is the indev handle, the SECOND is the device index we want."""
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-f", "avfoundation",
-         "-list_devices", "true", "-i", ""],
-        capture_output=True, text=True, timeout=15,
-    )
-    video: list[tuple[str, str]] = []
-    audio: list[tuple[str, str]] = []
-    section: str | None = None
-    for line in result.stderr.splitlines():
-        if "AVFoundation video devices:" in line:
-            section = "video"
-            continue
-        if "AVFoundation audio devices:" in line:
-            section = "audio"
-            continue
-        if section is None:
-            continue
-        # `[1] Brio 100` — match the LAST `[<int>] <name>` on the line so the
-        # `[AVFoundation indev @ 0x..]` prefix is skipped.
-        m = re.search(r"\[(\d+)\]\s+(.*\S)\s*$", line)
-        if m:
-            (video if section == "video" else audio).append((m.group(1), m.group(2)))
-    return video, audio
+def _rtsp_url() -> str | None:
+    """Return RTSP_URL with the hostname swapped for the last-discovered cam IP
+    if we have one, otherwise RTSP_URL as written. This is the only function
+    that should be used to build cam URLs — callers must NOT cache the result
+    across reconnects, since the cam's IP can move on DHCP renewal."""
+    if not RTSP_URL:
+        return RTSP_URL
+    with _cam_host_lock:
+        host = _cam_host
+    if not host:
+        return RTSP_URL
+    parsed = urlparse(RTSP_URL)
+    auth = ""
+    if parsed.username:
+        auth = f"{parsed.username}:{parsed.password}@" if parsed.password else f"{parsed.username}@"
+    portsuffix = f":{parsed.port}" if parsed.port else ""
+    return parsed._replace(netloc=f"{auth}{host}{portsuffix}").geturl()
 
 
-def _match_device(devices: list[tuple[str, str]], prefix: str) -> tuple[str, str] | None:
-    """First device whose name starts (case-insensitively) with `prefix`."""
-    want = prefix.strip().lower()
-    for idx, name in devices:
-        if name.lower().startswith(want):
-            return idx, name
-    return None
+def _discover_cam_host(per_probe_timeout: float = 0.4, overall_timeout: float = 6.0) -> str | None:
+    """Concurrent TCP-CAM_SCAN_PORT sweep of CAM_SCAN_SUBNET.0/24. First open
+    port wins. Returns the IP as a dotted string or None.
+
+    Cross-subnet equivalent of the same-subnet ARP-table sniff: ARP only sees
+    L2 neighbors, but a TCP probe goes through the router so it works whether
+    the cam is on our SSID or a guest one. As a bonus, a 'found' here means
+    'RTSP layer is alive', not just 'NIC is powered on' — which the wedged-cam
+    diagnostic taught us is a meaningful distinction for Eufy hardware."""
+    if not CAM_SCAN_SUBNET:
+        return None
+    found: list[str] = []
+    done = threading.Event()
+
+    def probe(ip: str) -> None:
+        if done.is_set():
+            return
+        try:
+            with socket.create_connection((ip, CAM_SCAN_PORT), timeout=per_probe_timeout):
+                pass
+        except OSError:
+            return
+        # First winner takes it; later threads short-circuit via done.
+        if not done.is_set():
+            found.append(ip)
+            done.set()
+
+    threads: list[threading.Thread] = []
+    for last in range(1, 255):
+        ip = f"{CAM_SCAN_SUBNET}.{last}"
+        t = threading.Thread(target=probe, args=(ip,), daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.monotonic() + overall_timeout
+    while not done.is_set() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return found[0] if found else None
 
 
-def _refresh_camera() -> str | None:
-    """Enumerate avfoundation devices, find the VIDEO device whose name starts
-    with CAMERA_NAME (case-insensitive), cache its index as the input spec, and
-    return it. The spec is always the bare video index ("1") — audio is never
-    captured. Returns None (leaving the cache untouched) if no matching video
-    device is currently present.
-
-    Enumerating does NOT open the camera, so this is cheap and leaves the
-    privacy LED off — safe to call on every keeper tick."""
-    global _camera_spec
+def _persist_cam_host(ip: str) -> None:
+    """Rewrite CAM_LAST_KNOWN_IP in .env so cold start skips the /24 sweep.
+    Atomic via tempfile + replace so a crash mid-write can't truncate .env.
+    No-op (with warning) if .env can't be found or written — discovery still
+    works at runtime, we just lose the cold-start hot-cache benefit."""
     try:
-        video, _audio = _list_avfoundation_devices()
+        if not _ENV_PATH.exists():
+            log.warning(f"[camera] .env not found at {_ENV_PATH}; skipping IP persist")
+            return
+        new_line = f'CAM_LAST_KNOWN_IP  = "{ip}"\n'
+        lines = _ENV_PATH.read_text().splitlines(keepends=True)
+        replaced = False
+        for i, line in enumerate(lines):
+            # Match `CAM_LAST_KNOWN_IP =` or `CAM_LAST_KNOWN_IP=` (ignore
+            # leading whitespace, allow either spacing convention). Skip
+            # commented-out lines.
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if stripped.split("=", 1)[0].strip() == "CAM_LAST_KNOWN_IP":
+                lines[i] = new_line
+                replaced = True
+                break
+        if not replaced:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(new_line)
+        tmp = _ENV_PATH.with_name(_ENV_PATH.name + ".tmp")
+        tmp.write_text("".join(lines))
+        tmp.replace(_ENV_PATH)
     except Exception as e:
-        log.warning(f"[camera] device enumeration failed: {e!r}")
-        return None
+        log.warning(f"[camera] could not persist CAM_LAST_KNOWN_IP={ip} to .env: {e!r}")
 
-    vmatch = _match_device(video, CAMERA_NAME)
-    if vmatch is None:
-        log.debug(f"[camera] no video device starting with {CAMERA_NAME!r}; "
-                  f"present: {[n for _, n in video]}")
-        return None
-    vidx, vname = vmatch
 
-    with _camera_lock:
-        changed = vidx != _camera_spec
-        _camera_spec = vidx
-    if changed:
-        log.info(f"[camera] matched {vname!r} — avfoundation video index {vidx!r}")
-    return vidx
+def _refresh_cam_host() -> str | None:
+    """Run discovery and update _cam_host ONLY on a positive find. A scan-miss
+    keeps the cached IP — losing it would force callers to fall back to
+    RTSP_URL as-written, which on a split-network setup means an mDNS name
+    that doesn't resolve cross-subnet. Persists changes back to .env.
+    Returns the new host (or None if nothing answered)."""
+    global _cam_host
+    new_host = _discover_cam_host()
+    with _cam_host_lock:
+        old = _cam_host
+        if new_host:
+            _cam_host = new_host
+    if new_host and new_host != old:
+        log.info(f"[camera] discovered cam at {new_host} (was {old or 'unset'})")
+        _persist_cam_host(new_host)
+    elif new_host is None:
+        # Don't clear _cam_host — keep the cached IP and let the next verify
+        # decide whether the cam is genuinely gone or just briefly slow.
+        log.debug(f"[camera] discovery scan of {CAM_SCAN_SUBNET}.0/24 found nothing; keeping cached {old or 'none'}")
+    return new_host
+
+
+def _warm_camera_path(attempts: int = 4, per_try_timeout: float = 5.0) -> bool:
+    """Knock on TCP/554 to refresh the macOS neighbor cache before ffmpeg runs.
+    Shells out to `nc -z` because, empirically, this is what unsticks the path
+    on this network — a Python socket.create_connection probe with identical
+    semantics does not. Don't rewrite this back to pure Python."""
+    parsed = urlparse(_rtsp_url() or "")
+    host = parsed.hostname
+    port = parsed.port or 554
+    if not host:
+        return False
+    for i in range(attempts):
+        try:
+            result = subprocess.run(
+                ["nc", "-z", "-v", "-G", str(int(per_try_timeout)), host, str(port)],
+                capture_output=True,
+                timeout=per_try_timeout + 2,
+            )
+            if result.returncode == 0:
+                return True
+            log.debug(f"[camera] warm-up {i+1}/{attempts} failed: {result.stderr.decode().strip()[-200:]}")
+        except subprocess.TimeoutExpired:
+            log.debug(f"[camera] warm-up {i+1}/{attempts} timed out")
+    return False
 
 
 def verify_camera_accessible() -> bool:
-    """True if the configured webcam currently enumerates. Doesn't open the
-    device (so no privacy-LED flash, and no contention with an in-flight
-    recording) — for a USB cam, enumerating means openable; if another process
-    is holding it, the recording's ffmpeg surfaces that at spawn time."""
-    return _refresh_camera() is not None
+    """Pull one frame from RTSP to confirm the camera is reachable before creating a broadcast."""
+    log.info("[camera] Verifying camera is accessible...")
+    _warm_camera_path()
+    cmd = [
+        "ffmpeg", "-y",
+        "-rtsp_transport", "tcp",
+        "-i", _rtsp_url(),
+        "-frames:v", "1",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        ok = result.returncode == 0
+        if not ok:
+            log.warning(f"[camera] ffmpeg probe failed: {result.stderr.decode()[-200:]}")
+        return ok
+    except subprocess.TimeoutExpired:
+        log.warning("[camera] Probe timed out after 30s")
+        return False
 
 
 def camera_keeper() -> None:
-    """Background thread — re-discover the webcam every CAMERA_POLL_INTERVAL
-    seconds whenever a recording isn't in progress.
+    """Background thread — keep the camera path warm at all times.
 
-    Unlike the old RTSP keeper there are no lightweight "warm knocks" and no
-    connected/disconnected fast path: each tick simply re-enumerates the
-    avfoundation device list and refreshes the cached input spec, so the cam is
-    always re-found even after an unplug/replug or an index change — even if it
-    was connected on the previous tick. Listing devices doesn't open the
-    camera, so this never contends with an active recording (the keeper still
-    pauses entirely while one is in flight)."""
-    log.info(f"[camera] Keeper started (interval={CAMERA_POLL_INTERVAL}s, "
-             f"name prefix={CAMERA_NAME!r})")
+    The macOS neighbor cache / Wi-Fi cam goes stale when idle, which makes the
+    first recording slow or fail to connect. Every CAMERA_RETRY_DELAY seconds:
+      - while disconnected, run a cross-subnet TCP-554 sweep of
+        CAM_SCAN_SUBNET.0/24 to (re)discover the cam's current IP (DHCP can
+        move it on the guest network where reservations aren't available),
+        then do a full frame-pull (verify_camera_accessible) against it;
+        a success flips _camera_connected on,
+      - once connected, do only the lightweight RTSP-port knock and SKIP
+        discovery entirely — a cam holding an RTSP session can't switch IPs
+        out from under us, so re-scanning would just add noise. The first
+        knock that fails flips _camera_connected back off so the next cycle
+        resumes scan-then-frame-pull.
+    Pauses entirely while a recording is in progress so probes don't contend
+    with the active RTSP session."""
+    log.info(f"[camera] Keeper started (interval={CAMERA_RETRY_DELAY}s, "
+             f"discovery={'on '+CAM_SCAN_SUBNET+'.0/24' if CAM_SCAN_SUBNET else 'off'})")
     while True:
         if not _recording_active.is_set():
             try:
-                if _refresh_camera() is None:
-                    log.warning(f"[camera] no device matching {CAMERA_NAME!r} found")
+                if _camera_connected.is_set():
+                    if not _warm_camera_path():
+                        log.warning("[camera] knock failed — marking disconnected")
+                        _camera_connected.clear()
+                else:
+                    if CAM_SCAN_SUBNET:
+                        _refresh_cam_host()
+                    if verify_camera_accessible():
+                        log.info("[camera] connected — switching to keep-warm knocks")
+                        _camera_connected.set()
             except Exception as e:
                 log.warning(f"[camera] keeper probe error: {e!r}")
-        time.sleep(CAMERA_POLL_INTERVAL)
+                _camera_connected.clear()
+        time.sleep(CAMERA_RETRY_DELAY)
 
 
 # ── SNAPSHOT ───────────────────────────────────────────────────────────────────
 
-def _read_live_frame(dst: Path, timeout: float = 6.0, max_age: float = 20.0) -> bool:
-    """Copy the recorder's live JPEG sidecar (LATEST_FRAME_PATH) to `dst`,
-    waiting up to `timeout`s for a fresh, fully-written frame. Returns True on
-    success.
-
-    The recording ffmpeg rewrites the sidecar ~1fps, so a copy can occasionally
-    catch a half-written file — we validate each copy by decoding it with PIL
-    and retry on failure. `max_age` rejects a stale frame left over from a prior
-    recording (e.g. if the new recording hasn't produced a frame yet)."""
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            if LATEST_FRAME_PATH.exists():
-                if (time.time() - LATEST_FRAME_PATH.stat().st_mtime) <= max_age:
-                    shutil.copyfile(LATEST_FRAME_PATH, dst)
-                    with Image.open(dst) as im:
-                        im.load()  # force decode; raises on a torn JPEG
-                    return True
-        except Exception:
-            pass  # mid-rewrite / torn read — fall through and retry
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.4)
-
-
 def grab_snapshot() -> Path | None:
-    """Return a local JPEG of the camera view, or None.
-
-    Two sources, because a USB webcam allows only ONE opener at a time:
-      - while a print is recording, copy the recorder's live JPEG sidecar
-        (LATEST_FRAME_PATH) — we must NOT open the device out from under the
-        recording's ffmpeg;
-      - otherwise, open the camera directly for a one-shot frame.
-    """
+    """Grab a single frame from the RTSP stream, return local path or None."""
     SNAPSHOT_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = SNAPSHOT_LOCAL_DIR / datetime.now().strftime("snap_%Y%m%d_%H%M%S.jpg")
+    filename = datetime.now().strftime("snap_%Y%m%d_%H%M%S.jpg")
+    out_path = SNAPSHOT_LOCAL_DIR / filename
 
-    if _recording_active.is_set():
-        if _read_live_frame(out_path):
-            log.info(f"[snapshot] Grabbed {out_path.name} from live recording frame")
-            return out_path
-        log.error("[snapshot] recording active but no fresh live frame available")
-        out_path.unlink(missing_ok=True)
-        return None
-
-    spec = _refresh_camera()
-    if spec is None:
-        log.error(f"[snapshot] no device matching {CAMERA_NAME!r}; cannot grab frame")
-        return None
-
+    _warm_camera_path()
     cmd = [
         "ffmpeg", "-y",
-        "-f", "avfoundation",
-        "-framerate", CAMERA_FRAMERATE,
-        "-i", spec,
+        "-rtsp_transport", "tcp",
+        "-i", _rtsp_url(),
         "-frames:v", "1",
         "-q:v", "2",
         str(out_path),
@@ -610,7 +646,6 @@ def grab_snapshot() -> Path | None:
         return out_path
     else:
         log.error(f"[snapshot] ffmpeg failed: {result.stderr.decode()[-200:]}")
-        out_path.unlink(missing_ok=True)
         return None
 
 
@@ -1336,8 +1371,8 @@ def record_orchestrator() -> None:
         log.info(f"[record] Start signal: id={gallery_id} name={name!r}")
 
         # We've already popped the start signal, so this print is ours. The
-        # webcam can be transiently absent (just plugged in / enumerating, USB
-        # hiccup) right when the print begins; keep retrying for up to 10 min so
+        # camera can be transiently unreachable (Wi-Fi cam waking up, network
+        # blip) right when the print begins; keep retrying for up to 10 min so
         # a camera that comes up mid-window still gets recorded. Only give up
         # (skipping this print) if it never appears within the window.
         cam_deadline = time.monotonic() + CAMERA_WAIT_SECONDS
@@ -1348,21 +1383,19 @@ def record_orchestrator() -> None:
                 break
             if time.monotonic() >= cam_deadline:
                 break
-            log.warning(f"[record] Camera {CAMERA_NAME!r} not found for "
-                        f"#{gallery_id}; retrying in {CAMERA_RETRY_DELAY}s "
+            # The keeper drives discovery on its own cadence, but if a start
+            # signal lands between keeper ticks (or the cam moved IPs since
+            # last connect), re-scan inline so we don't waste a full retry
+            # interval ffmpeg-probing a stale address.
+            if CAM_SCAN_SUBNET and not _camera_connected.is_set():
+                _refresh_cam_host()
+            log.warning(f"[record] Camera not reachable for #{gallery_id}; "
+                        f"retrying in {CAMERA_RETRY_DELAY}s "
                         f"({cam_deadline - time.monotonic():.0f}s left)")
             time.sleep(CAMERA_RETRY_DELAY)
         if not camera_ready:
             log.warning(f"[record] Camera never came up within "
                         f"{CAMERA_WAIT_SECONDS}s; skipping #{gallery_id}")
-            continue
-
-        # verify_camera_accessible just refreshed the spec; capture it for this
-        # recording. (Tiny race if the cam vanished in between — guard anyway.)
-        with _camera_lock:
-            cam_spec = _camera_spec
-        if cam_spec is None:
-            log.warning(f"[record] camera vanished before recording #{gallery_id}; skipping")
             continue
 
         if youtube is None:
@@ -1374,10 +1407,11 @@ def record_orchestrator() -> None:
                 log.error("[record] No YouTube client; recording but cannot upload")
 
         out_path = RECORDING_DIR / f"{gallery_id}_{int(time.time())}.mp4"
+        _warm_camera_path()
 
         try:
             proc = subprocess.Popen(
-                build_record_cmd(out_path, cam_spec),
+                build_record_cmd(out_path),
                 stdin=subprocess.PIPE,
             )
         except FileNotFoundError:
@@ -1419,12 +1453,6 @@ def record_orchestrator() -> None:
             with _inflight_lock:
                 _inflight_proc = None
                 _inflight_path = None
-            # Drop the live-frame sidecar so the next print's early snapshots
-            # can't pick up a stale frame from this recording.
-            try:
-                LATEST_FRAME_PATH.unlink(missing_ok=True)
-            except Exception as e:
-                log.warning(f"[record] could not remove {LATEST_FRAME_PATH}: {e!r}")
 
         if youtube:
             threading.Thread(
@@ -1450,9 +1478,10 @@ if __name__ == "__main__":
     log.info("═" * 50)
     log.info("  P.A.R. Recorder + Snapshot/Mod Pollers")
     log.info("═" * 50)
-    log.info(f"  Source : avfoundation webcam, name prefix {CAMERA_NAME!r}")
+    log.info(f"  Source : {(RTSP_URL or '<unset>').split('@')[-1]}")
     log.info(f"  Target : YouTube Data API (videos.insert)")
-    log.info(f"  Video  : {VIDEO_BITRATE} H.264 veryfast, video-only (no audio), cap {RECORD_MAX_SECONDS}s")
+    log.info(f"  Video  : {VIDEO_BITRATE} H.264 veryfast, cap {RECORD_MAX_SECONDS}s")
+    log.info(f"  Audio  : {AUDIO_BITRATE} AAC")
     log.info(f"  Poller : {SNAPSHOT_REQUEST_URL}")
     log.info("═" * 50)
 

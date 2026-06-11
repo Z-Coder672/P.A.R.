@@ -14,14 +14,24 @@ const float Y_TRAVEL = 399.695f;
 const int SERVO_PIN = 9;
 // Pulse widths match the standard Servo lib mapping
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°) so the angles the
-// rig was tuned for stay the same: REST≈0°, RELEASE≈30°, ENGAGE≈80°.
+// rig was tuned for stay the same: REST≈0°, RELEASE≈38°, ENGAGE≈90°.
 const int SERVO_US_REST    = 544;
-const int SERVO_US_RELEASE = 853;
-const int SERVO_US_ENGAGE  = 1369;
-const int SERVO_80_DEG_SETTLE_MS  = 300;
-const int SERVO_30_DEG_SETTLE_MS  = 100;
+const int SERVO_US_RELEASE = 936;
+const int SERVO_US_ENGAGE  = 1471;
+const int SERVO_90_DEG_SETTLE_MS  = 300;
+const int SERVO_50_DEG_SETTLE_MS  = 100;
+// Second-catch arm angle for the error-reduction pass: ~10° below RELEASE.
+// 544–2400µs over 0–180° (~10.3µs/°), so 10° ≈ 103µs. Mirrors PARMain.ino.
+const int SERVO_US_10_DEG = 103;
+const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
+const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
-const float FLIP_OFFSET_Y = 20.0f;
+
+// Step-3 second-catch pass: after the main flip+catch, drop the arm a further
+// ~10° (to RELEASE2, ~28°) and sweep +X once more to push back any disc the
+// first catch left over/under-rotated. Comment this out to remove the
+// second-catch back-move. Mirrors PARMain.ino — keep both in sync.
+//#define FLIP_SECOND_CATCH
 
 Servo flipServo;
 
@@ -41,8 +51,8 @@ void initGrid() {
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
       // 25 mm starting X offset — matches P.A.R.Main.
-      grid[y][x].x = -X_TRAVEL + 25.0f + 20.0f * x;
-      grid[y][x].y = -Y_TRAVEL + 0.0f + 22.0f * ((GRID_H - 1) - y);
+      grid[y][x].x = -X_TRAVEL + 25.0f + 20.045f * x;
+      grid[y][x].y = -Y_TRAVEL + 0.0f + 23.40f * ((GRID_H - 1) - y);
     }
   }
 }
@@ -134,29 +144,29 @@ void waitForMotion() {
   waitForIdle();
 }
 
-void flipDisc(int gx, int gy) {
+// Mirrors PARMain.ino flipDisc, including the second error-reduction catch.
+// `catchByNextMove`: when the caller's next motion already travels +X by
+// ≥FLIP_OFFSET_X (an LTR row with another flip ahead), pass true to leave the
+// arm down at RELEASE2 and let that move perform the catch; otherwise pass
+// false for an explicit +X stroke + re-park at REST.
+void flipDisc(int gx, int gy, bool catchByNextMove) {
   moveTo(grid[gy][gx].x, grid[gy][gx].y);
   waitForMotion();
 
-  writeServoUs(SERVO_US_ENGAGE, SERVO_80_DEG_SETTLE_MS);
-  writeServoUs(SERVO_US_REST, SERVO_80_DEG_SETTLE_MS);
+  writeServoUs(SERVO_US_ENGAGE, SERVO_90_DEG_SETTLE_MS);
+  writeServoUs(SERVO_US_REST, SERVO_90_DEG_SETTLE_MS);
 
-  float dy = (gy == GRID_H - 1) ? -FLIP_OFFSET_Y : FLIP_OFFSET_Y;
   float dx = FLIP_OFFSET_X;
   if (grid[gy][gx].x + dx > 0.0f) dx = -grid[gy][gx].x;
 
   char cmd[32];
   sendGcode("G91");
-  snprintf(cmd, sizeof(cmd), "G0 Y%.3f", -dy);
-  sendGcode(cmd);
   snprintf(cmd, sizeof(cmd), "G0 X%.3f", dx);
-  sendGcode(cmd);
-  snprintf(cmd, sizeof(cmd), "G0 Y%.3f", dy);
   sendGcode(cmd);
   sendGcode("G90");
   waitForMotion();
 
-  writeServoUs(SERVO_US_RELEASE, SERVO_30_DEG_SETTLE_MS);
+  writeServoUs(SERVO_US_RELEASE, SERVO_50_DEG_SETTLE_MS);
 
   sendGcode("G91");
   snprintf(cmd, sizeof(cmd), "G0 X%.3f", -dx);
@@ -164,7 +174,26 @@ void flipDisc(int gx, int gy) {
   sendGcode("G90");
   waitForMotion();
 
-  writeServoUs(SERVO_US_REST, SERVO_30_DEG_SETTLE_MS);
+#ifdef FLIP_SECOND_CATCH
+  // Second catch pass — drop the arm ~10° below RELEASE; emit our own +X
+  // stroke only when the next move won't already provide it.
+  writeServoUs(SERVO_US_RELEASE2, SERVO_10_DEG_SETTLE_MS);
+  if (!catchByNextMove) {
+    float dx2 = FLIP_OFFSET_X;
+    if (grid[gy][gx].x + dx2 > 0.0f) dx2 = -grid[gy][gx].x;
+    sendGcode("G91");
+    snprintf(cmd, sizeof(cmd), "G0 X%.3f", dx2);
+    sendGcode(cmd);
+    sendGcode("G90");
+    waitForMotion();
+    writeServoUs(SERVO_US_REST, SERVO_10_DEG_SETTLE_MS);
+  }
+#else
+  // Second catch disabled — there's no extra pass to leave the arm down for, so
+  // park it at REST regardless of catchByNextMove.
+  (void)catchByNextMove;
+  writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
+#endif
 }
 
 // End-of-job cleanup pass with the servo parked at REST. Serpentine sweep
@@ -232,7 +261,11 @@ void setup() {
       Serial.print(",");
       Serial.print(y);
       Serial.println(")");
-      flipDisc(x, y);
+      // On an LTR row, if another flipped cell follows (x + xStep still in
+      // range), its flipDisc opening move travels +X by 2 cell pitches
+      // (40.08 mm > 16.8 mm) — fold the second catch into it.
+      bool catchByNextMove = ltr && (x + xStep <= xEnd);
+      flipDisc(x, y, catchByNextMove);
       waitForIdle();
     }
 

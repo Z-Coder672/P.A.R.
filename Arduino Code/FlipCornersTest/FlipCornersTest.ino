@@ -13,13 +13,13 @@ const float Y_TRAVEL = 399.695f;
 const int SERVO_PIN = 9;
 // Pulse widths match the standard Servo lib mapping
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°) so the angles the
-// rig was tuned for stay the same: REST≈0°, RELEASE≈25°, ENGAGE≈80°.
+// rig was tuned for stay the same: REST≈0°, RELEASE≈50°, ENGAGE≈90°.
 const int SERVO_US_REST    = 544;
-const int SERVO_US_RELEASE = 802;
-const int SERVO_US_ENGAGE  = 1369;
-const int SERVO_SETTLE_MS  = 500;
+const int SERVO_US_RELEASE = 1060;
+const int SERVO_US_ENGAGE  = 1471;
+const int SERVO_90_DEG_SETTLE_MS  = 300;
+const int SERVO_50_DEG_SETTLE_MS  = 100;
 const float FLIP_OFFSET_X = 16.8f;
-const float FLIP_OFFSET_Y = 20.0f;
 
 // Back to the standard Servo library — it's the same path Sweep uses, which
 // the user has confirmed moves the servo on this rig. Bit-bang (digitalWrite)
@@ -27,10 +27,10 @@ const float FLIP_OFFSET_Y = 20.0f;
 // specific to those alternative drivers, not the Servo library or wiring.
 Servo flipServo;
 
-void writeServoUs(int us) {
+void writeServoUs(int us, int servo_settle_ms) {
   Serial.print("writeServoUs("); Serial.print(us); Serial.println(")");
   flipServo.writeMicroseconds(us);
-  delay(SERVO_SETTLE_MS);
+  delay(servo_settle_ms);
 }
 
 struct Coord {
@@ -43,8 +43,8 @@ void initGrid() {
   for (int y = 0; y < GRID_H; y++) {
     for (int x = 0; x < GRID_W; x++) {
       // 25 mm starting X offset (slight tweak vs. P.A.R.Main's 25.0f).
-      grid[y][x].x = -X_TRAVEL + 25.07f + 20.0f * x;
-      grid[y][x].y = -Y_TRAVEL + 0.0f + 22.0f * ((GRID_H - 1) - y);
+      grid[y][x].x = -X_TRAVEL + 25.f + 20.045f * x;
+      grid[y][x].y = -Y_TRAVEL + 0.0f + 23.40f * ((GRID_H - 1) - y);
     }
   }
 }
@@ -125,25 +125,20 @@ void flipDisc(int gx, int gy) {
   moveTo(grid[gy][gx].x, grid[gy][gx].y);
   waitForMotion();
 
-  writeServoUs(SERVO_US_ENGAGE);
-  writeServoUs(SERVO_US_REST);
+  writeServoUs(SERVO_US_ENGAGE, SERVO_90_DEG_SETTLE_MS);
+  writeServoUs(SERVO_US_REST, SERVO_90_DEG_SETTLE_MS);
 
-  float dy = (gy == GRID_H - 1) ? -FLIP_OFFSET_Y : FLIP_OFFSET_Y;
   float dx = FLIP_OFFSET_X;
   if (grid[gy][gx].x + dx > 0.0f) dx = -grid[gy][gx].x;
 
   char cmd[32];
   sendGcode("G91");
-  snprintf(cmd, sizeof(cmd), "G0 Y%.3f", -dy);
-  sendGcode(cmd);
   snprintf(cmd, sizeof(cmd), "G0 X%.3f", dx);
-  sendGcode(cmd);
-  snprintf(cmd, sizeof(cmd), "G0 Y%.3f", dy);
   sendGcode(cmd);
   sendGcode("G90");
   waitForMotion();
 
-  writeServoUs(SERVO_US_RELEASE);
+  writeServoUs(SERVO_US_RELEASE, SERVO_50_DEG_SETTLE_MS);
 
   sendGcode("G91");
   snprintf(cmd, sizeof(cmd), "G0 X%.3f", -dx);
@@ -151,7 +146,7 @@ void flipDisc(int gx, int gy) {
   sendGcode("G90");
   waitForMotion();
 
-  writeServoUs(SERVO_US_REST);
+  writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
 }
 
 void setup() {
@@ -177,7 +172,7 @@ void setup() {
   sendGcode("G90");
   waitForIdle();
 
-  writeServoUs(SERVO_US_REST);
+  writeServoUs(SERVO_US_REST, 1000);
 
   const int corners[4][2] = {
     { GRID_W - 1, GRID_H - 1 },

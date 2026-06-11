@@ -110,8 +110,8 @@ void initGrid() {
     for (int x = 0; x < GRID_W; x++) {
       //           starting offset⌄
       // 25 mm starting X offset, matching P.A.R.Main.
-      grid[y][x].x = -X_TRAVEL + 25.0f + 20.0f * x;
-      grid[y][x].y = -Y_TRAVEL +  0.0f + 22.0f * ((GRID_H - 1) - y);
+      grid[y][x].x = -X_TRAVEL + 25.0f + 20.045f * x;
+      grid[y][x].y = -Y_TRAVEL +  0.0f + 23.40f * ((GRID_H - 1) - y);
       //                                  ⌃grid spacing
     }
   }
@@ -208,10 +208,8 @@ void loop() {
   if (started) return;
   started = true;
 
-  // Skip the rightmost column on the sensor pass; the existing scan offset
-  // is set up so the leftmost column likewise falls outside the sweep.
   for (int y = 0; y < GRID_H; y++) {
-    for (int x = 0; x < GRID_W - 1; x++) {
+    for (int x = 0; x < GRID_W; x++) {
       sampleAndPrint(x, y,            0.0f,            0.0f);
       sampleAndPrint(x, y, -SAMPLE_RADIUS, -SAMPLE_RADIUS);
       sampleAndPrint(x, y,  SAMPLE_RADIUS, -SAMPLE_RADIUS);

@@ -1,13 +1,14 @@
-// Walks 6 rows of the known-pattern board (top 2, middle 2, bottom 2),
-// samples the center of each cell with the TCS3200, runs the trained
-// classifier, and prints the resulting blue/black accuracy.
+// Walks every row of the known-pattern board, samples the center of each
+// cell with the TCS3200, runs the trained classifier, and prints the
+// resulting blue/black accuracy.
 //
 // Uses the same homing/grid/streaming setup as CollectColorTrainingData,
-// but only the row centers and only one sample per cell — this is a quick
-// model sanity check, not a training pass.
+// but only one sample per cell — this is a quick model sanity check, not
+// a training pass.
 //
-// Expected board pattern (matches CollectColorTrainingData):
-//   full checkerboard — black where (x+y) is even, blue where (x+y) is odd.
+// Assumed board pattern: the "Luv" bitmap (heart + "u" letters) packed
+// 37x18 = 666 bits MSB-first into 84 bytes; bit 1 = blue disc, bit 0 =
+// black disc. Same packing as the site's bitmap format.
 //
 // Drop a trained model_weights.h into this sketch folder before flashing.
 
@@ -37,9 +38,17 @@ enum TcsFilter {
 struct Coord { float x; float y; };
 Coord grid[GRID_H][GRID_W];
 
-// Top 2, middle 2, bottom 2 rows of an 18-row board.
-const int VALIDATION_ROWS[] = {0, 1, 8, 9, 16, 17};
-const int N_VALIDATION_ROWS = sizeof(VALIDATION_ROWS) / sizeof(VALIDATION_ROWS[0]);
+// "Luv" pattern, 37x18 packed MSB-first into 84 bytes
+// (base64: AAAAAADgAAAAAgAAAAAQDjgAAID74AAED/+AAHB//AAAA//gAAAP/gAAAD/giAAA/ARAAAHAIgAABAEQAAAACIAAAAB8AAAAAAAAAAAAAAAAAAAA).
+const uint8_t LUV_BITMAP[84] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+  0x00, 0x00, 0x10, 0x0E, 0x38, 0x00, 0x00, 0x80, 0xFB, 0xE0, 0x00, 0x04,
+  0x0F, 0xFF, 0x80, 0x00, 0x70, 0x7F, 0xFC, 0x00, 0x00, 0x03, 0xFF, 0xE0,
+  0x00, 0x00, 0x0F, 0xFE, 0x00, 0x00, 0x00, 0x3F, 0xE0, 0x88, 0x00, 0x00,
+  0xFC, 0x04, 0x40, 0x00, 0x01, 0xC0, 0x22, 0x00, 0x00, 0x04, 0x01, 0x10,
+  0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
 
 // Ring buffer for the 5-frame running average fed to the classifier.
 static uint32_t ring[AVG_WINDOW][4];
@@ -105,8 +114,8 @@ void initGrid() {
     for (int x = 0; x < GRID_W; x++) {
       // Starting flip-head offset is 25 mm; the inline -23 mm bakes in
       // SCAN_OFFSET_X to land the sensor over the cell centre.
-      grid[y][x].x = -X_TRAVEL + 25.0f - 23.0f + 20.0f * x;
-      grid[y][x].y = -Y_TRAVEL + 0.0f + 4.0f + 22.0f * ((GRID_H - 1) - y);
+      grid[y][x].x = -X_TRAVEL + 25.0f - 23.0f + 20.045f * x;
+      grid[y][x].y = -Y_TRAVEL + 0.0f + 4.0f + 23.40f * ((GRID_H - 1) - y);
     }
   }
 }
@@ -153,7 +162,9 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
 }
 
 uint8_t expectedColor(int x, int y) {
-  return ((x + y) & 1) ? 1 : 0;  // black at (0,0), blue where (x+y) odd
+  int bitIndex = y * GRID_W + x;
+  uint8_t byte = LUV_BITMAP[bitIndex >> 3];
+  return (byte >> (7 - (bitIndex & 7))) & 0x01;  // 1 = blue, 0 = black
 }
 
 int totalSamples = 0;
@@ -222,11 +233,8 @@ void loop() {
   if (started) return;
   started = true;
 
-  for (int i = 0; i < N_VALIDATION_ROWS; i++) {
-    int y = VALIDATION_ROWS[i];
-    // Skip the rightmost column on the sensor pass — matches the scan
-    // geometry used by P.A.R.Main and CollectColorTrainingData.
-    for (int x = 0; x < GRID_W - 1; x++) {
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) {
       sampleAndCheck(x, y);
     }
   }

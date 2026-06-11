@@ -44,20 +44,44 @@ function showTab(tabName) {
     updateUploadRotatePrompt();
 
     if (tabName === 'gallery') {
-        loadGallery();
+        loadGallerySubtab(currentGallerySubtab);
         startGalleryPolling();
     } else {
         stopGalleryPolling();
+    }
+
+    if (tabName === 'latest') {
+        loadLatestRecording();
     }
 }
 
 const GALLERY_POLL_INTERVAL_MS = 5000;
 let galleryPollTimer = null;
+let currentGallerySubtab = 'gallery';
+let gallerySearchQuery = '';
+
+function itemMatchesSearch(item) {
+    if (!gallerySearchQuery) return true;
+    const name = (item && item.name ? String(item.name) : '').toLowerCase();
+    return name.includes(gallerySearchQuery);
+}
+
+function loadGallerySubtab(subtab) {
+    if (subtab === 'queue') {
+        loadQueue();
+    } else {
+        loadGallery();
+    }
+}
 
 function startGalleryPolling() {
     stopGalleryPolling();
     galleryPollTimer = setInterval(() => {
-        loadGallery({ silent: true });
+        if (currentGallerySubtab === 'queue') {
+            loadQueue({ silent: true });
+        } else {
+            loadGallery({ silent: true });
+        }
     }, GALLERY_POLL_INTERVAL_MS);
 }
 
@@ -68,75 +92,98 @@ function stopGalleryPolling() {
     }
 }
 
+function setGallerySubtab(subtab) {
+    currentGallerySubtab = subtab;
+    document.querySelectorAll('.gallery-subtab').forEach(btn => {
+        const isActive = btn.dataset.subtab === subtab;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    });
+    document.getElementById('galleryContainer').classList.toggle('hidden', subtab !== 'gallery');
+    document.getElementById('queueContainer').classList.toggle('hidden', subtab !== 'queue');
+    loadGallerySubtab(subtab);
+}
+
 // Determine active tab from URL
 function getActiveTabFromUrl() {
     const pathname = window.location.pathname.replace(/\/$/, '');
     if (pathname === '/upload') return 'upload';
     if (pathname === '/gallery') return 'gallery';
     if (pathname === '/about') return 'about';
-    return 'livestream';
+    return 'latest';
 }
 
-// Livestream search and embed functionality
-async function loadPARLivestream() {
-    const livestreamContainer = document.querySelector('.livestream-container');
+// Latest recording: server stores the newest upload in latest-video.json
+// (written by stream-video-id.php when YT-Streamer finishes uploading). One
+// fetch, no YouTube Data API calls.
+async function loadLatestRecording() {
+    const container = document.querySelector('.latest-container');
+    if (!container) return;
+
+    container.innerHTML = '';
+    const loadingBox = document.createElement('div');
+    loadingBox.className = 'latest-loading-box';
+    loadingBox.textContent = 'Loading latest recording...';
+    container.appendChild(loadingBox);
+
+    const renderEmpty = () => {
+        container.innerHTML = '';
+        const box = document.createElement('div');
+        box.className = 'no-latest-box';
+        const p = document.createElement('p');
+        p.textContent = 'No recordings yet —';
+        const link = document.createElement('a');
+        link.href = '/upload';
+        link.className = 'nav-link';
+        link.dataset.tab = 'upload';
+        link.textContent = 'head to Upload to draw the first one.';
+        link.addEventListener('click', function(e) {
+            e.preventDefault();
+            window.history.pushState({tab: 'upload'}, '', '/upload');
+            showTab('upload');
+        });
+        box.appendChild(p);
+        box.appendChild(link);
+        container.appendChild(box);
+    };
 
     try {
-        livestreamContainer.innerHTML = '';
-        const loadingBox = document.createElement('div');
-        loadingBox.className = 'livestream-loading-box';
-        loadingBox.textContent = 'Loading livestream...';
-        livestreamContainer.appendChild(loadingBox);
-
-        const response = await fetch('/livestream-api.php');
-        const data = await response.json();
-
-        if (data.found && data.videoId) {
-            if (livestreamContainer) {
-                const iframeWrapper = document.createElement('div');
-                iframeWrapper.className = 'livestream-iframe-wrapper';
-                iframeWrapper.style.display = 'none';
-
-                const iframe = document.createElement('iframe');
-                iframe.width = '100%';
-                iframe.height = '100%';
-                iframe.src = `https://www.youtube.com/embed/${data.videoId}?autoplay=1`;
-                iframe.frameBorder = '0';
-                iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
-                iframe.allowFullscreen = true;
-                iframe.className = 'livestream-iframe';
-
-                iframe.onload = function() {
-                    loadingBox.style.display = 'none';
-                    iframeWrapper.style.display = 'block';
-                };
-
-                iframeWrapper.appendChild(iframe);
-                livestreamContainer.appendChild(iframeWrapper);
-
-                const title = document.createElement('p');
-                title.className = 'livestream-caption';
-                title.textContent = data.title;
-                livestreamContainer.appendChild(title);
-            }
-        } else {
-            if (livestreamContainer) {
-                livestreamContainer.innerHTML = '';
-                const noLiveBox = document.createElement('div');
-                noLiveBox.className = 'no-livestream-box';
-                noLiveBox.textContent = 'No livestream available';
-                livestreamContainer.appendChild(noLiveBox);
-            }
+        const resp = await fetch('/latest-video.php');
+        if (resp.status === 204) {
+            renderEmpty();
+            return;
         }
-    } catch (error) {
-        console.error('Error loading livestream:', error);
-        if (livestreamContainer) {
-            livestreamContainer.innerHTML = '';
-            const errorBox = document.createElement('div');
-            errorBox.className = 'no-livestream-box';
-            errorBox.textContent = 'Error loading livestream';
-            livestreamContainer.appendChild(errorBox);
+        if (!resp.ok) throw new Error('latest-video.php ' + resp.status);
+        const data = await resp.json();
+        const videoId = data.video_id;
+        if (!videoId || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
+            renderEmpty();
+            return;
         }
+
+        container.innerHTML = '';
+        const wrapper = document.createElement('div');
+        wrapper.className = 'latest-iframe-wrapper';
+        const iframe = document.createElement('iframe');
+        iframe.src = `https://www.youtube.com/embed/${videoId}?autoplay=1`;
+        iframe.frameBorder = '0';
+        iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
+        iframe.allowFullscreen = true;
+        iframe.className = 'latest-iframe';
+        wrapper.appendChild(iframe);
+        container.appendChild(wrapper);
+
+        const caption = document.createElement('p');
+        caption.className = 'latest-caption';
+        caption.textContent = data.name || 'Latest P.A.R. recording';
+        container.appendChild(caption);
+    } catch (err) {
+        console.error('Error loading latest recording:', err);
+        container.innerHTML = '';
+        const errorBox = document.createElement('div');
+        errorBox.className = 'no-latest-box';
+        errorBox.textContent = 'Error loading latest recording';
+        container.appendChild(errorBox);
     }
 }
 
@@ -153,19 +200,30 @@ async function loadGallery({ silent = false } = {}) {
         const response = await fetch('/gallery.php');
         const data = await response.json();
 
-        const items = data.items || [];
+        const allItems = data.items || [];
+        const items = allItems.filter(itemMatchesSearch);
 
         if (items.length === 0) {
             container.innerHTML = '';
             const placeholder = document.createElement('div');
             placeholder.className = 'gallery-placeholder';
-            placeholder.innerHTML = `
-                <div class="gallery-placeholder-icon">
-                    <i class="fa-solid fa-image"></i>
-                </div>
-                <p class="gallery-placeholder-text">No pictures yet</p>
-                <p class="gallery-placeholder-sub">Pictures appear here after being displayed on the P.A.R.</p>
-            `;
+            if (gallerySearchQuery && allItems.length > 0) {
+                placeholder.innerHTML = `
+                    <div class="gallery-placeholder-icon">
+                        <i class="fa-solid fa-magnifying-glass"></i>
+                    </div>
+                    <p class="gallery-placeholder-text">No matches</p>
+                    <p class="gallery-placeholder-sub">No gallery items match your search.</p>
+                `;
+            } else {
+                placeholder.innerHTML = `
+                    <div class="gallery-placeholder-icon">
+                        <i class="fa-solid fa-image"></i>
+                    </div>
+                    <p class="gallery-placeholder-text">No pictures yet</p>
+                    <p class="gallery-placeholder-sub">Pictures appear here after being displayed on the P.A.R.</p>
+                `;
+            }
             container.appendChild(placeholder);
             return;
         }
@@ -196,6 +254,117 @@ async function loadGallery({ silent = false } = {}) {
     }
 }
 
+// Queue
+async function loadQueue({ silent = false } = {}) {
+    const container = document.getElementById('queueContainer');
+    if (!container) return;
+
+    if (!silent) {
+        container.innerHTML = '<p class="gallery-loading">Loading...</p>';
+    }
+
+    try {
+        const response = await fetch('/queue.php');
+        const data = await response.json();
+
+        const allItems = data.items || [];
+        const items = allItems.filter(itemMatchesSearch);
+
+        if (items.length === 0) {
+            container.innerHTML = '';
+            const placeholder = document.createElement('div');
+            placeholder.className = 'gallery-placeholder';
+            if (gallerySearchQuery && allItems.length > 0) {
+                placeholder.innerHTML = `
+                    <div class="gallery-placeholder-icon">
+                        <i class="fa-solid fa-magnifying-glass"></i>
+                    </div>
+                    <p class="gallery-placeholder-text">No matches</p>
+                    <p class="gallery-placeholder-sub">No queued items match your search.</p>
+                `;
+            } else {
+                placeholder.innerHTML = `
+                    <div class="gallery-placeholder-icon">
+                        <i class="fa-solid fa-hourglass-half"></i>
+                    </div>
+                    <p class="gallery-placeholder-text">Queue is empty</p>
+                    <p class="gallery-placeholder-sub">Submitted pictures waiting for P.A.R. appear here.</p>
+                `;
+            }
+            container.appendChild(placeholder);
+            return;
+        }
+
+        const grid = document.createElement('div');
+        grid.className = 'gallery-grid';
+
+        items.forEach(item => {
+            const card = document.createElement('div');
+            card.className = 'gallery-card';
+
+            const img = bitmapBase64ToCanvas(item.bitmap);
+            img.className = 'gallery-image';
+
+            card.appendChild(img);
+            card.addEventListener('click', () => openQueueModal(item));
+
+            grid.appendChild(card);
+        });
+
+        container.innerHTML = '';
+        container.appendChild(grid);
+    } catch (error) {
+        console.error('Error loading queue:', error);
+        if (!silent) {
+            container.innerHTML = '<p class="gallery-loading">Error loading queue</p>';
+        }
+    }
+}
+
+function ordinalSuffix(n) {
+    const v = n % 100;
+    if (v >= 11 && v <= 13) return 'th';
+    switch (n % 10) {
+        case 1: return 'st';
+        case 2: return 'nd';
+        case 3: return 'rd';
+        default: return 'th';
+    }
+}
+
+function openQueueModal(item) {
+    const modal = document.getElementById('galleryItemModal');
+    const nameEl = document.getElementById('galleryModalName');
+    const imgEl = document.getElementById('galleryModalImage');
+    const snapshotEl = document.getElementById('galleryModalSnapshot');
+    const noSnapshotEl = document.getElementById('galleryModalNoSnapshot');
+    const pendingEl = document.getElementById('galleryModalPending');
+    const queueEl = document.getElementById('galleryModalQueue');
+
+    imgEl.classList.add('hidden');
+    snapshotEl.classList.add('hidden');
+    snapshotEl.removeAttribute('src');
+    noSnapshotEl.classList.add('hidden');
+    pendingEl.classList.add('hidden');
+    queueEl.classList.add('hidden');
+
+    nameEl.textContent = item.name || '(unnamed)';
+
+    if (item.bitmap) {
+        const src = bitmapBase64ToCanvas(item.bitmap);
+        imgEl.width = src.width;
+        imgEl.height = src.height;
+        imgEl.getContext('2d').drawImage(src, 0, 0);
+        imgEl.classList.remove('hidden');
+    }
+
+    const pos = item.position;
+    queueEl.textContent = `In queue — ${pos}${ordinalSuffix(pos)} position`;
+    queueEl.classList.remove('hidden');
+
+    modal.classList.remove('hidden');
+}
+
 // Gallery item modal — re-fetches gallery state so a stale cached `item.pending`
 // from the initial render can't make a completed entry look "In progress".
 async function openGalleryItem(cachedItem) {
@@ -218,6 +387,8 @@ function openGalleryModal(item) {
     const snapshotEl = document.getElementById('galleryModalSnapshot');
     const noSnapshotEl = document.getElementById('galleryModalNoSnapshot');
     const pendingEl = document.getElementById('galleryModalPending');
+    const queueEl = document.getElementById('galleryModalQueue');
+    const videoEl = document.getElementById('galleryModalVideo');
 
     nameEl.textContent = '';
     imgEl.classList.add('hidden');
@@ -225,6 +396,9 @@ function openGalleryModal(item) {
     snapshotEl.removeAttribute('src');
     noSnapshotEl.classList.add('hidden');
     pendingEl.classList.add('hidden');
+    queueEl.classList.add('hidden');
+    videoEl.classList.add('hidden');
+    videoEl.innerHTML = '';
 
     nameEl.textContent = item.name || '(unnamed)';
 
@@ -246,6 +420,33 @@ function openGalleryModal(item) {
     }
 
     modal.classList.remove('hidden');
+
+    if (item.video_id && /^[A-Za-z0-9_-]{11}$/.test(item.video_id)) {
+        maybeEmbedRecording(item.video_id, videoEl);
+    }
+}
+
+async function maybeEmbedRecording(videoId, container) {
+    try {
+        const resp = await fetch('/video-status.php?id=' + encodeURIComponent(videoId));
+        if (!resp.ok) return;
+        const data = await resp.json();
+        // Skip if the video doesn't exist (deleted) or is still processing on
+        // YouTube's side. Uploaded recordings are never live; the gate is for
+        // legacy gallery rows that point at live broadcasts.
+        if (!data.exists || data.live) return;
+
+        const iframe = document.createElement('iframe');
+        iframe.src = 'https://www.youtube.com/embed/' + encodeURIComponent(videoId);
+        iframe.title = 'P.A.R. broadcast recording';
+        iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
+        iframe.allowFullscreen = true;
+        iframe.loading = 'lazy';
+        container.appendChild(iframe);
+        container.classList.remove('hidden');
+    } catch (err) {
+        console.error('video-status check failed:', err);
+    }
 }
 
 function closeGalleryModal() {
@@ -253,18 +454,53 @@ function closeGalleryModal() {
 }
 
 // Load livestream when page is ready
+function updateNavbarHeightVar() {
+    const navbar = document.querySelector('.navbar');
+    if (!navbar) return;
+    const h = navbar.getBoundingClientRect().height;
+    document.documentElement.style.setProperty('--navbar-height', `${h}px`);
+}
+
+window.addEventListener('resize', updateNavbarHeightVar);
+window.addEventListener('orientationchange', updateNavbarHeightVar);
+
+function observeGallerySubtabsStuck() {
+    const sentinel = document.querySelector('.gallery-subtabs-sentinel');
+    const subtabs = document.querySelector('.gallery-subtabs');
+    if (!sentinel || !subtabs || !('IntersectionObserver' in window)) return;
+
+    const navH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--navbar-height')) || 64;
+    const observer = new IntersectionObserver(
+        ([entry]) => {
+            subtabs.classList.toggle('stuck', !entry.isIntersecting);
+        },
+        { rootMargin: `-${navH}px 0px 0px 0px`, threshold: 0 }
+    );
+    observer.observe(sentinel);
+}
+
 document.addEventListener('DOMContentLoaded', function() {
-    loadPARLivestream();
+    updateNavbarHeightVar();
+    observeGallerySubtabsStuck();
+    loadLatestRecording();
+
+    document.querySelectorAll('.gallery-subtab').forEach(btn => {
+        btn.addEventListener('click', function() {
+            setGallerySubtab(this.dataset.subtab);
+        });
+    });
+
+    const gallerySearchInput = document.getElementById('gallerySearch');
+    if (gallerySearchInput) {
+        gallerySearchInput.addEventListener('input', function() {
+            gallerySearchQuery = this.value.trim().toLowerCase();
+            loadGallerySubtab(currentGallerySubtab);
+        });
+    }
 
     document.getElementById('closeGalleryModal').addEventListener('click', closeGalleryModal);
     document.getElementById('galleryItemModal').addEventListener('click', function(e) {
         if (e.target === this) closeGalleryModal();
-    });
-    document.getElementById('galleryModalLivestreamLink').addEventListener('click', function(e) {
-        e.preventDefault();
-        closeGalleryModal();
-        window.history.pushState({tab: 'livestream'}, '', '/livestream');
-        showTab('livestream');
     });
 });
 

@@ -44,13 +44,18 @@ function acquireConcurrencySlot(string $scriptName)
     return false;
 }
 
-$requestMethod = $_SERVER['REQUEST_METHOD'] ?? (PHP_SAPI === 'cli' ? 'GET' : null);
+// POST-only: this endpoint pops a queue item per call, so it must not be
+// replay-safe at the HTTP layer. GET is spec-allowed to be retried by any
+// intermediate (Cloudflare retries on origin connect-fail/5xx); a silent
+// retry would pop a second item that the Arduino never sees, leaving an
+// orphan gallery/<N>/pending.json. POST is not retried by default.
+$requestMethod = $_SERVER['REQUEST_METHOD'] ?? (PHP_SAPI === 'cli' ? 'POST' : null);
 
-if ($requestMethod !== 'GET') {
+if ($requestMethod !== 'POST') {
     http_response_code(405);
-    header('Allow: GET');
+    header('Allow: POST');
     header('Content-Type: text/plain; charset=UTF-8');
-    echo 'GET only';
+    echo 'POST only';
     exit;
 }
 
@@ -137,6 +142,20 @@ if (mkdir($entryDir, 0777, true)) {
         );
         header('X-Gallery-Id: ' . $galleryIndex);
         file_put_contents(__DIR__ . '/snapshot-pending.flag', (string)$galleryIndex);
+        // Stream-restart flag: YT-Streamer polls this to retitle the
+        // YouTube broadcast with the art-piece name when a new print
+        // starts. Stale flags (>10 min) get dropped on the next write or
+        // by stream-start.php on read, so a queued-but-never-picked-up
+        // print doesn't retitle a much-later stream.
+        $streamFlag = __DIR__ . '/stream-pending.flag';
+        $existing = @filemtime($streamFlag);
+        if ($existing !== false && (time() - $existing) > 600) {
+            @unlink($streamFlag);
+        }
+        file_put_contents($streamFlag, json_encode(
+            ['id' => $galleryIndex, 'name' => $itemName],
+            JSON_UNESCAPED_UNICODE
+        ));
     }
 }
 

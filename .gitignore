@@ -20,3 +20,9 @@ YT-Streamer/stream.log
 YT-Streamer/venv/
 **/venv/
 **/__pycache__/
+
+# Arduino build artifacts
+**/build/
+
+# Stray logs
+YT-Streamer/stream.log.fresh
