@@ -19,7 +19,7 @@ const int   GRID_H = 18;
 const int   AVG_WINDOW = 5;
 
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 399.695f;
+const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 
 // TCS3200 sensor pins (matches P.A.R.Main).
 const int TCS_S0  = 4;

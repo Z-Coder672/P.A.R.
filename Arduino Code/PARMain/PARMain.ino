@@ -19,7 +19,7 @@ const int GRID_H = 18;
 
 // CNC homes to full negatives, so the work area lives in negative coordinates.
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 399.695f;
+const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 
 // TCS3200 color sensor: S0-S3 + OUT on D4..D8.
 // Defined before any function so the Arduino IDE's auto-prototype generator
@@ -516,13 +516,13 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
 const float SCAN_OFFSET_X = -23.0f;
 const float SCAN_OFFSET_Y = 4.0f;
 
-// The sensor sits +SCAN_OFFSET_Y in Y from the flip head, so reading the top
-// bitmap row (grid Y ≈ -1.895) would command the gantry to ≈ +2.105 — past the
-// Y=0 soft-limit edge, which GRBL rejects with ALARM:2 ($20=1). Clamp every scan
-// target's Y to stay just inside the envelope; the top row then reads ~2 mm low
-// (still well within the ~16 mm disc), every lower row is strongly negative and
-// untouched. NOTE: raising $131 does NOT help — that extends the -Y end, while
-// this overrun is on the +Y (Y=0) end, which GRBL caps at 0 regardless of $131.
+// The sensor sits +SCAN_OFFSET_Y in Y from the flip head, so the top bitmap
+// row's scan target is the closest any move gets to the Y=0 soft-limit edge
+// (GRBL rejects target > 0 with ALARM:2 under $20=1). With Y_TRAVEL=$131=402
+// the top-row scan lands at -402 + 23.40*17 + 4.0 = -0.2 — inside the envelope
+// — but keep this clamp as a safety net so future offset/pitch tweaks can't
+// silently push a scan target past 0. (Historic bug: with $131=399.695 the
+// same target was +2.105 → deterministic ALARM:2 on every top-row scan.)
 const float SCAN_Y_MAX = -0.05f;
 static inline float clampScanY(float y) { return y > SCAN_Y_MAX ? SCAN_Y_MAX : y; }
 

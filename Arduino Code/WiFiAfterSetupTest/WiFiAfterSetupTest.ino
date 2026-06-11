@@ -323,7 +323,7 @@ void gcodeStreamStress() {
 const int   GRID_W = 37;
 const int   GRID_H = 18;
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 399.695f;
+const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 const float SCAN_OFFSET_X = -23.0f;
 const float SCAN_OFFSET_Y =   4.0f;
 
