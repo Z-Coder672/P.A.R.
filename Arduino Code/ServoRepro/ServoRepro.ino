@@ -23,8 +23,8 @@ const int SERVO_50_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 
 // ---- Strip-down knobs (change one at a time once it reproduces) ----
-#define DO_X_MOVES   1   // 1 = real flip with X slide+catch; 0 = servo-only (no GRBL motion between servo writes)
-#define DO_HOMING    1   // 1 = $H at boot (needed for DO_X_MOVES); 0 = $X unlock only
+#define DO_X_MOVES   0   // 1 = real flip with X slide+catch; 0 = servo-only (no GRBL motion between servo writes)
+#define DO_HOMING    0   // 1 = $H at boot (needed for DO_X_MOVES); 0 = $X unlock only
 
 // ---- Production bit-banged servo TX (match PARMain.ino exactly) ----
 const int SERVO_TX_PIN = 9;
