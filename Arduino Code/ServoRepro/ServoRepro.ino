@@ -205,16 +205,18 @@ void displayBitmap(uint8_t* bitmap) {
   }
 }
 
-// Test pattern: all of row 0 (top) and row GRID_H-1 (bottom) on/off.
+// Full-board checkerboard, inverted each pass -> every cell flips every pass
+// (~333 flips/pass), traversing the entire board incl. the bottom-right corner.
+// Closest stand-in for a real job's servo+motion volume.
 uint8_t testBmp[84];
-void buildPattern(bool on) {
+void buildPattern(bool phase) {
   for (int i = 0; i < 84; i++) testBmp[i] = 0;
-  if (!on) return;
-  int rows[2] = {0, GRID_H - 1};
-  for (int r = 0; r < 2; r++)
+  for (int y = 0; y < GRID_H; y++)
     for (int x = 0; x < GRID_W; x++) {
-      int idx = rows[r] * GRID_W + x;
-      testBmp[idx / 8] |= (uint8_t)(1 << (7 - (idx % 8)));
+      if (((x + y) & 1) == (phase ? 1 : 0)) {
+        int idx = y * GRID_W + x;
+        testBmp[idx / 8] |= (uint8_t)(1 << (7 - (idx % 8)));
+      }
     }
 }
 
