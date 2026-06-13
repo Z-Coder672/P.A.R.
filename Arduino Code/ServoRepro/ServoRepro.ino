@@ -23,8 +23,9 @@ const int SERVO_50_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 
 // ---- Strip-down knobs (change one at a time once it reproduces) ----
-#define DO_X_MOVES   0   // 1 = real flip with X slide+catch; 0 = servo-only (no GRBL motion between servo writes)
-#define DO_HOMING    0   // 1 = $H at boot (needed for DO_X_MOVES); 0 = $X unlock only
+#define DO_X_MOVES   1   // 1 = real flip with X slide+catch; 0 = servo-only (no GRBL motion between servo writes)
+#define DO_HOMING    1   // 1 = $H at boot (needed for DO_X_MOVES); 0 = $X unlock only
+#define TRAVERSE     1   // 1 = flip all 4 corners each loop (full-board travel, max wire flex); 0 = hammer (0,0)
 
 // ---- Production bit-banged servo TX (match PARMain.ino exactly) ----
 const int SERVO_TX_PIN = 9;
@@ -154,11 +155,26 @@ void setup() {
   startMs = millis();
 }
 
+#if TRAVERSE
+const int CORNERS[4][2] = { {0,0}, {GRID_W-1,0}, {GRID_W-1,GRID_H-1}, {0,GRID_H-1} };
+#endif
+
 void loop() {
+#if TRAVERSE
+  for (int c = 0; c < 4; c++) {
+    int gx = CORNERS[c][0], gy = CORNERS[c][1];
+    flipCorner(gx, gy);
+    unsigned long el = millis() - startMs;
+    Serial.print("FLIP ("); Serial.print(gx); Serial.print(","); Serial.print(gy);
+    Serial.print(")  t="); Serial.print(el / 1000UL); Serial.println("s");
+  }
+  cycle++;
+  Serial.print("=== TRAVERSAL "); Serial.print(cycle); Serial.println(" done ===");
+#else
   flipCorner(0, 0);
   cycle++;
   unsigned long el = millis() - startMs;
   Serial.print("CYCLE "); Serial.print(cycle);
-  Serial.print("  t="); Serial.print(el / 1000UL); Serial.print("s");
-  Serial.println();
+  Serial.print("  t="); Serial.print(el / 1000UL); Serial.println("s");
+#endif
 }
