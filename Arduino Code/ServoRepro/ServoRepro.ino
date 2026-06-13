@@ -195,6 +195,9 @@ void displayBitmap(uint8_t* bitmap) {
     int step     = ltr ? +1 : -1;
     for (int x = startCol; x != endCol + step; x += step) {
       if (bitmapBit(bitmap, x, y) != gridState[y][x]) {
+        unsigned long el = (millis() - startMs) / 1000UL;
+        Serial.print("FLIP x="); Serial.print(x); Serial.print(" y="); Serial.print(y);
+        Serial.print(" t="); Serial.print(el); Serial.println("s");
         flipDisc(x, y);
         gridState[y][x] = bitmapBit(bitmap, x, y);
       }
