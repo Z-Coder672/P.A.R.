@@ -53,6 +53,7 @@ void writeServoUs(int us, int settle_ms) { servoTxLine(us); delay(settle_ms); }
 struct Coord { float x; float y; };
 Coord grid[GRID_H][GRID_W];
 uint8_t gridState[GRID_H][GRID_W];
+unsigned long startMs = 0;
 
 void initGrid() {
   for (int y = 0; y < GRID_H; y++)
@@ -223,7 +224,7 @@ void buildPattern(bool phase) {
     }
 }
 
-unsigned long pass = 0, startMs = 0;
+unsigned long pass = 0;
 bool patternOn = false;
 
 void setup() {
