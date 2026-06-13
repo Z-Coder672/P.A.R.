@@ -10,7 +10,7 @@
 
 const int SERVO_TX_PIN = 9;
 const int SERVO_TX_BIT_US = 102;
-const int SERVO_US_CENTER = 1472;  // 90 deg
+const int SERVO_US_CENTER = 544;  // REST / 0 deg (parked)
 
 void servoTxByte(uint8_t b) {
   noInterrupts();
@@ -40,8 +40,8 @@ void setup() {
 
 void loop() {
   servoTxLine(SERVO_US_CENTER);
-  Serial.print("center -> ");
+  Serial.print("hold -> ");
   Serial.print(SERVO_US_CENTER);
-  Serial.println("us (90 deg)");
+  Serial.println("us (REST / 0 deg)");
   delay(500);
 }
