@@ -1,16 +1,21 @@
-// ServoRepro — reproduce the servo failure that shows up during a normal job.
+// ServoRepro — faithful "normal job" servo+motion load to reproduce the MAIN
+// servo failure, with the WITNESS servo (same signal line, off the ServoNano
+// output) as the diagnostic reference.
 //
-// Uses the PRODUCTION servo path: RP2040 D9 bit-banged 9600 UART -> ServoNano
-// (which drives the actual SG90 + witness servo on the shared signal line),
-// exactly as PARMain.ino. Reuses FlipCornersTest's GRBL streaming. No WiFi, no
-// sensor, no scan — homes once, then flips the TOP-LEFT corner (grid 0,0) over
-// and over, printing a cycle counter + elapsed time so we can correlate a
-// failure (seen on camera / in the ServoNano echo) with cycle # and uptime
-// (thermal). Strip-down knobs are grouped at the top.
+// Uses PARMain's EXACT motion choreography: serpentine displayBitmap + moveToYSafe
+// (Y travel only at X soft-limits, never a diagonal sweep across the board) +
+// flipDisc with second-catch OFF (so the servo ALWAYS returns to REST between
+// flips). The carriage therefore only ever moves with the servo at REST, except
+// inside a flip — satisfying the hardware-safety rule. Servo is driven via the
+// production bit-banged-UART -> ServoNano path. No WiFi, no sensor, no scan.
+//
+// Loop alternates a top-row+bottom-row pattern on/off, forcing 74 flips per pass
+// with full-width X sweeps at top and bottom and a full-height Y transition
+// between them. Run it and watch: does the main servo fail while the witness
+// keeps moving (-> main's wire/power/sag), or do both fail (-> shared signal)?
 
 const int GRID_W = 37;
 const int GRID_H = 18;
-
 const float X_TRAVEL = 777.695f;
 const float Y_TRAVEL = 402.0f;
 
@@ -21,11 +26,6 @@ const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
-
-// ---- Strip-down knobs (change one at a time once it reproduces) ----
-#define DO_X_MOVES   1   // 1 = real flip with X slide+catch; 0 = servo-only (no GRBL motion between servo writes)
-#define DO_HOMING    1   // 1 = $H at boot (needed for DO_X_MOVES); 0 = $X unlock only
-#define TRAVERSE     1   // 1 = flip all 4 corners each loop (full-board travel, max wire flex); 0 = hammer (0,0)
 
 // ---- Production bit-banged servo TX (match PARMain.ino exactly) ----
 const int SERVO_TX_PIN = 9;
@@ -43,26 +43,23 @@ void servoTxByte(uint8_t b) {
   interrupts();
   delayMicroseconds(SERVO_TX_BIT_US);
 }
-
 void servoTxLine(int us) {
   char buf[12];
   int n = snprintf(buf, sizeof(buf), "%d\n", us);
   for (int i = 0; i < n; i++) servoTxByte((uint8_t)buf[i]);
 }
-
-void writeServoUs(int us, int settle_ms) {
-  servoTxLine(us);
-  delay(settle_ms);
-}
+void writeServoUs(int us, int settle_ms) { servoTxLine(us); delay(settle_ms); }
 
 struct Coord { float x; float y; };
 Coord grid[GRID_H][GRID_W];
+uint8_t gridState[GRID_H][GRID_W];
 
 void initGrid() {
   for (int y = 0; y < GRID_H; y++)
     for (int x = 0; x < GRID_W; x++) {
       grid[y][x].x = -X_TRAVEL + 25.0f + 20.045f * x;
       grid[y][x].y = -Y_TRAVEL + 0.0f + 23.40f * ((GRID_H - 1) - y);
+      gridState[y][x] = 0;
     }
 }
 
@@ -73,108 +70,136 @@ int cmdLengths[QUEUE_SIZE];
 int qHead = 0, qTail = 0, bufferFill = 0;
 void enqueue(int len) { cmdLengths[qTail] = len; qTail = (qTail + 1) % QUEUE_SIZE; }
 int dequeue() { int len = cmdLengths[qHead]; qHead = (qHead + 1) % QUEUE_SIZE; return len; }
-
 void drainResponses() {
   while (Serial1.available()) {
     String resp = Serial1.readStringUntil('\n');
     resp.trim();
     if (resp.length() == 0) continue;
-    if (resp == "ok") {
-      if (qHead != qTail) bufferFill -= dequeue();
-    } else if (resp.startsWith("error") || resp.startsWith("ALARM")) {
+    if (resp == "ok") { if (qHead != qTail) bufferFill -= dequeue(); }
+    else if (resp.startsWith("error") || resp.startsWith("ALARM")) {
       Serial.print("!!! GRBL halted: "); Serial.println(resp);
       while (true) ;
     }
   }
 }
-
 void sendGcode(const char* cmd) {
   int cmdLen = strlen(cmd) + 1;
   while (bufferFill + cmdLen > RX_BUFFER_SAFE) drainResponses();
-  Serial1.print(cmd);
-  Serial1.write('\n');
-  bufferFill += cmdLen;
-  enqueue(cmdLen);
+  Serial1.print(cmd); Serial1.write('\n');
+  bufferFill += cmdLen; enqueue(cmdLen);
 }
-
 void waitForIdle() { while (bufferFill > 0) drainResponses(); }
 void moveTo(float x, float y) { char cmd[40]; snprintf(cmd, sizeof(cmd), "G0 X%.3f Y%.3f", x, y); sendGcode(cmd); }
 void waitForMotion() { sendGcode("G4 P0"); waitForIdle(); }
 
-void flipCorner(int gx, int gy) {
-#if DO_X_MOVES
+// Pure-X -> pure-Y -> pure-X so the Y leg never drags the head across the disc
+// area at a non-limit X (copied from PARMain).
+void moveToYSafe(float targetX, float targetY) {
+  char cmd[40];
+  float xLimit = (targetX > -X_TRAVEL / 2.0f) ? 0.0f : -X_TRAVEL;
+  snprintf(cmd, sizeof(cmd), "G0 X%.3f", xLimit); sendGcode(cmd);
+  snprintf(cmd, sizeof(cmd), "G0 Y%.3f", targetY); sendGcode(cmd);
+  snprintf(cmd, sizeof(cmd), "G0 X%.3f", targetX); sendGcode(cmd);
+}
+
+// flipDisc with second-catch OFF: arm always parks at REST at the end, so every
+// inter-cell / inter-row move runs with the servo at REST (hardware-safe rule).
+void flipDisc(int gx, int gy) {
   moveTo(grid[gy][gx].x, grid[gy][gx].y);
   waitForMotion();
-#endif
 
   writeServoUs(SERVO_US_ENGAGE, SERVO_90_DEG_SETTLE_MS);
   writeServoUs(SERVO_US_REST,   SERVO_90_DEG_SETTLE_MS);
 
-#if DO_X_MOVES
   float dx = FLIP_OFFSET_X;
   if (grid[gy][gx].x + dx > 0.0f) dx = -grid[gy][gx].x;
   char cmd[32];
   sendGcode("G91"); snprintf(cmd, sizeof(cmd), "G0 X%.3f", dx);  sendGcode(cmd); sendGcode("G90"); waitForMotion();
-#endif
 
   writeServoUs(SERVO_US_RELEASE, SERVO_50_DEG_SETTLE_MS);
 
-#if DO_X_MOVES
   sendGcode("G91"); snprintf(cmd, sizeof(cmd), "G0 X%.3f", -dx); sendGcode(cmd); sendGcode("G90"); waitForMotion();
-#endif
 
   writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
 }
 
-unsigned long cycle = 0;
-unsigned long startMs = 0;
+uint8_t bitmapBit(const uint8_t* bitmap, int x, int y) {
+  int idx = y * GRID_W + x;
+  return (bitmap[idx / 8] >> (7 - (idx % 8))) & 1;
+}
+
+// Serpentine display over the band of changing rows (copied from PARMain,
+// second-catch path removed). Flips only cells whose bit differs from gridState.
+void displayBitmap(uint8_t* bitmap) {
+  int firstY = -1, lastY = -1;
+  for (int y = GRID_H - 1; y >= 0; y--)
+    for (int x = 0; x < GRID_W; x++)
+      if (bitmapBit(bitmap, x, y) != gridState[y][x]) { if (firstY < 0) firstY = y; lastY = y; break; }
+  if (firstY < 0) return;
+
+  bool ltr = true;
+  moveToYSafe(grid[firstY][0].x, grid[firstY][0].y);
+  for (int y = firstY; y >= lastY; y--) {
+    int startCol = ltr ? 0 : GRID_W - 1;
+    int endCol   = ltr ? GRID_W - 1 : 0;
+    int step     = ltr ? +1 : -1;
+    for (int x = startCol; x != endCol + step; x += step) {
+      if (bitmapBit(bitmap, x, y) != gridState[y][x]) {
+        flipDisc(x, y);
+        gridState[y][x] = bitmapBit(bitmap, x, y);
+      }
+    }
+    moveTo(grid[y][endCol].x, grid[y][endCol].y);
+    waitForMotion();
+    if (y > lastY) { moveToYSafe(grid[y - 1][endCol].x, grid[y - 1][endCol].y); ltr = !ltr; }
+  }
+}
+
+// Test pattern: all of row 0 (top) and row GRID_H-1 (bottom) on/off.
+uint8_t testBmp[84];
+void buildPattern(bool on) {
+  for (int i = 0; i < 84; i++) testBmp[i] = 0;
+  if (!on) return;
+  int rows[2] = {0, GRID_H - 1};
+  for (int r = 0; r < 2; r++)
+    for (int x = 0; x < GRID_W; x++) {
+      int idx = rows[r] * GRID_W + x;
+      testBmp[idx / 8] |= (uint8_t)(1 << (7 - (idx % 8)));
+    }
+}
+
+unsigned long pass = 0, startMs = 0;
+bool patternOn = false;
 
 void setup() {
   Serial.begin(115200);
   Serial1.begin(115200);
   pinMode(SERVO_TX_PIN, OUTPUT);
-  digitalWrite(SERVO_TX_PIN, HIGH);  // UART idle high
+  digitalWrite(SERVO_TX_PIN, HIGH);
   while (!Serial && millis() < 3000) ;
 
-  servoTxLine(SERVO_US_REST);
+  servoTxLine(SERVO_US_REST);   // park servo before any motion
   initGrid();
 
-  delay(2000);  // GRBL boot
+  delay(2000);
   while (Serial1.available()) Serial1.read();
 
-#if DO_HOMING
   Serial.println("Homing...");
   sendGcode("$H"); waitForIdle();
-#else
-  sendGcode("$X"); waitForIdle();
-#endif
   sendGcode("G21"); sendGcode("G90"); waitForIdle();
   writeServoUs(SERVO_US_REST, 1000);
 
-  Serial.println("ServoRepro start: flipping top-left corner (0,0) forever");
+  Serial.println("ServoRepro: faithful displayBitmap loop (top+bottom rows toggle)");
   startMs = millis();
 }
 
-#if TRAVERSE
-const int CORNERS[4][2] = { {0,0}, {GRID_W-1,0}, {GRID_W-1,GRID_H-1}, {0,GRID_H-1} };
-#endif
-
 void loop() {
-#if TRAVERSE
-  for (int c = 0; c < 4; c++) {
-    int gx = CORNERS[c][0], gy = CORNERS[c][1];
-    flipCorner(gx, gy);
-    unsigned long el = millis() - startMs;
-    Serial.print("FLIP ("); Serial.print(gx); Serial.print(","); Serial.print(gy);
-    Serial.print(")  t="); Serial.print(el / 1000UL); Serial.println("s");
-  }
-  cycle++;
-  Serial.print("=== TRAVERSAL "); Serial.print(cycle); Serial.println(" done ===");
-#else
-  flipCorner(0, 0);
-  cycle++;
+  patternOn = !patternOn;
+  buildPattern(patternOn);
+  displayBitmap(testBmp);
+  pass++;
   unsigned long el = millis() - startMs;
-  Serial.print("CYCLE "); Serial.print(cycle);
-  Serial.print("  t="); Serial.print(el / 1000UL); Serial.println("s");
-#endif
+  Serial.print("=== PASS "); Serial.print(pass);
+  Serial.print(" (pattern "); Serial.print(patternOn ? "ON" : "OFF");
+  Serial.print(")  t="); Serial.print(el / 1000UL); Serial.println("s ===");
 }
