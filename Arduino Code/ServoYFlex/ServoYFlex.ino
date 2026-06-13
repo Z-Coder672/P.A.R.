@@ -15,9 +15,10 @@
 
 const float X_TRAVEL = 777.695f;
 const float Y_TRAVEL = 402.0f;
-const float X_EDGE = -775.0f;   // left edge, just inside the -X soft limit
-const float Y_TOP  = -3.0f;     // near top (Y=0 is the +Y soft limit)
-const float Y_BOT  = -399.0f;   // near bottom (-Y_TRAVEL is the home limit)
+const float X_LEFT  = -775.0f;  // left edge (main visible here at Y~top); inside -X soft limit
+const float X_RIGHT = -31.0f;   // rightmost disc column (col 36) — "all the way right"
+const float Y_TOP   = -3.0f;    // near top (Y=0 is the +Y soft limit)
+const float Y_BOT   = -399.0f;  // near bottom (-Y_TRAVEL is the home limit)
 
 const int SERVO_US_REST    = 544;
 const int SERVO_US_RELEASE = 936;
@@ -85,6 +86,7 @@ void sendGcode(const char* c) {
 }
 void waitForIdle() { unsigned long t0=millis(); int lf=bufferFill; while (bufferFill>0){ drainResponses(); if(bufferFill!=lf){lf=bufferFill;t0=millis();} if(millis()-t0>GRBL_STALL_TIMEOUT_MS) haltSafe("stall waitForIdle"); } }
 void moveY(float y) { char c[40]; snprintf(c, sizeof(c), "G0 Y%.3f", y); sendGcode(c); sendGcode("G4 P0"); waitForIdle(); }
+void moveX(float x) { char c[40]; snprintf(c, sizeof(c), "G0 X%.3f", x); sendGcode(c); sendGcode("G4 P0"); waitForIdle(); }
 
 unsigned long iter = 0, startMs = 0;
 
@@ -99,24 +101,29 @@ void setup() {
   Serial.println("Homing...");
   sendGcode("$H"); waitForIdle();
   sendGcode("G21"); sendGcode("G90"); waitForIdle();
-  // Go to the left edge once (pure-X at servo REST), then all motion is pure-Y there.
-  { char c[40]; snprintf(c, sizeof(c), "G0 X%.3f", X_EDGE); sendGcode(c); sendGcode("G4 P0"); waitForIdle(); }
+  // Start at the left edge, top (pure-X then pure-Y, servo at REST).
+  moveX(X_LEFT); moveY(Y_TOP);
   writeServoUs(SERVO_US_REST, 500);
-  Serial.println("ServoYFlex start: Y up/down at left edge, cycle servo at top (main visible)");
+  Serial.println("ServoYFlex start: stress bottom-right corner, verify main at top-left");
   startMs = millis();
 }
 
+// Safe excursion: only pure-X (along a row) and pure-Y (at the left edge) legs —
+// never a diagonal sweep across the disc field. Carriage moves with servo at REST.
 void loop() {
-  // --- at TOP-LEFT (main visible): cycle the servo and watch ---
-  moveY(Y_TOP);
+  // --- verify at TOP-LEFT (main visible): cycle servo, observe main vs witness ---
   unsigned long el = (millis() - startMs) / 1000UL;
-  Serial.print("AT_TOP iter="); Serial.print(iter); Serial.print(" t="); Serial.print(el); Serial.println("s (main visible, cycling)");
-  for (int k = 0; k < 4; k++) cycleServo();
+  Serial.print("AT_TOPLEFT iter="); Serial.print(iter); Serial.print(" t="); Serial.print(el); Serial.println("s (main visible, verifying)");
+  for (int k = 0; k < 6; k++) cycleServo();
 
-  // --- traverse to BOTTOM and back (flexes the main wire) ---
-  moveY(Y_BOT);
-  Serial.println("AT_BOT (main out of frame)");
-  for (int k = 0; k < 4; k++) cycleServo();   // keep duty up while down
+  // --- excursion to BOTTOM-RIGHT corner (where it often fails) and stress there ---
+  moveY(Y_BOT);          // down the left edge (pure-Y)
+  moveX(X_RIGHT);        // across the bottom row to the right (pure-X) -> BOTTOM-RIGHT
+  Serial.println("AT_BOTRIGHT (stressing; main out of frame)");
+  for (int k = 0; k < 6; k++) cycleServo();   // cycle servo at the failure corner
 
+  // --- return to top-left (pure-X back, then pure-Y up the left edge) ---
+  moveX(X_LEFT);
+  moveY(Y_TOP);
   iter++;
 }
