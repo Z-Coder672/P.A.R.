@@ -63,32 +63,82 @@ void initGrid() {
     }
 }
 
-// ---- GRBL streaming (from FlipCornersTest) ----
+// ---- GRBL streaming (robust + LOGGED, streamlined from PARMain) ----
 #define RX_BUFFER_SAFE 120
 #define QUEUE_SIZE 32
+#define MAX_CMD_LEN 40
+#define MAX_ERROR_RETRIES 5
+#define ERROR_RETRY_DELAY_MS 500
+#define GRBL_STALL_TIMEOUT_MS 30000UL
+char cmdTexts[QUEUE_SIZE][MAX_CMD_LEN];
 int cmdLengths[QUEUE_SIZE];
 int qHead = 0, qTail = 0, bufferFill = 0;
-void enqueue(int len) { cmdLengths[qTail] = len; qTail = (qTail + 1) % QUEUE_SIZE; }
+int errorRetryCount = 0;
+char lastErrorCmd[MAX_CMD_LEN] = "";
+
+void enqueue(const char* cmd, int len) {
+  strncpy(cmdTexts[qTail], cmd, MAX_CMD_LEN - 1); cmdTexts[qTail][MAX_CMD_LEN-1] = '\0';
+  cmdLengths[qTail] = len; qTail = (qTail + 1) % QUEUE_SIZE;
+}
 int dequeue() { int len = cmdLengths[qHead]; qHead = (qHead + 1) % QUEUE_SIZE; return len; }
+
+// Park servo at REST and freeze — used on an unrecoverable fault so the rig is
+// left safe and the printed reason can be read from the USB log.
+void haltSafe(const char* why) {
+  servoTxLine(SERVO_US_REST);
+  Serial.print("!!! HALT: "); Serial.println(why);
+  while (true) { delay(1000); servoTxLine(SERVO_US_REST); }
+}
+
 void drainResponses() {
   while (Serial1.available()) {
     String resp = Serial1.readStringUntil('\n');
     resp.trim();
     if (resp.length() == 0) continue;
-    if (resp == "ok") { if (qHead != qTail) bufferFill -= dequeue(); }
-    else if (resp.startsWith("error") || resp.startsWith("ALARM")) {
-      Serial.print("!!! GRBL halted: "); Serial.println(resp);
-      while (true) ;
+    Serial.print("GRBL: "); Serial.println(resp);   // log EVERY response to USB
+
+    if (resp == "ok") {
+      if (qHead != qTail) { bufferFill -= dequeue(); errorRetryCount = 0; lastErrorCmd[0] = '\0'; }
+    } else if (resp.startsWith("ALARM")) {
+      if (qHead != qTail) { Serial.print("!!! ALARM on cmd: '"); Serial.print(cmdTexts[qHead]); Serial.println("'"); }
+      haltSafe("GRBL ALARM");
+    } else if (resp.startsWith("error")) {
+      if (qHead == qTail) { Serial.println("(error with empty queue, ignored)"); continue; }
+      char failed[MAX_CMD_LEN]; strncpy(failed, cmdTexts[qHead], MAX_CMD_LEN); failed[MAX_CMD_LEN-1]='\0';
+      bufferFill -= dequeue();
+      if (strcmp(failed, lastErrorCmd) == 0) errorRetryCount++;
+      else { strncpy(lastErrorCmd, failed, MAX_CMD_LEN); lastErrorCmd[MAX_CMD_LEN-1]='\0'; errorRetryCount = 1; }
+      Serial.print("  -> "); Serial.print(resp); Serial.print(" on '"); Serial.print(failed);
+      Serial.print("' retry "); Serial.print(errorRetryCount); Serial.print("/"); Serial.println(MAX_ERROR_RETRIES);
+      if (errorRetryCount > MAX_ERROR_RETRIES) haltSafe("error retries exhausted");
+      delay(ERROR_RETRY_DELAY_MS);
+      int rlen = strlen(failed) + 1;
+      Serial1.print(failed); Serial1.write('\n');
+      bufferFill += rlen; enqueue(failed, rlen);
     }
+    // else: status/banner/[MSG] — not queue-tied, ignore.
   }
 }
+
 void sendGcode(const char* cmd) {
   int cmdLen = strlen(cmd) + 1;
-  while (bufferFill + cmdLen > RX_BUFFER_SAFE) drainResponses();
+  unsigned long t0 = millis(); int lastFill = bufferFill;
+  while (bufferFill + cmdLen > RX_BUFFER_SAFE) {
+    drainResponses();
+    if (bufferFill != lastFill) { lastFill = bufferFill; t0 = millis(); }
+    if (millis() - t0 > GRBL_STALL_TIMEOUT_MS) haltSafe("stall in sendGcode (no ok 30s)");
+  }
   Serial1.print(cmd); Serial1.write('\n');
-  bufferFill += cmdLen; enqueue(cmdLen);
+  bufferFill += cmdLen; enqueue(cmd, cmdLen);
 }
-void waitForIdle() { while (bufferFill > 0) drainResponses(); }
+void waitForIdle() {
+  unsigned long t0 = millis(); int lastFill = bufferFill;
+  while (bufferFill > 0) {
+    drainResponses();
+    if (bufferFill != lastFill) { lastFill = bufferFill; t0 = millis(); }
+    if (millis() - t0 > GRBL_STALL_TIMEOUT_MS) haltSafe("stall in waitForIdle (no ok 30s)");
+  }
+}
 void moveTo(float x, float y) { char cmd[40]; snprintf(cmd, sizeof(cmd), "G0 X%.3f Y%.3f", x, y); sendGcode(cmd); }
 void waitForMotion() { sendGcode("G4 P0"); waitForIdle(); }
 
