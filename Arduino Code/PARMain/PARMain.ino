@@ -42,10 +42,10 @@ enum TcsFilter {
 const int SERVO_PIN = 9;
 // Pulse widths match the standard Servo lib mapping
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°) so the angles the
-// rig was tuned for stay the same: REST≈0° (parked), RELEASE≈38° (pushes the
+// rig was tuned for stay the same: REST≈0° (parked), RELEASE≈46° (pushes the
 // half-rotated squisk during the X slide-back), ENGAGE≈90° (initial 90° flip).
 const int SERVO_US_REST = 544;
-const int SERVO_US_RELEASE = 936;
+const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/≈38°)
 const int SERVO_US_ENGAGE = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
@@ -58,8 +58,24 @@ const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
 const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 
+// The flip head isn't perfectly square to the board: the disc columns lean
+// slightly, so the higher up the board a cell sits, the further left (toward
+// −X / the homing corner) its true flip position is. Model this as a linear
+// X shift in physical height — 0 at the bottom row, FLIP_SKEW_X_TOP at the top
+// row — applied only to the flip head (scanning still targets cell centers).
+// Refine the magnitude with FlipLeftColumnTest.
+const float FLIP_SKEW_X_TOP = -2.0f;  // X shift (mm) at the top row; −X = toward homing
+
+// Linear skew for grid row gy (bitmap y; 0 = top = highest physical Y). Returns
+// the X offset to add to the flip head's target. Bottom row → 0, top row →
+// FLIP_SKEW_X_TOP, interpolated by physical height.
+static inline float flipSkewX(int gy) {
+  float heightFrac = (float)((GRID_H - 1) - gy) / (float)(GRID_H - 1);
+  return FLIP_SKEW_X_TOP * heightFrac;
+}
+
 // Step-3 second-catch pass: after the main flip+catch, drop the arm a further
-// ~10° (to RELEASE2, ~28°) and sweep +X once more to push back any disc the
+// ~10° (to RELEASE2, ~36°) and sweep +X once more to push back any disc the
 // first catch left over/under-rotated. Comment this out to remove the
 // second-catch back-move (the main flip then runs without the extra pass).
 //#define FLIP_SECOND_CATCH
@@ -592,7 +608,7 @@ void waitForMotion() {
 //   1) Servo to ENGAGE (~90°) above the disc — this rotates the squisk 90°.
 //      Servo back to REST. The squisk is now half-flipped and stays put.
 //   2) Slide X by +16.8 mm so the arm clears the disc column, drop the arm to
-//      RELEASE (~38°), then slide X back. The arm catches the half-rotated
+//      RELEASE (~46°), then slide X back. The arm catches the half-rotated
 //      squisk and pushes it through the final 90° during the −dx return slide.
 //   3) Second catch: drop the arm a further ~10° (RELEASE2) and sweep once
 //      more in the +X direction (opposite the −dx return) over ≥16.8 mm, to
@@ -607,7 +623,10 @@ void waitForMotion() {
 // Otherwise (RTL rows, row ends, last flip) pass false and we emit an explicit
 // +X stroke and re-park the arm at REST.
 void flipDisc(int gx, int gy, bool catchByNextMove) {
-  moveTo(grid[gy][gx].x, grid[gy][gx].y);
+  // Skew-corrected flip X for this row (see flipSkewX). The Y excursions below
+  // are all relative (G91), so only the absolute X target shifts.
+  float fx = grid[gy][gx].x + flipSkewX(gy);
+  moveTo(fx, grid[gy][gx].y);
   waitForMotion();
 
   writeServoUs(SERVO_US_ENGAGE, SERVO_90_DEG_SETTLE_MS);
@@ -617,7 +636,7 @@ void flipDisc(int gx, int gy, bool catchByNextMove) {
   // slide never command a position past X=0 (the work area is entirely
   // negative).
   float dx = FLIP_OFFSET_X;
-  if (grid[gy][gx].x + dx > 0.0f) dx = -grid[gy][gx].x;
+  if (fx + dx > 0.0f) dx = -fx;
 
   char cmd[32];
   sendGcode("G91");
@@ -641,7 +660,7 @@ void flipDisc(int gx, int gy, bool catchByNextMove) {
   if (!catchByNextMove) {
     // Same X=0 cap so the +X stroke never commands past the soft limit.
     float dx2 = FLIP_OFFSET_X;
-    if (grid[gy][gx].x + dx2 > 0.0f) dx2 = -grid[gy][gx].x;
+    if (fx + dx2 > 0.0f) dx2 = -fx;
     sendGcode("G91");
     snprintf(cmd, sizeof(cmd), "G0 X%.3f", dx2);
     sendGcode(cmd);
@@ -663,11 +682,39 @@ uint8_t bitmapBit(const uint8_t* bitmap, int x, int y) {
   return (bitmap[idx / 8] >> (7 - (idx % 8))) & 1;
 }
 
+// Check-pass tolerance. Two short-circuits hang off this threshold (see loop()):
+//   1. If the first displayBitmap() flipped this few cells or fewer, the job was
+//      tiny — few chances to fail — so skip the whole check pass (no re-scan).
+//   2. Otherwise re-scan; only re-flip if MORE than this many cells are still
+//      wrong. The color sensor is ~99.5% accurate, so a full 666-cell scan
+//      misreads ~3 cells on average — a handful of mismatches sits within that
+//      noise floor and is more likely a misread than a real mechanical miss.
+//      Re-flipping on a misread flips a *correct* disc the wrong way, so
+//      tolerating <=5 doesn't lower display accuracy; it avoids corrupting good
+//      cells that the noisy re-scan only thinks are wrong.
+const int CHECK_FIX_MAX_SKIP = 5;
+
+// Count cells whose desired bit differs from the current gridState[] — i.e. how
+// many discs are "wrong" relative to the target bitmap. Used to gate the check
+// pass's corrective re-flip.
+int countMismatches(const uint8_t* bitmap) {
+  int n = 0;
+  for (int y = 0; y < GRID_H; y++) {
+    for (int x = 0; x < GRID_W; x++) {
+      if (bitmapBit(bitmap, x, y) != gridState[y][x]) n++;
+    }
+  }
+  return n;
+}
+
 // Bottom-to-top (bitmap y = GRID_H-1 → 0) over the band of rows containing at
-// least one flip. Rows alternate sweep direction (serpentine), so the only Y
-// motion between rows happens at an X soft-limit via moveToYSafe — never a
-// diagonal or pure-Y at non-limit X.
-void displayBitmap(uint8_t* bitmap) {
+// least one flip. Rows with no differing cells are skipped entirely — we don't
+// even move to them; the next flipping row is entered via moveToYSafe regardless,
+// so jumping over an empty row keeps the only Y travel at an X soft-limit.
+// Flipping rows alternate sweep direction (serpentine) so consecutive entries
+// land on the same side. Returns the number of cells flipped (= cells that were
+// wrong vs the target), which the caller uses to gate the check pass.
+int displayBitmap(uint8_t* bitmap) {
   int firstY = -1;  // bottom-most changing row (largest bitmap-y)
   int lastY = -1;   // top-most changing row (smallest bitmap-y)
   for (int y = GRID_H - 1; y >= 0; y--) {
@@ -679,14 +726,26 @@ void displayBitmap(uint8_t* bitmap) {
       }
     }
   }
-  if (firstY < 0) return;
+  if (firstY < 0) return 0;
 
+  int flipped = 0;
   bool ltr = true;
-  moveToYSafe(grid[firstY][0].x, grid[firstY][0].y);
   for (int y = firstY; y >= lastY; y--) {
+    // Skip rows that don't need any changes — don't move to them at all.
+    bool rowHasFlip = false;
+    for (int x = 0; x < GRID_W; x++) {
+      if (bitmapBit(bitmap, x, y) != gridState[y][x]) { rowHasFlip = true; break; }
+    }
+    if (!rowHasFlip) continue;
+
     int startCol = ltr ? 0 : GRID_W - 1;
     int endCol = ltr ? GRID_W - 1 : 0;
     int step = ltr ? +1 : -1;
+
+    // Enter this row (or transition from the previous flipping row) at an X
+    // soft-limit so the Y leg never drags the head across populated discs.
+    moveToYSafe(grid[y][startCol].x, grid[y][startCol].y);
+
     // Collect the columns needing a flip in sweep order so each flip knows
     // whether another one follows it in this row. On an LTR row the next flip
     // sits at a larger X, so the next flipDisc's opening move already travels
@@ -703,13 +762,12 @@ void displayBitmap(uint8_t* bitmap) {
       flipDisc(x, y, catchByNextMove);
       gridState[y][x] = bitmapBit(bitmap, x, y);
     }
+    flipped += nFlips;
     moveTo(grid[y][endCol].x, grid[y][endCol].y);
     waitForMotion();
-    if (y > lastY) {
-      moveToYSafe(grid[y - 1][endCol].x, grid[y - 1][endCol].y);
-      ltr = !ltr;
-    }
+    ltr = !ltr;
   }
+  return flipped;
 }
 
 void setup() {
@@ -1013,19 +1071,35 @@ void loop() {
       }
 
       plog::log("displayBitmap begin");
-      displayBitmap(bitmap);
+      int flipped = displayBitmap(bitmap);
       waitForIdle();
+      plog::logf("displayBitmap flipped %d cells", flipped);
 
       // Check pass: re-scan the board (which reseeds gridState[] from the
       // physical discs, catching any that didn't flip cleanly), then run
       // displayBitmap again so its diff-against-gridState logic re-flips just
-      // the cells that are still wrong. One pass — misclassifications or
-      // mechanical misses get a second chance without a full redraw.
-      plog::log("check pass: scanGrid begin");
-      scanGrid();
-      plog::log("check pass: displayBitmap begin");
-      displayBitmap(bitmap);
-      waitForIdle();
+      // the cells that are still wrong. Two short-circuits (CHECK_FIX_MAX_SKIP):
+      //   1. If the first draw flipped that few cells or fewer, the job was tiny
+      //      (few chances to fail) — skip the whole check pass, re-scan and all.
+      //   2. Otherwise re-scan, but only re-flip when MORE than that many cells
+      //      are still wrong. The color sensor is ~99.5% accurate, so a 666-cell
+      //      scan misreads ~3 cells on average — <=5 mismatches sit in that noise
+      //      floor, so re-flipping them would more likely flip a correct disc
+      //      than fix a real miss. Tolerating <=5 doesn't lower accuracy.
+      if (flipped <= CHECK_FIX_MAX_SKIP) {
+        plog::logf("check pass skipped (only %d flipped)", flipped);
+      } else {
+        plog::log("check pass: scanGrid begin");
+        scanGrid();
+        int wrong = countMismatches(bitmap);
+        if (wrong > CHECK_FIX_MAX_SKIP) {
+          plog::logf("check pass: %d wrong, re-fixing", wrong);
+          displayBitmap(bitmap);
+          waitForIdle();
+        } else {
+          plog::logf("check pass: %d wrong (<=%d), skip fix", wrong, CHECK_FIX_MAX_SKIP);
+        }
+      }
 
       plog::log("display done");
       // Trigger the snapshot now that the board reflects the final corrected

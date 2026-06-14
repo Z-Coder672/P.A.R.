@@ -26,3 +26,12 @@ YT-Streamer/venv/
 
 # Stray logs
 YT-Streamer/stream.log.fresh
+
+# Local debug image artifacts (rig photos, bitmap dumps — never committed)
+/IMG_*
+/P.A.R. Pics/
+/Pics of par again yay/
+/centers/
+/consensus/
+/consensus_bitmap.png
+/photo-bitmap/

@@ -13,9 +13,9 @@ const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y s
 const int SERVO_PIN = 9;
 // Pulse widths match the standard Servo lib mapping
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°) so the angles the
-// rig was tuned for stay the same: REST≈0°, RELEASE≈50°, ENGAGE≈90°.
+// rig was tuned for stay the same: REST≈0°, RELEASE≈58°, ENGAGE≈90°.
 const int SERVO_US_REST    = 544;
-const int SERVO_US_RELEASE = 1060;
+const int SERVO_US_RELEASE = 1142;  // ≈58° (raised 8° from the prior 1060/≈50°)
 const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS  = 300;
 const int SERVO_50_DEG_SETTLE_MS  = 100;

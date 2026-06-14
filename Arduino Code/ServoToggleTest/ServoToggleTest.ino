@@ -9,7 +9,7 @@
 
 const int SERVO_PIN        = 9;
 const int SERVO_US_REST    = 544;   // 0°
-const int SERVO_US_RELEASE = 853;   // ~30°
+const int SERVO_US_RELEASE = 935;   // ~38° (raised 8° from the prior 853/~30°)
 const int SETTLE_MS        = 200;
 
 Servo flipServo;

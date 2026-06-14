@@ -42,20 +42,24 @@ poll server → got bitmap? → re-scan board → display it → release sweep �
 
 **4. `scanGrid()`** — re-home and re-read every cell with the TCS3200. The 10-min idle disables steppers, so position can drift and discs may have been moved; this reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ.
 
-**5. `displayBitmap()`** — iterate every cell; if `desired bit ≠ gridState`, call `flipDisc(x, y)`
+**5. `displayBitmap()`** — over the band of rows that contain at least one differing cell, flip cells where `desired bit ≠ gridState`. Rows with no differing cells are **skipped entirely** (no move to them — the next flipping row is still entered via `moveToYSafe`, so Y travel stays at an X soft-limit). Returns the number of cells flipped (= cells that were wrong vs the target), used to gate the check pass.
 
-**5b. Check pass** — after the first `displayBitmap()` completes, re-run `scanGrid()` (reseeds `gridState[]` from the physical board, catching any disc that didn't flip cleanly or was misclassified) then `displayBitmap()` again, which re-flips only the cells still differing from the target. One pass.
+**5b. Check pass** — after the first `displayBitmap()` completes, conditionally re-scan + re-fix. Two short-circuits, both keyed on `CHECK_FIX_MAX_SKIP` (=5):
+- **First draw flipped ≤5 cells** → tiny job, few chances to fail → **skip the whole check pass** (no re-scan, no re-fix).
+- **Otherwise** → re-run `scanGrid()` (reseeds `gridState[]` from the physical board, catching discs that didn't flip cleanly or were misclassified), then count mismatches vs the target. Re-run `displayBitmap()` **only if >5 cells are still wrong**; ≤5 are left as-is. The color sensor is ~99.5% accurate, so a full 666-cell scan misreads ~3 cells on average — ≤5 mismatches sit within that noise floor, so re-flipping them would more likely flip a *correct* disc than fix a real miss. Tolerating ≤5 doesn't lower display accuracy. One corrective pass at most.
 
 **6. `flipDisc(x, y, catchByNextMove)`** — two-stage 180° rotation (+ optional second catch)
+
+The absolute flip X is `grid[y][x].x + flipSkewX(y)`: a linear left-lean correction for the board not being perfectly square to the head. `flipSkewX` is 0 at the bottom row and `FLIP_SKEW_X_TOP` (−2.0 mm, toward homing/−X) at the top row, interpolated by physical height. Only the flip head shifts — scanning still targets cell centers. The −dx return slide and the X=0 soft-limit cap both use the skewed X. Calibrate the magnitude with `FlipLeftColumnTest`.
 ```
-move gantry to disc
+move gantry to disc (skew-corrected X)
 servo → ENGAGE (90°)   → settle 300ms  # rotates squisk 90°
 servo → REST (0°)      → settle 300ms
 G91; X +dx; G90                        # clear the disc column
-servo → RELEASE (38°)  → settle 100ms
-G91; X -dx; G90                        # return slide — the 38° arm pushes the squisk through the final 90°
+servo → RELEASE (46°)  → settle 100ms
+G91; X -dx; G90                        # return slide — the 46° arm pushes the squisk through the final 90°
 #ifdef FLIP_SECOND_CATCH               # default OFF — commented-out //#define near FLIP_OFFSET_X
-  servo → RELEASE2 (~28°)→ settle 100ms # second catch: arm a further ~10° lower
+  servo → RELEASE2 (~36°)→ settle 100ms # second catch: arm a further ~10° lower
   if !catchByNextMove:                  # only when the next move won't already do it
     G91; X +dx2; G90                    # explicit +X sweep (opposite the return)
     servo → REST (0°)    → settle 100ms

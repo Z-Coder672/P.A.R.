@@ -14,9 +14,9 @@ const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y s
 const int SERVO_PIN = 9;
 // Pulse widths match the standard Servo lib mapping
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°) so the angles the
-// rig was tuned for stay the same: REST≈0°, RELEASE≈38°, ENGAGE≈90°.
+// rig was tuned for stay the same: REST≈0°, RELEASE≈46°, ENGAGE≈90°.
 const int SERVO_US_REST    = 544;
-const int SERVO_US_RELEASE = 936;
+const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/≈38°)
 const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS  = 300;
 const int SERVO_50_DEG_SETTLE_MS  = 100;
@@ -28,7 +28,7 @@ const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 
 // Step-3 second-catch pass: after the main flip+catch, drop the arm a further
-// ~10° (to RELEASE2, ~28°) and sweep +X once more to push back any disc the
+// ~10° (to RELEASE2, ~36°) and sweep +X once more to push back any disc the
 // first catch left over/under-rotated. Comment this out to remove the
 // second-catch back-move. Mirrors PARMain.ino — keep both in sync.
 //#define FLIP_SECOND_CATCH
