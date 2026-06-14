@@ -66,6 +66,13 @@ load_dotenv(Path(__file__).parent / ".env")
 # broadcast (build_record_cmd hard-codes -an and the input is video-only).
 CAMERA_NAME            = os.getenv("CAMERA_NAME", "Brio 100")
 CAMERA_FRAMERATE       = os.getenv("CAMERA_FRAMERATE", "30")
+# avfoundation REQUIRES an explicit frame size: requesting -framerate without
+# -video_size makes the device config fail and silently fall back to the cam's
+# default mode, after which ffmpeg "can't estimate rate" and feeds libx264 a
+# garbage ~5000fps timebase → MB-rate level overflow → a grey, corrupted
+# recording. Pin both to a mode the cam actually advertises (the Brio 100 tops
+# out at 1920x1080@30).
+CAMERA_VIDEO_SIZE      = os.getenv("CAMERA_VIDEO_SIZE", "1920x1080")
 # Keeper re-enumerates the device list this often (when not recording).
 CAMERA_POLL_INTERVAL   = int(os.getenv("CAMERA_POLL_INTERVAL", "15"))
 SNAPSHOT_SECRET        = os.getenv("SNAPSHOT_SECRET")
@@ -204,23 +211,37 @@ def build_record_cmd(out_path: Path, cam_spec: str) -> list[str]:
         "-loglevel", "warning",
         "-f", "avfoundation",
         "-framerate", CAMERA_FRAMERATE,
+        # Pin the capture mode (see CAMERA_VIDEO_SIZE) so the device configures
+        # cleanly and ffmpeg can estimate the real rate instead of guessing.
+        "-video_size", CAMERA_VIDEO_SIZE,
+        "-pixel_format", "uyvy422",
+        # The Brio drops its true capture rate (~15fps in dim light) below the
+        # requested 30; wall-clock input timestamps + a forced CFR output keep
+        # the encoder on a sane, constant timebase and play back smoothly.
+        "-use_wallclock_as_timestamps", "1",
         "-t", str(RECORD_MAX_SECONDS),
         "-i", cam_spec,
         # ── output 1: the recording ──────────────────────────────────────────
         "-map", "0:v",
+        "-fps_mode", "cfr",
+        "-r", CAMERA_FRAMERATE,
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
         "-b:v", VIDEO_BITRATE,
         "-maxrate", VIDEO_BITRATE,
         "-bufsize", str(int(VIDEO_BITRATE[:-1]) * 2) + "k",
         "-g", "30",
         "-an",
-        "-movflags", "+empty_moov+default_base_moof+frag_keyframe+faststart",
+        # No +faststart: it conflicts with fragmented streaming muxing (which is
+        # already seekable) and forces a seek-on-close that the frag flags break.
+        "-movflags", "+empty_moov+default_base_moof+frag_keyframe",
         "-f", "mp4",
         str(out_path),
         # ── output 2: the live snapshot frame ────────────────────────────────
         "-map", "0:v",
+        "-fps_mode", "cfr",
         "-r", "1",
         "-update", "1",
         "-q:v", "2",
