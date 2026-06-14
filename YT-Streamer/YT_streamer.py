@@ -609,6 +609,11 @@ def grab_snapshot() -> Path | None:
         "-framerate", CAMERA_FRAMERATE,
         "-i", spec,
         "-frames:v", "1",
+        # ffmpeg 8.x's image2 muxer refuses a single fixed filename without
+        # -update 1 (it otherwise wants a %d sequence pattern): it still decodes
+        # the frame and writes the JPEG, but exits non-zero, so without this the
+        # grab is treated as a failure and the good file gets unlinked below.
+        "-update", "1",
         "-q:v", "2",
         str(out_path),
     ]
