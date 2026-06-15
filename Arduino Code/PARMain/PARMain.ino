@@ -5,6 +5,8 @@
 #include "classifier.h"      // tiny ternary transformer for blue/black RGBC
 #include "persistent_log.h"  // flash-backed log for WiFi/HTTP/poll events only
 #include "hardware/spi.h"
+#include "hardware/structs/watchdog.h"            // scratch regs for reset-cause cookie
+#include "hardware/structs/vreg_and_chip_reset.h"  // chip_reset HAD_POR/HAD_RUN flags
 
 const char* SSID = "ab guest";
 const char* PASSWORD = WIFI_PASSWORD;
@@ -794,6 +796,26 @@ void setup() {
   // The log persists across resets.
   plog::begin();
   plog::log("boot");
+
+  // Reset-cause breadcrumb. The RP2040 watchdog scratch registers survive a
+  // software reset (every NVIC_SystemReset path in this firmware logs its
+  // reason first) but are wiped to 0 by a power-on or brownout reset. So:
+  //   cookie present  -> warm/soft reset (look just above for the reason line)
+  //   cookie absent   -> COLD power event (POR or brownout) — no reason logged
+  // This is the signal we need for the silent scanGrid reboots: a Cortex-M0+
+  // with no watchdog armed can't reboot from a hard fault (it locks up), so a
+  // *silent* reboot is power, not firmware. chip_reset is logged raw as a
+  // cross-check (HAD_POR bit = power/brownout, HAD_RUN bit = external RUN pin),
+  // though its HAD_* bits are sticky across soft resets so the cookie is the
+  // authoritative warm/cold call.
+  {
+    const uint32_t PLOG_WARM_COOKIE = 0xB007C0DEu;
+    bool warm = (watchdog_hw->scratch[0] == PLOG_WARM_COOKIE);
+    plog::logf("reset cause: %s cr=0x%08lx",
+               warm ? "warm/soft" : "COLD/power",
+               (unsigned long)vreg_and_chip_reset_hw->chip_reset);
+    watchdog_hw->scratch[0] = PLOG_WARM_COOKIE;
+  }
 
   initGrid();
 
