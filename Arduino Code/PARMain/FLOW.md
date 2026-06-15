@@ -73,7 +73,7 @@ G91; X -dx; G90                        # return slide — the 46° arm pushes th
 
 **8. `onDisplayComplete()`** — `GET /complete.php?id=<N>` tells the server the image is confirmed displayed.
 
-**9. Sleep 10 min** — release steppers (`$1=0` + tiny jog to trigger disable), then `delay(10 min)` before polling again.
+**9. Sleep 10 min** — release steppers (`$1=0` + tiny jog to trigger disable), then `delay(10 min)` before polling again. **Sync (`waitForIdle`) after the `$1=0` before the jog** — `$1=0` commits the settings block to the Mega's EEPROM, and grbl disables interrupts during the write, dropping the Serial1 RX bytes of anything pipelined behind it. Without the sync, the jog arrives garbled → `error:2` → the rest of the burst desyncs the `ok` accounting → 60 s `waitForIdle` watchdog → MCU reset. Same `waitForIdle`-after-`$1` guard is applied at boot and in `rehome()`.
 
 ---
 

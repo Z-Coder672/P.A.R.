@@ -558,6 +558,9 @@ void rehome() {
   sendGcode("$H");
   waitForIdle();
   sendGcode("$1=255");
+  waitForIdle();  // sync past the $1 EEPROM write before pipelining more — grbl
+                  // disables interrupts during the commit and drops Serial1 RX
+                  // bytes (same fault that error:2'd the end-of-job jog).
   sendGcode("G21");
   sendGcode("G90");
   waitForIdle();
@@ -826,6 +829,8 @@ void setup() {
     // $1=255 keeps steppers energized while idle so the gantry holds position
     // between motions; we drop back to $1=0 + a tiny jog at job end to release.
     sendGcode("$1=255");
+    waitForIdle();  // sync past the $1 EEPROM write before pipelining more (see rehome)
+    if (grblStartupFault) goto restart_grbl;
     sendGcode("G21");
     sendGcode("G90");
     waitForIdle();
@@ -1120,6 +1125,15 @@ void loop() {
       sendGcode("G21");
       sendGcode("G90");
       sendGcode("$1=0");
+      // $1=0 actually changes the value (255->0), so grbl commits the settings
+      // block to the Mega's EEPROM — and each changed byte runs under cli() with
+      // a busy-wait on EEPE (a few ms with the Serial1 RX ISR dead). Anything
+      // pipelined right behind it gets dropped/garbled: that's what turned the
+      // jog below into a malformed line GRBL rejected with error:2, then mangled
+      // the rest of the burst so the ok accounting never drained -> 60s
+      // waitForIdle watchdog -> MCU reset. Wait for $1=0's ok (which lands only
+      // after the EEPROM write finishes) before sending the motion lines.
+      waitForIdle();
       sendGcode("G91");
       sendGcode("G0 X-0.1");
       sendGcode("G90");
