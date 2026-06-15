@@ -966,60 +966,6 @@ void sendSnapshotRequest(const char* galleryId) {
   }
 }
 
-// Fire-and-forget POST to /stream-end-set.php telling the Mac Mini to stop
-// the recording it started when this print began. Called after the 10-min
-// post-display idle. No retries — if it fails, the Mac's 1.5h hard cap
-// closes the recording anyway.
-void sendStreamEnd(const char* galleryId) {
-  if (!galleryId || galleryId[0] == '\0') return;
-  plog::logf("stream-end-set start id=%s", galleryId);
-
-  WiFiSSLClient ssl;
-  if (!ssl.connect(SERVER, PORT)) {
-    plog::log("stream-end-set connect() failed");
-    return;
-  }
-
-  char body[64];
-  int bodyLen = snprintf(body, sizeof(body), "id=%s", galleryId);
-  if (bodyLen <= 0 || bodyLen >= (int)sizeof(body)) {
-    ssl.stop();
-    return;
-  }
-
-  ssl.print("POST /stream-end-set.php HTTP/1.1\r\n");
-  ssl.print("Host: ");
-  ssl.print(SERVER);
-  ssl.print("\r\n");
-  ssl.print("User-Agent: P.A.R./1.0\r\n");
-  ssl.print("Accept: */*\r\n");
-  ssl.print("Content-Type: application/x-www-form-urlencoded\r\n");
-  ssl.print("Content-Length: ");
-  ssl.print(bodyLen);
-  ssl.print("\r\n");
-  ssl.print("X-Snapshot-Secret: ");
-  ssl.print(SNAPSHOT_SECRET);
-  ssl.print("\r\n");
-  ssl.print("Connection: close\r\n");
-  ssl.print("\r\n");
-  ssl.print(body);
-
-  // Drain only the status line so we know it actually got there.
-  unsigned long t0 = millis();
-  while (ssl.connected() && !ssl.available()) {
-    if (millis() - t0 > 10000) break;
-    delay(10);
-  }
-  String statusLine = ssl.readStringUntil('\n');
-  ssl.stop();
-  int sp = statusLine.indexOf(' ');
-  if (sp >= 0 && statusLine.charAt(sp + 1) == '2') {
-    plog::logf("stream-end-set ok id=%s", galleryId);
-  } else {
-    plog::logf("stream-end-set unexpected: %.40s", statusLine.c_str());
-  }
-}
-
 void loop() {
   ensureWiFi();
   plog::log("poll start");
@@ -1138,11 +1084,11 @@ void loop() {
       sendGcode("G0 X-0.1");
       sendGcode("G90");
       waitForIdle();
+      // Post-display linger: paces polling and lets the board settle before the
+      // next job. The recording is already stopped by now — the Mac Mini ends it
+      // when it captures this print's snapshot (the snapshot request above is the
+      // single "print done" signal), so no stream-end is sent from here.
       delay(10UL * 60UL * 1000UL);
-      // After the post-display linger, tell the Mac Mini to stop recording
-      // this print. Sent here (not in onDisplayComplete) so the recording
-      // covers the full display + 10-min settle window.
-      sendStreamEnd(pendingGalleryId[0] ? pendingGalleryId : galleryId.c_str());
     } else {
       plog::logf("bad decode length: %d", decoded);
     }

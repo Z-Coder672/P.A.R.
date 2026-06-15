@@ -96,6 +96,14 @@ RECORDING_DIR          = Path("/tmp/recordings")
 LATEST_FRAME_PATH      = RECORDING_DIR / "latest_frame.jpg"
 # 1.5h hard cap on a single recording (safety net if the stop signal is lost).
 RECORD_MAX_SECONDS     = 90 * 60
+# A recording must run at least this long before the snapshot signal is allowed
+# to stop it. The snapshot flag is armed TWICE per print — once by next.php at
+# job start (content = gallery id) and once by the Arduino's snapshot-request at
+# display-done (empty → id=null). The job-start arm fires within a few seconds of
+# the recording starting (or before it), so requiring the snapshot signal to land
+# at least this far into the recording filters it out; the real display takes
+# minutes, so the post-display snapshot always clears this floor.
+MIN_RECORD_SECONDS     = 60
 
 # FTPS (port 21, explicit TLS). The Site5 addon FTP account is FTP-only —
 # SSH/SFTP on :22 is reserved for the main cPanel user, so paramiko can't
@@ -180,6 +188,18 @@ _recording_active = threading.Event()
 _inflight_lock = threading.Lock()
 _inflight_proc: subprocess.Popen | None = None
 _inflight_path: Path | None = None
+# Gallery id of the in-flight recording (None when idle). Read by the snapshot
+# poller so a snapshot popped with id=null (the Arduino's post-display touch) can
+# still be tied to the recording it belongs to. Guarded by _inflight_lock.
+_inflight_id: int | None = None
+# Snapshot-stop signal: the snapshot poller sets these after it grabs the
+# snapshot for an in-flight print; record_orchestrator polls them to know the
+# print is done and the recording should stop. _snapshot_stop_ts is a
+# time.monotonic() stamp so the orchestrator can require the signal to have
+# landed well after the recording began (see MIN_RECORD_SECONDS).
+_snapshot_stop_lock = threading.Lock()
+_snapshot_stop_id: int | None = None
+_snapshot_stop_ts: float = 0.0
 # ───────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -726,6 +746,23 @@ def poll_snapshot_queue():
                     snap = grab_snapshot()
                     if snap:
                         upload_snapshot(snap, gallery_id)
+
+                    # Tie this snapshot to the in-flight recording (if any) so it
+                    # doubles as the "print done → stop recording" signal. A
+                    # snapshot popped with id=null is the Arduino's post-display
+                    # touch (its body id is dropped by snapshot-request.php), so
+                    # fall back to the recording's own id. Signal after the grab
+                    # (the live-frame sidecar copy already happened) and
+                    # regardless of upload success, so a failed snapshot upload
+                    # doesn't strand the recording at the 1.5h cap.
+                    with _inflight_lock:
+                        inflight_id = _inflight_id
+                    effective_id = gallery_id if gallery_id is not None else inflight_id
+                    if effective_id is not None:
+                        global _snapshot_stop_id, _snapshot_stop_ts
+                        with _snapshot_stop_lock:
+                            _snapshot_stop_id = effective_id
+                            _snapshot_stop_ts = time.monotonic()
             elif resp.status_code == 204:
                 log.debug("[snapshot] Queue empty")
             else:
@@ -1265,34 +1302,21 @@ def _wait_for_start() -> tuple[int, str] | None:
     return gid, name
 
 
-def _check_stop(expected_gid: int) -> bool:
-    """Poll stream-end.php once. Returns True if a stop signal arrived for
-    this recording (matching id, or id=None as fire-and-forget tolerance)."""
-    if not STREAM_END_URL:
-        return False
-    try:
-        resp = requests.post(
-            STREAM_END_URL,
-            data={"secret": SNAPSHOT_SECRET},
-            headers={"User-Agent": "P.A.R./1.0"},
-            timeout=10,
-        )
-    except Exception as e:
-        log.warning(f"[record] stop-poll error: {e}")
-        return False
-    if resp.status_code != 200:
-        return False
-    try:
-        data = resp.json()
-    except Exception:
-        return False
-    if not data.get("ok"):
-        return False
-    flag_id = data.get("id")
-    if flag_id is None or flag_id == expected_gid:
-        return True
-    log.warning(f"[record] stop signal id mismatch: got {flag_id}, expected {expected_gid} — ignoring")
-    return False
+def _check_stop(expected_gid: int, started: float) -> bool:
+    """Return True if the snapshot poller has captured the snapshot for this
+    recording — the unified "print done" signal that replaces the old
+    stream-end.php poll. The snapshot flag is armed twice per print (job-start by
+    next.php with the gallery id, and display-done by the Arduino with id=null),
+    so only honor a signal that landed at least MIN_RECORD_SECONDS into the
+    recording: the job-start arm fires within seconds of (or before) the
+    recording start and is filtered out, while the post-display snapshot lands
+    minutes in. `started` is this recording's time.monotonic() start stamp."""
+    with _snapshot_stop_lock:
+        if _snapshot_stop_id != expected_gid:
+            return False
+        if (_snapshot_stop_ts - started) <= MIN_RECORD_SECONDS:
+            return False
+    return True
 
 
 def _graceful_stop_ffmpeg(proc: subprocess.Popen) -> None:
@@ -1355,8 +1379,9 @@ def record_orchestrator() -> None:
     if not STREAM_START_URL:
         log.warning("[record] Disabled — STREAM_START_URL not set")
         return
-    if not STREAM_END_URL:
-        log.warning("[record] STREAM_END_URL not set — recordings only stop on 1.5h cap")
+    # Recordings stop when the snapshot poller captures the print's snapshot (the
+    # unified "print done" signal); the 1.5h cap is the backstop. The old
+    # stream-end.php poll is retired, so STREAM_END_URL is no longer used here.
 
     RECORDING_DIR.mkdir(parents=True, exist_ok=True)
     youtube = None
@@ -1425,9 +1450,10 @@ def record_orchestrator() -> None:
         log.info(f"[record] ffmpeg pid={proc.pid} -> {out_path.name}")
         _recording_active.set()  # pause the camera keeper while we record
         with _inflight_lock:
-            global _inflight_proc, _inflight_path
+            global _inflight_proc, _inflight_path, _inflight_id
             _inflight_proc = proc
             _inflight_path = out_path
+            _inflight_id = gallery_id
         started = time.monotonic()
         deadline = started + RECORD_MAX_SECONDS
         stop_reason = "unknown"
@@ -1440,8 +1466,8 @@ def record_orchestrator() -> None:
                 if time.monotonic() >= deadline:
                     stop_reason = "cap"
                     break
-                if _check_stop(gallery_id):
-                    stop_reason = "signal"
+                if _check_stop(gallery_id, started):
+                    stop_reason = "snapshot"
                     break
                 time.sleep(STREAM_POLL_INTERVAL)
 
@@ -1453,6 +1479,12 @@ def record_orchestrator() -> None:
             with _inflight_lock:
                 _inflight_proc = None
                 _inflight_path = None
+                _inflight_id = None
+            # Clear the snapshot-stop signal so a stale one can't immediately
+            # stop the next recording.
+            with _snapshot_stop_lock:
+                global _snapshot_stop_id
+                _snapshot_stop_id = None
             # Drop the live-frame sidecar so the next print's early snapshots
             # can't pick up a stale frame from this recording.
             try:
