@@ -3,9 +3,16 @@
 Per-print Recorder + Snapshot/Moderation Pollers.
 
 Records a locally-attached USB webcam (a Logitech "Brio 100", matched by name
-prefix) to a local mp4 while a print is active via ffmpeg's avfoundation input,
-then uploads to YouTube via the Data API and attaches the resulting video id to
-the gallery entry.
+prefix) to a local mov while a print is active via a NATIVE AVFoundation
+capture session (PyObjC), then uploads to YouTube via the Data API and attaches
+the resulting video id to the gallery entry.
+
+Recording uses AVCaptureSession — NOT ffmpeg — because ffmpeg's avfoundation
+input can only request the camera's UNCOMPRESSED device formats, and uncompressed
+1080p over USB 2.0 is bandwidth-capped to ~5fps. AVCaptureSession can select the
+MJPEG-backed 1080p30 device format (the same one Photo Booth uses), so it gets a
+true 1080p30. ffmpeg is still used for device enumeration and for one-shot
+snapshot stills when no recording is in flight.
 
 A recording starts when stream-start.php hands us a (gallery_id, name) and
 stops when either stream-end.php fires (Arduino's signal after its 10-min
@@ -59,20 +66,23 @@ from googleapiclient.http import MediaFileUpload
 load_dotenv(Path(__file__).parent / ".env")
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-# Locally-attached USB webcam, accessed through ffmpeg's avfoundation input.
-# CAMERA_NAME is matched case-insensitively against the START of each
-# avfoundation VIDEO-device name, so "brio 100" matches "Brio 100", "Brio 100
-# (1234)", etc. Recording is ALWAYS video-only — audio is never captured or
-# broadcast (build_record_cmd hard-codes -an and the input is video-only).
+# Locally-attached USB webcam. CAMERA_NAME is matched case-insensitively against
+# the START of each video-device name, so "brio 100" matches "Brio 100", "Brio
+# 100 (1234)", etc. — for BOTH ffmpeg enumeration (keeper/snapshot) and the
+# AVFoundation recorder's localizedName lookup. Recording is ALWAYS video-only:
+# the AVCaptureSession adds only a video input, no audio.
 CAMERA_NAME            = os.getenv("CAMERA_NAME", "Brio 100")
 CAMERA_FRAMERATE       = os.getenv("CAMERA_FRAMERATE", "30")
-# avfoundation REQUIRES an explicit frame size: requesting -framerate without
-# -video_size makes the device config fail and silently fall back to the cam's
-# default mode, after which ffmpeg "can't estimate rate" and feeds libx264 a
-# garbage ~5000fps timebase → MB-rate level overflow → a grey, corrupted
-# recording. Pin both to a mode the cam actually advertises (the Brio 100 tops
-# out at 1920x1080@30).
+# Recording resolution. The AVFoundation recorder selects the device format of
+# exactly this size whose max frame rate is >= CAMERA_FRAMERATE, preferring the
+# '420v' (NV12, MJPEG-backed) format — the only one that sustains 30fps at 1080p
+# over USB 2.0. The Brio 100 tops out at 1920x1080@30.
 CAMERA_VIDEO_SIZE      = os.getenv("CAMERA_VIDEO_SIZE", "1920x1080")
+try:
+    CAMERA_REC_W, CAMERA_REC_H = (int(x) for x in CAMERA_VIDEO_SIZE.lower().split("x"))
+except Exception:
+    print(f"WARNING: CAMERA_VIDEO_SIZE={CAMERA_VIDEO_SIZE!r} invalid; using 1920x1080")
+    CAMERA_REC_W, CAMERA_REC_H = 1920, 1080
 # Keeper re-enumerates the device list this often (when not recording).
 CAMERA_POLL_INTERVAL   = int(os.getenv("CAMERA_POLL_INTERVAL", "15"))
 SNAPSHOT_SECRET        = os.getenv("SNAPSHOT_SECRET")
@@ -86,7 +96,7 @@ STREAM_END_URL         = os.getenv("STREAM_END_URL")
 STREAM_VIDEO_ID_URL    = os.getenv("STREAM_VIDEO_ID_URL")
 STREAM_POLL_INTERVAL   = int(os.getenv("STREAM_POLL_INTERVAL", "10"))
 
-# Local working dir for in-flight mp4 recordings. Uploads delete on success;
+# Local working dir for in-flight .mov recordings. Uploads delete on success;
 # failed uploads are left here for manual recovery.
 RECORDING_DIR          = Path("/tmp/recordings")
 # While a recording is in flight, the recording ffmpeg also writes a ~1fps JPEG
@@ -167,7 +177,13 @@ if _missing:
     print("ERROR: Missing required environment variables:", ", ".join(_missing))
     sys.exit(1)
 
-VIDEO_BITRATE        = "2500k"
+# Target H.264 average bitrate for the recording. AVCaptureMovieFileOutput's
+# default is ~24 Mbps at 1080p (a 90-min cap would be ~16 GB) — far too large
+# for /tmp and the YouTube upload, so we pin a sane average via the movie
+# output's compression settings. 2.5 Mbps is plenty for the low-detail LED
+# matrix subject (90-min cap ≈ 1.7 GB).
+VIDEO_BITRATE        = os.getenv("VIDEO_BITRATE", "2500k")
+VIDEO_BITRATE_BPS    = int(VIDEO_BITRATE.rstrip("kK")) * 1000
 CAMERA_RETRY_DELAY   = 30   # seconds between camera-availability re-checks
 # Total window to keep retrying the camera after a start signal before giving
 # up on a print. A cam that comes up any time inside this window gets recorded.
@@ -178,15 +194,15 @@ CAMERA_WAIT_SECONDS  = 10 * 60
 # refreshes this every CAMERA_POLL_INTERVAL seconds.
 _camera_lock = threading.Lock()
 _camera_spec: str | None = None
-# Set while ffmpeg is actively recording a print — pauses the camera keeper so
-# it doesn't re-enumerate devices while a recording holds the cam.
+# Set while a recording is in flight — pauses the camera keeper so it doesn't
+# re-enumerate devices while the AVCaptureSession holds the cam.
 _recording_active = threading.Event()
-# Tracks the currently in-flight recording (ffmpeg proc + its mp4 path) so a
-# Ctrl+C handler can stop ffmpeg cleanly and delete the partial file. Guarded
-# by _inflight_lock because the orchestrator thread writes it and the signal
-# handler (main thread) reads it.
+# Tracks the currently in-flight recording (the AVFRecorder + its mov path) so a
+# Ctrl+C handler can stop it cleanly and delete the partial file. Guarded by
+# _inflight_lock because the orchestrator thread writes it and the signal handler
+# (main thread) reads it.
 _inflight_lock = threading.Lock()
-_inflight_proc: subprocess.Popen | None = None
+_inflight_rec: "AVFRecorder | None" = None
 _inflight_path: Path | None = None
 # Gallery id of the in-flight recording (None when idle). Read by the snapshot
 # poller so a snapshot popped with id=null (the Arduino's post-display touch) can
@@ -213,61 +229,269 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def build_record_cmd(out_path: Path, cam_spec: str) -> list[str]:
-    """Webcam (avfoundation) -> local mp4, plus a ~1fps JPEG sidecar, from one
-    capture. `cam_spec` is the avfoundation VIDEO index from _refresh_camera().
+# ── NATIVE AVFOUNDATION RECORDER ─────────────────────────────────────────────
+# Recording goes through AVCaptureSession (PyObjC), not ffmpeg, so we can select
+# the camera's MJPEG-backed 1080p30 device format (see module docstring). The
+# import is guarded so the rest of the daemon (mod/snapshot pollers) still loads
+# if PyObjC is somehow missing — only recording then fails, with a clear error.
+try:
+    import objc
+    import AVFoundation as _AVF
+    import CoreMedia as _CM
+    import Quartz as _Quartz
+    import libdispatch as _libdispatch
+    from Foundation import NSObject, NSURL
+    _AVF_IMPORT_ERROR: Exception | None = None
+except Exception as _avf_e:                                    # pragma: no cover
+    _AVF_IMPORT_ERROR = _avf_e
+    NSObject = object                                          # type: ignore
 
-    Two outputs:
-      1. the fragmented mp4 (a SIGKILL still leaves a playable file),
-      2. LATEST_FRAME_PATH, overwritten ~once a second, so the snapshot poller
-         can grab a still WITHOUT opening the camera (a USB cam allows only one
-         opener, and the recording owns the device).
 
-    Audio is NEVER captured: the input is video-only and -an is hard-coded.
-    -t on the INPUT caps total capture at RECORD_MAX_SECONDS, stopping both
-    outputs together (a safety net if the stop signal is lost)."""
-    return [
-        "ffmpeg",
-        "-loglevel", "warning",
-        "-f", "avfoundation",
-        "-framerate", CAMERA_FRAMERATE,
-        # Pin the capture mode (see CAMERA_VIDEO_SIZE) so the device configures
-        # cleanly and ffmpeg can estimate the real rate instead of guessing.
-        "-video_size", CAMERA_VIDEO_SIZE,
-        "-pixel_format", "uyvy422",
-        # The Brio drops its true capture rate (~15fps in dim light) below the
-        # requested 30; wall-clock input timestamps + a forced CFR output keep
-        # the encoder on a sane, constant timebase and play back smoothly.
-        "-use_wallclock_as_timestamps", "1",
-        "-t", str(RECORD_MAX_SECONDS),
-        "-i", cam_spec,
-        # ── output 1: the recording ──────────────────────────────────────────
-        "-map", "0:v",
-        "-fps_mode", "cfr",
-        "-r", CAMERA_FRAMERATE,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p",
-        "-b:v", VIDEO_BITRATE,
-        "-maxrate", VIDEO_BITRATE,
-        "-bufsize", str(int(VIDEO_BITRATE[:-1]) * 2) + "k",
-        "-g", "30",
-        "-an",
-        # No +faststart: it conflicts with fragmented streaming muxing (which is
-        # already seekable) and forces a seek-on-close that the frag flags break.
-        "-movflags", "+empty_moov+default_base_moof+frag_keyframe",
-        "-f", "mp4",
-        str(out_path),
-        # ── output 2: the live snapshot frame ────────────────────────────────
-        "-map", "0:v",
-        "-fps_mode", "cfr",
-        "-r", "1",
-        "-update", "1",
-        "-q:v", "2",
-        "-f", "image2",
-        str(LATEST_FRAME_PATH),
-    ]
+def _fourcc(n: int) -> str:
+    return bytes([(n >> 24) & 0xFF, (n >> 16) & 0xFF,
+                  (n >> 8) & 0xFF, n & 0xFF]).decode("ascii", "replace")
+
+
+if _AVF_IMPORT_ERROR is None:
+    class _RecordDelegate(NSObject):
+        """AVCaptureMovieFileOutput finish callback — signals the recorder that
+        the moov atom has been flushed and the file is finalized."""
+        def initWithRecorder_(self, rec):
+            self = objc.super(_RecordDelegate, self).init()
+            if self is None:
+                return None
+            self._rec = rec
+            return self
+
+        def captureOutput_didFinishRecordingToOutputFileAtURL_fromConnections_error_(
+                self, out, url, conns, error):
+            self._rec._on_finish(error)
+
+    class _SidecarDelegate(NSObject):
+        """VideoDataOutput callback — writes LATEST_FRAME_PATH ~1fps so the
+        snapshot poller has a no-contention source while a recording owns the cam.
+        Throttled in-callback; most invocations just compare a timestamp and
+        return. Frames arrive BGRA; CoreImage renders the JPEG."""
+        def initWithPath_(self, path):
+            self = objc.super(_SidecarDelegate, self).init()
+            if self is None:
+                return None
+            self._path = str(path)
+            self._tmp = self._path + ".tmp"
+            self._last = 0.0
+            self._ctx = _Quartz.CIContext.context()
+            self._cs = _Quartz.CGColorSpaceCreateDeviceRGB()
+            return self
+
+        def captureOutput_didOutputSampleBuffer_fromConnection_(self, out, sbuf, conn):
+            now = time.monotonic()
+            if now - self._last < 1.0:
+                return
+            self._last = now
+            try:
+                img = _CM.CMSampleBufferGetImageBuffer(sbuf)
+                if img is None:
+                    return
+                ci = _Quartz.CIImage.imageWithCVImageBuffer_(img)
+                data = self._ctx.JPEGRepresentationOfImage_colorSpace_options_(ci, self._cs, {})
+                if data is not None and data.writeToFile_atomically_(self._tmp, True):
+                    os.replace(self._tmp, self._path)
+            except Exception as e:                              # pragma: no cover
+                log.debug(f"[sidecar] frame write failed: {e!r}")
+
+
+class AVFRecorder:
+    """Native AVFoundation per-print recorder. Selects the camera's MJPEG-backed
+    1080p30 device format (the one ffmpeg's avfoundation input can't reach) and
+    records H.264 to `out_path` via AVCaptureMovieFileOutput, while a throttled
+    VideoDataOutput writes a ~1fps JPEG sidecar (`sidecar_path`) for the snapshot
+    poller. Audio is never captured — only a video input is added.
+
+    Unlike the old fragmented-mp4 ffmpeg path, the moov atom is finalized on
+    stop(); a hard crash mid-record loses the file, but the normal graceful-stop
+    path (snapshot signal or 1.5h cap) always finalizes cleanly."""
+
+    def __init__(self, out_path: Path, name_prefix: str, sidecar_path: Path,
+                 want_w: int = CAMERA_REC_W, want_h: int = CAMERA_REC_H,
+                 fps: int = int(CAMERA_FRAMERATE)):
+        self.out_path = Path(out_path)
+        self.sidecar_path = Path(sidecar_path)
+        self.name_prefix = name_prefix.strip().lower()
+        self.want_w, self.want_h, self.fps = want_w, want_h, fps
+        self._session = None
+        self._movie_out = None
+        self._delegate = None
+        self._data_delegate = None
+        self._queue = None
+        self._error = None
+        self._finished = threading.Event()
+        self.device_name: str | None = None
+        self.chosen_subtype: str | None = None
+
+    # — public API —————————————————————————————————————————————————————————————
+    def start(self) -> None:
+        """Configure the session and begin recording. Raises on fatal setup
+        error (no PyObjC, no matching device, no suitable format, etc.)."""
+        if _AVF_IMPORT_ERROR is not None:
+            raise RuntimeError(f"PyObjC AVFoundation unavailable: {_AVF_IMPORT_ERROR!r}")
+
+        dt = _AVF.AVCaptureDeviceDiscoverySession.discoverySessionWithDeviceTypes_mediaType_position_(
+            [_AVF.AVCaptureDeviceTypeExternal,
+             _AVF.AVCaptureDeviceTypeBuiltInWideAngleCamera,
+             _AVF.AVCaptureDeviceTypeContinuityCamera],
+            _AVF.AVMediaTypeVideo, _AVF.AVCaptureDevicePositionUnspecified)
+        devs = list(dt.devices())
+        dev = next((d for d in devs
+                    if d.localizedName().lower().startswith(self.name_prefix)), None)
+        if dev is None:
+            raise RuntimeError(
+                f"no AVFoundation camera matching {self.name_prefix!r} "
+                f"(present: {[d.localizedName() for d in devs]})")
+        self.device_name = dev.localizedName()
+
+        fmt = self._pick_format(dev)
+        if fmt is None:
+            raise RuntimeError(
+                f"{self.device_name!r} has no {self.want_w}x{self.want_h}"
+                f"@>={self.fps}fps format")
+
+        ok = dev.lockForConfiguration_(None)
+        if not (ok[0] if isinstance(ok, tuple) else ok):
+            raise RuntimeError("lockForConfiguration failed")
+        try:
+            dev.setActiveFormat_(fmt)
+            # Pin CFR at the format's fastest supported frame duration. Use the
+            # range's exact rational (the device rejects a naive 1/fps CMTime).
+            r = sorted(fmt.videoSupportedFrameRateRanges(),
+                       key=lambda x: -x.maxFrameRate())[0]
+            dev.setActiveVideoMinFrameDuration_(r.minFrameDuration())
+            dev.setActiveVideoMaxFrameDuration_(r.minFrameDuration())
+        finally:
+            dev.unlockForConfiguration()
+
+        session = _AVF.AVCaptureSession.alloc().init()
+        session.beginConfiguration()
+        inp, err = _AVF.AVCaptureDeviceInput.deviceInputWithDevice_error_(dev, None)
+        if inp is None or not session.canAddInput_(inp):
+            raise RuntimeError(f"cannot add camera input: {err}")
+        session.addInput_(inp)
+
+        movie = _AVF.AVCaptureMovieFileOutput.alloc().init()
+        if not session.canAddOutput_(movie):
+            raise RuntimeError("cannot add movie output")
+        session.addOutput_(movie)
+
+        # Sidecar: low-overhead VideoDataOutput, BGRA, throttled to ~1fps. Adding
+        # it alongside the movie output does NOT reduce the recording's fps.
+        # Best-effort: if the OS won't allow the second output, record anyway.
+        try:
+            data = _AVF.AVCaptureVideoDataOutput.alloc().init()
+            data.setAlwaysDiscardsLateVideoFrames_(True)
+            # kCVPixelBufferPixelFormatTypeKey == "PixelFormatType"; 'BGRA' == 0x42475241
+            data.setVideoSettings_({"PixelFormatType": 0x42475241})
+            self._queue = _libdispatch.dispatch_queue_create(b"par.avf.sidecar", None)
+            self._data_delegate = _SidecarDelegate.alloc().initWithPath_(str(self.sidecar_path))
+            data.setSampleBufferDelegate_queue_(self._data_delegate, self._queue)
+            if session.canAddOutput_(data):
+                session.addOutput_(data)
+            else:
+                self._data_delegate = None
+                log.warning("[record] sidecar VideoDataOutput rejected; "
+                            "recording without live frame")
+        except Exception as e:
+            self._data_delegate = None
+            log.warning(f"[record] sidecar setup failed ({e!r}); "
+                        "recording without live frame")
+
+        session.commitConfiguration()
+        self._session = session
+        self._movie_out = movie
+
+        # Cap the H.264 average bitrate — AVFoundation's default (~24 Mbps at
+        # 1080p) would make a 90-min recording ~16 GB. The video connection
+        # exists only after the output is added to the session.
+        try:
+            conn = movie.connectionWithMediaType_(_AVF.AVMediaTypeVideo)
+            if conn is not None:
+                movie.setOutputSettings_forConnection_({
+                    _AVF.AVVideoCodecKey: _AVF.AVVideoCodecTypeH264,
+                    _AVF.AVVideoWidthKey: self.want_w,
+                    _AVF.AVVideoHeightKey: self.want_h,
+                    _AVF.AVVideoCompressionPropertiesKey: {
+                        _AVF.AVVideoAverageBitRateKey: VIDEO_BITRATE_BPS,
+                        _AVF.AVVideoMaxKeyFrameIntervalKey: self.fps,
+                    },
+                }, conn)
+        except Exception as e:
+            log.warning(f"[record] could not set bitrate ({e!r}); "
+                        "using AVFoundation default")
+
+        # A stale sidecar from a prior recording must not be served before the
+        # first fresh frame lands.
+        self.sidecar_path.unlink(missing_ok=True)
+
+        session.startRunning()
+        self._delegate = _RecordDelegate.alloc().initWithRecorder_(self)
+        self.out_path.unlink(missing_ok=True)
+        movie.startRecordingToOutputFileURL_recordingDelegate_(
+            NSURL.fileURLWithPath_(str(self.out_path)), self._delegate)
+
+    def stop(self, timeout: float = 15.0) -> None:
+        """Stop recording, flushing the moov atom, then tear down the session.
+        Idempotent and exception-safe (called from the orchestrator finally
+        block and the Ctrl+C handler)."""
+        try:
+            mo = self._movie_out
+            if mo is not None and mo.isRecording():
+                mo.stopRecording()
+                # Wait for the finish delegate (moov flush) before stopping the
+                # session, else the file can be left without a moov.
+                if not self._finished.wait(timeout):
+                    log.warning("[record] movie finish callback timed out; "
+                                "file may be incomplete")
+        except Exception as e:
+            log.warning(f"[record] stop error: {e!r}")
+        finally:
+            try:
+                if self._session is not None and self._session.isRunning():
+                    self._session.stopRunning()
+            except Exception as e:
+                log.warning(f"[record] session stop error: {e!r}")
+
+    def is_running(self) -> bool:
+        return self._movie_out is not None and self._movie_out.isRecording()
+
+    @property
+    def error(self):
+        return self._error
+
+    # — internals ——————————————————————————————————————————————————————————————
+    def _pick_format(self, dev):
+        """Pick the device format of the wanted size whose max fps >= self.fps,
+        preferring '420v' (NV12, MJPEG-backed) — the format that actually
+        sustains 30fps at 1080p over USB 2.0 (vs 'yuvs'/uyvy, which caps ~5fps)."""
+        best = None
+        for f in dev.formats():
+            desc = f.formatDescription()
+            dims = _CM.CMVideoFormatDescriptionGetDimensions(desc)
+            if dims.width != self.want_w or dims.height != self.want_h:
+                continue
+            maxfps = max((r.maxFrameRate() for r in f.videoSupportedFrameRateRanges()),
+                         default=0.0)
+            if maxfps + 0.5 < self.fps:
+                continue
+            sub = _fourcc(_CM.CMFormatDescriptionGetMediaSubType(desc))
+            score = (sub == "420v", maxfps)
+            if best is None or score > best[0]:
+                best = (score, f, sub)
+        if best is None:
+            return None
+        self.chosen_subtype = best[2]
+        return best[1]
+
+    def _on_finish(self, error):
+        self._error = error
+        self._finished.set()
 
 
 # ── YOUTUBE API ────────────────────────────────────────────────────────────────
@@ -431,8 +655,8 @@ def get_youtube_service():
 
 
 def upload_recording(youtube, out_path: Path, title: str) -> str | None:
-    """Resumable upload of a finished mp4 via videos.insert.
-    Returns the 11-char YouTube video id, or None on failure."""
+    """Resumable upload of a finished recording (QuickTime .mov) via
+    videos.insert. Returns the 11-char YouTube video id, or None on failure."""
     body = {
         "snippet": {
             "title": title,
@@ -444,7 +668,7 @@ def upload_recording(youtube, out_path: Path, title: str) -> str | None:
             "selfDeclaredMadeForKids": False,
         },
     }
-    media = MediaFileUpload(str(out_path), mimetype="video/mp4",
+    media = MediaFileUpload(str(out_path), mimetype="video/quicktime",
                             resumable=True, chunksize=8 * 1024 * 1024)
     request = youtube.videos().insert(
         part="snippet,status",
@@ -1239,15 +1463,12 @@ def poll_mod_queue() -> None:
 
 # ── RECORDING ORCHESTRATOR ─────────────────────────────────────────────────────
 #
-# Single-thread state machine driven by the server's two recording flags:
-#   - stream-pending.flag (set by next.php on each print)  -> START
-#   - stream-end.flag     (set by Arduino's stream-end-set) -> STOP
-#
-# Per print: poll stream-start.php for a (gallery_id, name) start signal,
-# spawn ffmpeg to record RTSP -> /tmp/recordings/<id>_<ts>.mp4, poll
-# stream-end.php until we see the matching stop signal (or 1.5h elapses),
-# graceful-stop ffmpeg, then hand the file off to a background uploader so
-# the next print can start recording immediately even if the upload is slow.
+# Single-thread state machine: poll stream-start.php for a (gallery_id, name)
+# start signal, start an AVFRecorder (native AVCaptureSession) recording the
+# local USB webcam -> /tmp/recordings/<id>_<ts>.mov, wait for the snapshot-stop
+# signal (or 1.5h cap), stop the recorder (finalizes the moov), then hand the
+# file off to a background uploader so the next print can start recording
+# immediately even if the upload is slow.
 
 
 def _post_video_id(gallery_id: int, video_id: str) -> None:
@@ -1319,36 +1540,6 @@ def _check_stop(expected_gid: int, started: float) -> bool:
     return True
 
 
-def _graceful_stop_ffmpeg(proc: subprocess.Popen) -> None:
-    """Tell ffmpeg to flush and exit cleanly. Sends 'q' on stdin (the muxer
-    finalizes the moov atom), then SIGTERM, then SIGKILL as escalating
-    fallbacks."""
-    if proc.poll() is not None:
-        return
-    try:
-        if proc.stdin and not proc.stdin.closed:
-            proc.stdin.write(b"q\n")
-            proc.stdin.flush()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=10)
-        return
-    except subprocess.TimeoutExpired:
-        log.warning("[record] ffmpeg did not exit after 'q'; SIGTERM")
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        log.warning("[record] ffmpeg did not exit after SIGTERM; SIGKILL")
-    proc.kill()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        log.error("[record] ffmpeg unkillable")
-
-
 def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> None:
     """Background uploader. Builds the title (no timestamp), uploads, posts
     the resulting video_id back to the gallery, and unlinks on success."""
@@ -1416,14 +1607,9 @@ def record_orchestrator() -> None:
                         f"{CAMERA_WAIT_SECONDS}s; skipping #{gallery_id}")
             continue
 
-        # verify_camera_accessible just refreshed the spec; capture it for this
-        # recording. (Tiny race if the cam vanished in between — guard anyway.)
-        with _camera_lock:
-            cam_spec = _camera_spec
-        if cam_spec is None:
-            log.warning(f"[record] camera vanished before recording #{gallery_id}; skipping")
-            continue
-
+        # verify_camera_accessible just confirmed the cam enumerates; the
+        # AVFRecorder re-selects it by name itself. (Tiny race if it vanished in
+        # between — AVFRecorder.start() raises and we skip this print.)
         if youtube is None:
             try:
                 youtube = get_youtube_service()
@@ -1432,26 +1618,24 @@ def record_orchestrator() -> None:
             if not youtube:
                 log.error("[record] No YouTube client; recording but cannot upload")
 
-        out_path = RECORDING_DIR / f"{gallery_id}_{int(time.time())}.mp4"
+        out_path = RECORDING_DIR / f"{gallery_id}_{int(time.time())}.mov"
 
+        rec = AVFRecorder(out_path, CAMERA_NAME, LATEST_FRAME_PATH)
         try:
-            proc = subprocess.Popen(
-                build_record_cmd(out_path, cam_spec),
-                stdin=subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            log.error("[record] ffmpeg not found on PATH — orchestrator exiting")
-            return
+            rec.start()
         except Exception as e:
-            log.error(f"[record] failed to spawn ffmpeg: {e!r}")
+            log.error(f"[record] failed to start AVFoundation capture for "
+                      f"#{gallery_id}: {e!r}")
             time.sleep(STREAM_POLL_INTERVAL)
             continue
 
-        log.info(f"[record] ffmpeg pid={proc.pid} -> {out_path.name}")
+        log.info(f"[record] recording #{gallery_id} -> {out_path.name} "
+                 f"(device={rec.device_name!r}, format={rec.chosen_subtype}, "
+                 f"{CAMERA_REC_W}x{CAMERA_REC_H}@{CAMERA_FRAMERATE})")
         _recording_active.set()  # pause the camera keeper while we record
         with _inflight_lock:
-            global _inflight_proc, _inflight_path, _inflight_id
-            _inflight_proc = proc
+            global _inflight_rec, _inflight_path, _inflight_id
+            _inflight_rec = rec
             _inflight_path = out_path
             _inflight_id = gallery_id
         started = time.monotonic()
@@ -1460,8 +1644,8 @@ def record_orchestrator() -> None:
 
         try:
             while True:
-                if proc.poll() is not None:
-                    stop_reason = f"ffmpeg-exit({proc.returncode})"
+                if not rec.is_running():
+                    stop_reason = f"capture-ended(err={rec.error})"
                     break
                 if time.monotonic() >= deadline:
                     stop_reason = "cap"
@@ -1473,11 +1657,11 @@ def record_orchestrator() -> None:
 
             log.info(f"[record] stopping ({stop_reason}) after "
                      f"{time.monotonic()-started:.0f}s")
-            _graceful_stop_ffmpeg(proc)
+            rec.stop()
         finally:
             _recording_active.clear()  # resume the camera keeper
             with _inflight_lock:
-                _inflight_proc = None
+                _inflight_rec = None
                 _inflight_path = None
                 _inflight_id = None
             # Clear the snapshot-stop signal so a stale one can't immediately
@@ -1516,10 +1700,14 @@ if __name__ == "__main__":
     log.info("═" * 50)
     log.info("  P.A.R. Recorder + Snapshot/Mod Pollers")
     log.info("═" * 50)
-    log.info(f"  Source : avfoundation webcam, name prefix {CAMERA_NAME!r}")
+    log.info(f"  Source : AVFoundation webcam, name prefix {CAMERA_NAME!r}")
     log.info(f"  Target : YouTube Data API (videos.insert)")
-    log.info(f"  Video  : {VIDEO_BITRATE} H.264 veryfast, video-only (no audio), cap {RECORD_MAX_SECONDS}s")
+    log.info(f"  Video  : {CAMERA_REC_W}x{CAMERA_REC_H}@{CAMERA_FRAMERATE} H.264 (AVCaptureSession), "
+             f"video-only (no audio), cap {RECORD_MAX_SECONDS}s")
     log.info(f"  Poller : {SNAPSHOT_REQUEST_URL}")
+    if _AVF_IMPORT_ERROR is not None:
+        log.error(f"  WARNING: PyObjC AVFoundation unavailable ({_AVF_IMPORT_ERROR!r}); "
+                  f"recording will fail until pyobjc is installed")
     log.info("═" * 50)
 
     # Start mod poller FIRST so it's running regardless of camera/YouTube state.
@@ -1555,18 +1743,18 @@ if __name__ == "__main__":
             time.sleep(3600)
     except KeyboardInterrupt:
         log.info("Interrupted by user. Stopping.")
-        # Clean up any in-flight recording: stop ffmpeg, delete the partial
-        # mp4. The orchestrator thread is a daemon and will be killed at
+        # Clean up any in-flight recording: stop the capture, delete the partial
+        # mov. The orchestrator thread is a daemon and will be killed at
         # interpreter shutdown, so we have to do this here on the main thread.
         with _inflight_lock:
-            proc = _inflight_proc
+            rec = _inflight_rec
             path = _inflight_path
-        if proc is not None:
-            log.info(f"[record] Ctrl+C — stopping in-flight ffmpeg pid={proc.pid}")
+        if rec is not None:
+            log.info("[record] Ctrl+C — stopping in-flight recording")
             try:
-                _graceful_stop_ffmpeg(proc)
+                rec.stop()
             except Exception as e:
-                log.warning(f"[record] error stopping ffmpeg on shutdown: {e!r}")
+                log.warning(f"[record] error stopping recording on shutdown: {e!r}")
         if path is not None and path.exists():
             try:
                 path.unlink()

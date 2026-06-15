@@ -9,3 +9,12 @@ google-auth==2.53.0
 google-auth-oauthlib==1.4.0
 google-api-python-client==2.197.0
 claude-agent-sdk==0.2.97
+
+# Native AVFoundation recording (macOS). Recording uses AVCaptureSession via
+# PyObjC — NOT ffmpeg — to reach the camera's MJPEG-backed 1080p30 device format
+# (ffmpeg's avfoundation input only gets uncompressed formats, capped to ~5fps
+# at 1080p over USB 2.0). See AVFRecorder in YT_streamer.py.
+pyobjc-framework-AVFoundation==12.2
+pyobjc-framework-CoreMedia==12.2
+pyobjc-framework-Quartz==12.2
+pyobjc-framework-libdispatch==12.2
