@@ -64,6 +64,16 @@ if (is_dir($galleryDir)) {
             }
         }
 
+        // A photo only ever lands after the board has displayed and been shot
+        // (post check-pass), so image.jpg present means the print is done — treat
+        // the entry as completed even if its file is still pending.json (e.g. the
+        // pending->info rename was lost to a dropped/failed call). Without this,
+        // the modal would show "In progress" on top of a finished print that
+        // already has a real photo.
+        if ($entry['image'] !== null) {
+            $entry['pending'] = false;
+        }
+
         $items[] = $entry;
     }
 
