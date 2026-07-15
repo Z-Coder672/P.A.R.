@@ -1,13 +1,3 @@
-[ ] Add finished livestream on gallery modals
-
 [ ] Option for Email notifications for print start/finish
 
-[ ] X spacing lower
-
-[ ] Debug servo cutting out
-
-[ ] Decrease servo angle for second 90° flip.
-
-[ ] Add second second flip for error reduction
-
-[ ] Add check pass
+[ ] Use the fix pass scan as pre-scan for next draw if <20 errors.
