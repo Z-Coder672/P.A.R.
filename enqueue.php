@@ -111,6 +111,21 @@ if (isset($data['name']) && is_string($data['name'])) {
     $name = mb_substr(trim($data['name']), 0, 100);
 }
 
+// Optional notification email. Validated here; the address is NEVER written to
+// the (web-served) mod/main queue files — only stored encrypted off-webroot,
+// keyed by this entry's id. The queue entry carries a boolean flag only.
+$notifyEmail = null;
+if (isset($data['email']) && is_string($data['email'])) {
+    $candidate = trim($data['email']);
+    if ($candidate !== ''
+        && strlen($candidate) <= MAX_EMAIL_LENGTH
+        && !preg_match('/[\r\n]/', $candidate)
+        && filter_var($candidate, FILTER_VALIDATE_EMAIL)
+    ) {
+        $notifyEmail = $candidate;
+    }
+}
+
 // Submissions now land in the moderation queue first. An external daemon
 // (YT-Streamer/YT_streamer.py) runs Claude-based image + name checks and
 // either auto-approves (promoting the entry into queue.txt via
@@ -168,13 +183,24 @@ if (count($lines) >= MAX_MOD_QUEUE_LENGTH) {
     exit;
 }
 
+$entryId = uniqid('', true);
+
+// Persist the encrypted email (off-webroot) keyed by this entry id. Best-effort:
+// if the secure store is unavailable the submission still enqueues, just without
+// a notification. `notify` in the entry is a flag only — no address.
+$notifyStored = false;
+if ($notifyEmail !== null) {
+    $notifyStored = par_store_submission_email($entryId, $notifyEmail, $name);
+}
+
 $queueEntry = json_encode([
-    'id'        => uniqid('', true),
+    'id'        => $entryId,
     'item'      => $data['item'],
     'name'      => $name,
     'ts'        => time(),
     'status'    => 'pending',
     'status_ts' => time(),
+    'notify'    => $notifyStored,
 ], JSON_UNESCAPED_UNICODE);
 
 fseek($handle, 0, SEEK_END);
