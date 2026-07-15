@@ -1,12 +1,19 @@
-<FilesMatch "^(\.env|queue\.txt|stream\.log|router\.php|\.DS_Store|snapshot-pending\.flag)$">
+# --- Deny direct web access to secrets, data, and internal source ---------
+# The frontend only ever talks to *.php endpoints (verified), so raw data files
+# are never fetched by a browser and can be fully denied. Emails live encrypted
+# ABOVE the document root (see lib/private_store.php); these rules are a second
+# line of defense in case a file ever lands inside the served tree.
+<FilesMatch "(^\.env$|^\.DS_Store$|^router\.php$|\.log$|\.flag$|\.enc$|^email\.key$|^queue\.txt$|^mod_queue\.txt$|^latest-video\.json$|^(pending|info)\.json$)">
     Require all denied
 </FilesMatch>
 
 <IfModule mod_rewrite.c>
     RewriteEngine On
 
-    # Block the locks directory
-    RewriteRule ^locks(/|$) - [F,L]
+    # Block internal / private directories outright.
+    RewriteRule ^locks(/|$)       - [F,L]
+    RewriteRule ^lib(/|$)         - [F,L]
+    RewriteRule ^par-private(/|$) - [F,L]
 
     # If the requested URI is exactly /gallery or /gallery/, route to SPA
     RewriteRule ^gallery/?$ index.html [L]
