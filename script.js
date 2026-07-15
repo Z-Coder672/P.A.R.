@@ -791,6 +791,10 @@ function getQueueErrorMessage(errorCode, statusCode) {
         return 'This picture could not be prepared for the queue.';
     }
 
+    if (statusCode === 429 || errorCode === 'rate_limited') {
+        return 'You\'re sending pictures too quickly. Please wait a moment and try again.';
+    }
+
     return 'Could not add picture to the P.A.R. queue.';
 }
 
@@ -1705,6 +1709,10 @@ document.getElementById('pictureName').addEventListener('input', function() {
 // Name modal — cancel
 document.getElementById('cancelNameModal').addEventListener('click', function() {
     document.getElementById('nameModal').classList.add('hidden');
+    const emailInput = document.getElementById('pictureEmail');
+    emailInput.value = '';
+    emailInput.classList.remove('input-error');
+    document.getElementById('pictureEmailError').classList.add('hidden');
 });
 
 // Name modal — upload
@@ -1712,6 +1720,8 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
     const nameModal = document.getElementById('nameModal');
     const nameInput = document.getElementById('pictureName');
     const nameError = document.getElementById('pictureNameError');
+    const emailInput = document.getElementById('pictureEmail');
+    const emailError = document.getElementById('pictureEmailError');
     const name = nameInput.value.trim();
 
     if (!name) {
@@ -1722,11 +1732,26 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
     }
     nameError.classList.add('hidden');
     nameInput.classList.remove('input-error');
+
+    // Email is optional, but if provided it must look valid before we send.
+    const email = emailInput.value.trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        emailError.classList.remove('hidden');
+        emailInput.classList.add('input-error');
+        emailInput.focus();
+        return;
+    }
+    emailError.classList.add('hidden');
+    emailInput.classList.remove('input-error');
+
     const state = captureGridState();
     const payload = {
         item: encodeGridStateToBase64(state),
         name: name
     };
+    if (email) {
+        payload.email = email;
+    }
 
     setQueueStatus('Sending to queue...');
 
@@ -1748,7 +1773,10 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
             throw new Error(getQueueErrorMessage(result.error));
         }
 
-        setQueueStatus('Picture added to the P.A.R. queue.');
+        setQueueStatus(email
+            ? 'Picture added to the P.A.R. queue. We\'ll email you when it prints.'
+            : 'Picture added to the P.A.R. queue.');
+        emailInput.value = '';
     } catch (error) {
         console.error('Error sending picture to queue:', error);
         const message = error instanceof Error
@@ -1758,4 +1786,9 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
     } finally {
         nameModal.classList.add('hidden');
     }
+});
+
+document.getElementById('pictureEmail').addEventListener('input', function() {
+    document.getElementById('pictureEmailError').classList.add('hidden');
+    this.classList.remove('input-error');
 });
