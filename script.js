@@ -113,9 +113,77 @@ function getActiveTabFromUrl() {
     return 'latest';
 }
 
-// Latest recording: server stores the newest upload in latest-video.json
-// (written by stream-video-id.php when YT-Streamer finishes uploading). One
-// fetch, no YouTube Data API calls.
+// --- YouTube IFrame Player API ---------------------------------------------
+// Recordings embed via the IFrame Player API (not a bare <iframe>) so we can
+// read player.getDuration() in the browser and seek to ~10s before the end —
+// opening on the finished board. This needs ZERO YouTube Data API calls: the
+// video id comes from gallery.php and the duration from the player itself.
+const NEAR_END_SECONDS = 10;
+let _ytApiReadyPromise = null;
+let latestVideoPlayer = null;
+let latestVideoToken = 0;
+let galleryModalPlayer = null;
+let galleryModalToken = 0;
+
+function loadYouTubeIframeApi() {
+    if (window.YT && window.YT.Player) return Promise.resolve();
+    if (_ytApiReadyPromise) return _ytApiReadyPromise;
+    _ytApiReadyPromise = new Promise((resolve) => {
+        // The API invokes this global once loaded; chain any prior handler so we
+        // don't clobber another registration.
+        const prev = window.onYouTubeIframeAPIReady;
+        window.onYouTubeIframeAPIReady = function () {
+            if (typeof prev === 'function') prev();
+            resolve();
+        };
+        const tag = document.createElement('script');
+        tag.src = 'https://www.youtube.com/iframe_api';
+        document.head.appendChild(tag);
+    });
+    return _ytApiReadyPromise;
+}
+
+// Mount a player on `mountEl` (the API replaces it with an iframe) that seeks to
+// ~10s before the end as soon as the duration is known. getDuration() only
+// returns a real value once playback metadata loads (≈ first PLAYING), so we try
+// on both onReady and the first PLAYING. Returns the YT.Player synchronously —
+// loadYouTubeIframeApi() must have resolved first.
+function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError } = {}) {
+    let seeked = false;
+    const seekNearEnd = (p) => {
+        if (seeked) return;
+        const dur = p.getDuration();
+        if (dur && dur > NEAR_END_SECONDS) {
+            p.seekTo(dur - NEAR_END_SECONDS, true);
+            seeked = true;
+        }
+    };
+    return new YT.Player(mountEl, {
+        videoId,
+        playerVars: {
+            // Muted is the only autoplay browsers reliably allow; recordings are
+            // silent anyway, so muting costs nothing.
+            autoplay: autoplay ? 1 : 0,
+            mute: autoplay ? 1 : 0,
+            playsinline: 1,
+            rel: 0,
+        },
+        events: {
+            onReady: (e) => {
+                seekNearEnd(e.target);
+                if (autoplay) e.target.playVideo();
+            },
+            onStateChange: (e) => {
+                if (e.data === YT.PlayerState.PLAYING) seekNearEnd(e.target);
+            },
+            onError: () => { if (typeof onError === 'function') onError(); },
+        },
+    });
+}
+
+// Latest recording: pull the gallery list (newest-first) and embed the most
+// recent entry that has a playable YouTube recording. No separate latest-video
+// store — the gallery is the single source of truth.
 async function loadLatestRecording() {
     const container = document.querySelector('.latest-container');
     if (!container) return;
@@ -147,44 +215,72 @@ async function loadLatestRecording() {
         container.appendChild(box);
     };
 
+    const token = ++latestVideoToken;
+    if (latestVideoPlayer) {
+        try { latestVideoPlayer.destroy(); } catch (e) {}
+        latestVideoPlayer = null;
+    }
+
+    let data;
     try {
-        const resp = await fetch('/latest-video.php');
-        if (resp.status === 204) {
-            renderEmpty();
-            return;
-        }
-        if (!resp.ok) throw new Error('latest-video.php ' + resp.status);
-        const data = await resp.json();
-        const videoId = data.video_id;
-        if (!videoId || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) {
-            renderEmpty();
-            return;
-        }
-
-        container.innerHTML = '';
-        const wrapper = document.createElement('div');
-        wrapper.className = 'latest-iframe-wrapper';
-        const iframe = document.createElement('iframe');
-        iframe.src = `https://www.youtube.com/embed/${videoId}?autoplay=1`;
-        iframe.frameBorder = '0';
-        iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
-        iframe.allowFullscreen = true;
-        iframe.className = 'latest-iframe';
-        wrapper.appendChild(iframe);
-        container.appendChild(wrapper);
-
-        const caption = document.createElement('p');
-        caption.className = 'latest-caption';
-        caption.textContent = data.name || 'Latest P.A.R. recording';
-        container.appendChild(caption);
+        const resp = await fetch('/gallery.php');
+        if (!resp.ok) throw new Error('gallery.php ' + resp.status);
+        data = await resp.json();
     } catch (err) {
         console.error('Error loading latest recording:', err);
+        if (token !== latestVideoToken) return;
         container.innerHTML = '';
         const errorBox = document.createElement('div');
         errorBox.className = 'no-latest-box';
         errorBox.textContent = 'Error loading latest recording';
         container.appendChild(errorBox);
+        return;
     }
+
+    // Items are newest-first; keep the ones with a well-formed video id.
+    const candidates = (data.items || []).filter(
+        it => it.video_id && /^[A-Za-z0-9_-]{11}$/.test(it.video_id)
+    );
+    if (candidates.length === 0) {
+        if (token === latestVideoToken) renderEmpty();
+        return;
+    }
+
+    await loadYouTubeIframeApi();
+    if (token !== latestVideoToken) return;   // a newer load superseded us
+
+    container.innerHTML = '';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'latest-iframe-wrapper';
+    const caption = document.createElement('p');
+    caption.className = 'latest-caption';
+    container.appendChild(wrapper);
+    container.appendChild(caption);
+
+    // Embed the newest candidate; if its video is gone / not embeddable
+    // (onError), destroy it and fall through to the next-newest recording.
+    let idx = 0;
+    const tryNext = () => {
+        if (token !== latestVideoToken) return;
+        if (latestVideoPlayer) {
+            try { latestVideoPlayer.destroy(); } catch (e) {}
+            latestVideoPlayer = null;
+        }
+        wrapper.innerHTML = '';
+        if (idx >= candidates.length) {
+            renderEmpty();
+            return;
+        }
+        const it = candidates[idx++];
+        caption.textContent = it.name || 'Latest P.A.R. recording';
+        const mount = document.createElement('div');
+        wrapper.appendChild(mount);
+        latestVideoPlayer = createNearEndPlayer(mount, it.video_id, {
+            autoplay: true,
+            onError: () => { if (token === latestVideoToken) setTimeout(tryNext, 0); },
+        });
+    };
+    tryNext();
 }
 
 // Gallery
@@ -380,6 +476,25 @@ async function openGalleryItem(cachedItem) {
     openGalleryModal(item);
 }
 
+// Deep-linking: a `#<id>` hash opens that gallery entry's modal. The completion
+// email links to `/gallery#<id>` so a recipient lands straight on their piece;
+// opening any entry also writes the hash so the URL is shareable.
+function galleryIdFromHash() {
+    const m = window.location.hash.match(/^#(\d+)$/);
+    return m ? m[1] : null;
+}
+
+async function openGalleryItemById(id) {
+    try {
+        const response = await fetch('/gallery.php');
+        const data = await response.json();
+        const item = (data.items || []).find(it => String(it.id) === String(id));
+        if (item) openGalleryModal(item);
+    } catch (error) {
+        console.error('Error opening gallery item by id:', error);
+    }
+}
+
 function openGalleryModal(item) {
     const modal = document.getElementById('galleryItemModal');
     const nameEl = document.getElementById('galleryModalName');
@@ -397,8 +512,7 @@ function openGalleryModal(item) {
     noSnapshotEl.classList.add('hidden');
     pendingEl.classList.add('hidden');
     queueEl.classList.add('hidden');
-    videoEl.classList.add('hidden');
-    videoEl.innerHTML = '';
+    resetGalleryModalVideo();
 
     nameEl.textContent = item.name || '(unnamed)';
 
@@ -421,36 +535,58 @@ function openGalleryModal(item) {
 
     modal.classList.remove('hidden');
 
+    // Reflect the open entry in the URL so it can be copied/shared and survives
+    // a refresh. replaceState (not push) keeps the back button leaving the tab.
+    if (item.id !== undefined && item.id !== null && /^\d+$/.test(String(item.id))) {
+        window.history.replaceState({ tab: 'gallery' }, '', '/gallery#' + item.id);
+    }
+
     if (item.video_id && /^[A-Za-z0-9_-]{11}$/.test(item.video_id)) {
         maybeEmbedRecording(item.video_id, videoEl);
     }
 }
 
-async function maybeEmbedRecording(videoId, container) {
-    try {
-        const resp = await fetch('/video-status.php?id=' + encodeURIComponent(videoId));
-        if (!resp.ok) return;
-        const data = await resp.json();
-        // Skip if the video doesn't exist (deleted) or is still processing on
-        // YouTube's side. Uploaded recordings are never live; the gate is for
-        // legacy gallery rows that point at live broadcasts.
-        if (!data.exists || data.live) return;
-
-        const iframe = document.createElement('iframe');
-        iframe.src = 'https://www.youtube.com/embed/' + encodeURIComponent(videoId);
-        iframe.title = 'P.A.R. broadcast recording';
-        iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
-        iframe.allowFullscreen = true;
-        iframe.loading = 'lazy';
-        container.appendChild(iframe);
-        container.classList.remove('hidden');
-    } catch (err) {
-        console.error('video-status check failed:', err);
+// Tear down the modal's player and hide its container. Bumps the token so any
+// in-flight maybeEmbedRecording (still awaiting the API) bails on resume.
+function resetGalleryModalVideo() {
+    galleryModalToken++;
+    if (galleryModalPlayer) {
+        try { galleryModalPlayer.destroy(); } catch (e) {}
+        galleryModalPlayer = null;
+    }
+    const videoEl = document.getElementById('galleryModalVideo');
+    if (videoEl) {
+        videoEl.innerHTML = '';
+        videoEl.classList.add('hidden');
     }
 }
 
+async function maybeEmbedRecording(videoId, container) {
+    const token = galleryModalToken;
+    await loadYouTubeIframeApi();
+    if (token !== galleryModalToken) return;   // modal moved on while API loaded
+
+    container.innerHTML = '';
+    const mount = document.createElement('div');
+    container.appendChild(mount);
+    container.classList.remove('hidden');
+    galleryModalPlayer = createNearEndPlayer(mount, videoId, {
+        autoplay: false,
+        onError: () => {
+            // Deleted / not embeddable — hide the video area entirely.
+            if (token !== galleryModalToken) return;
+            resetGalleryModalVideo();
+        },
+    });
+}
+
 function closeGalleryModal() {
+    resetGalleryModalVideo();
     document.getElementById('galleryItemModal').classList.add('hidden');
+    // Drop the deep-link hash so a refresh doesn't re-open the modal.
+    if (galleryIdFromHash() !== null) {
+        window.history.replaceState({ tab: 'gallery' }, '', '/gallery');
+    }
 }
 
 // Load livestream when page is ready
@@ -463,6 +599,27 @@ function updateNavbarHeightVar() {
 
 window.addEventListener('resize', updateNavbarHeightVar);
 window.addEventListener('orientationchange', updateNavbarHeightVar);
+
+// Scroll-reveal: reveal .reveal elements once as they scroll into view.
+// Falls back to showing everything if IntersectionObserver is unavailable or
+// the user prefers reduced motion.
+function initScrollReveal() {
+    const els = document.querySelectorAll('.reveal');
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce || !('IntersectionObserver' in window)) {
+        els.forEach(el => el.classList.add('in-view'));
+        return;
+    }
+    const observer = new IntersectionObserver((entries, obs) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                entry.target.classList.add('in-view');
+                obs.unobserve(entry.target);
+            }
+        });
+    }, { rootMargin: '0px 0px -10% 0px', threshold: 0.12 });
+    els.forEach(el => observer.observe(el));
+}
 
 function observeGallerySubtabsStuck() {
     const sentinel = document.querySelector('.gallery-subtabs-sentinel');
@@ -482,6 +639,7 @@ function observeGallerySubtabsStuck() {
 document.addEventListener('DOMContentLoaded', function() {
     updateNavbarHeightVar();
     observeGallerySubtabsStuck();
+    initScrollReveal();
     loadLatestRecording();
 
     document.querySelectorAll('.gallery-subtab').forEach(btn => {
@@ -495,6 +653,14 @@ document.addEventListener('DOMContentLoaded', function() {
         gallerySearchInput.addEventListener('input', function() {
             gallerySearchQuery = this.value.trim().toLowerCase();
             loadGallerySubtab(currentGallerySubtab);
+        });
+    }
+
+    const howItWorksBtn = document.getElementById('howItWorksBtn');
+    if (howItWorksBtn) {
+        howItWorksBtn.addEventListener('click', function() {
+            const target = document.getElementById('how-it-works');
+            if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
         });
     }
 
@@ -521,6 +687,17 @@ navLinks.forEach(link => {
 window.addEventListener('popstate', function(e) {
     const tabName = getActiveTabFromUrl();
     showTab(tabName);
+});
+
+// Open the matching gallery entry when the `#<id>` deep-link hash changes.
+window.addEventListener('hashchange', function() {
+    const id = galleryIdFromHash();
+    if (id === null) return;
+    if (getActiveTabFromUrl() !== 'gallery') {
+        window.history.replaceState({ tab: 'gallery' }, '', '/gallery#' + id);
+        showTab('gallery');
+    }
+    openGalleryItemById(id);
 });
 
 // Get elements
@@ -555,8 +732,17 @@ function updateUploadRotatePrompt() {
     uploadRotatePrompt.setAttribute('aria-hidden', shouldShowPrompt ? 'false' : 'true');
 }
 
-// Set initial active tab based on current URL
+// Set initial active tab based on current URL. A `#<id>` hash (e.g. the deep
+// link in a completion email) forces the gallery tab and opens that entry —
+// even from a bare `/#<id>`, which is normalized to `/gallery#<id>`.
+const _initialHashId = galleryIdFromHash();
+if (_initialHashId !== null && getActiveTabFromUrl() !== 'gallery') {
+    window.history.replaceState({ tab: 'gallery' }, '', '/gallery#' + _initialHashId);
+}
 showTab(getActiveTabFromUrl());
+if (_initialHashId !== null) {
+    openGalleryItemById(_initialHashId);
+}
 
 // Undo/Redo history management
 const HISTORY_BUFFER_SIZE = 100;
