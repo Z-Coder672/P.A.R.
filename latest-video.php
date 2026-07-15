@@ -1,6 +1,14 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/lib/ratelimit.php';
+par_rate_limit('latest', [
+    'ip_rate'     => 0.34, // ~20/min per IP
+    'ip_burst'    => 20,
+    'global_rate' => 5.0,
+    'global_burst' => 60,
+]);
+
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-store');
 

@@ -1,6 +1,14 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/lib/ratelimit.php';
+par_rate_limit('gallery', [
+    'ip_rate'     => 0.5,  // ~30/min per IP (frontend polls every 5s = 12/min)
+    'ip_burst'    => 30,
+    'global_rate' => 5.0,
+    'global_burst' => 100,
+]);
+
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 

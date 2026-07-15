@@ -2,9 +2,12 @@
 declare(strict_types=1);
 
 const EXPECTED_BITMAP_BYTES = 84;
-const MAX_QUEUE_LENGTH = 20;
 const MAX_MOD_QUEUE_LENGTH = 50;
 const MAX_CONCURRENT_REQUESTS = 5;
+const MAX_EMAIL_LENGTH = 254; // RFC 5321 max
+
+require_once __DIR__ . '/lib/ratelimit.php';
+require_once __DIR__ . '/lib/private_store.php';
 
 /**
  * @return resource|null
@@ -46,6 +49,17 @@ if ($requestMethod !== 'POST') {
 
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+
+// Rate limit the only public write endpoint. Per-IP keeps a single submitter
+// to a few per minute; the global bucket caps total submission traffic so a
+// flood can't run up Site5's shared-hosting resource meter. Checked before any
+// real work (queue I/O) so throttled requests are shed cheaply.
+par_rate_limit('enqueue', [
+    'ip_rate'     => 5 / 60,   // sustained ~5/min per IP
+    'ip_burst'    => 5,
+    'global_rate' => 1.0,      // sustained ~60/min total
+    'global_burst' => 30,
+]);
 
 // Require application/json to force a CORS preflight on cross-origin requests
 // (text/plain and form content-types are "simple" and bypass preflight, which

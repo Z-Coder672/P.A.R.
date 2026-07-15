@@ -1,6 +1,15 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/lib/ratelimit.php';
+// Also shields the YouTube Data API quota from being burned by request floods.
+par_rate_limit('video-status', [
+    'ip_rate'     => 0.25, // ~15/min per IP
+    'ip_burst'    => 15,
+    'global_rate' => 2.0,
+    'global_burst' => 30,
+]);
+
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-store');
 
