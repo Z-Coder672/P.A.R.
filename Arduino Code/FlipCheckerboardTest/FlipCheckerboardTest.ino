@@ -20,8 +20,9 @@ const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/�
 const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS  = 300;
 const int SERVO_50_DEG_SETTLE_MS  = 100;
-// Second-catch arm angle for the error-reduction pass: ~10° below RELEASE.
-// 544–2400µs over 0–180° (~10.3µs/°), so 10° ≈ 103µs. Mirrors PARMain.ino.
+// Lowered arm angle ~10° below RELEASE (scan sweep + second-catch pass in
+// PARMain; second-catch only here). 544–2400µs over 0–180° (~10.3µs/°), so
+// 10° ≈ 103µs. Mirrors PARMain.ino.
 const int SERVO_US_10_DEG = 103;
 const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
 const int SERVO_10_DEG_SETTLE_MS = 100;
