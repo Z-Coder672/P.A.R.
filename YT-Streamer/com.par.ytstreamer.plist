@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  P.A.R. YT-Streamer LaunchAgent.
+
+  A GUI (Aqua) LaunchAgent, NOT a LaunchDaemon: it must run in the user's login
+  session so the AVFoundation camera capture works and the one-time Camera consent
+  prompt can be shown/clicked (Screen Sharing counts, so this works headless). A
+  system LaunchDaemon runs in a non-GUI context and would reproduce the exact
+  NotDetermined / no-frames failure this replaces.
+
+  It runs watchdog.py (the existing supervisor, with its rapid-fail budget), and
+  launchd keeps the watchdog itself alive (RunAtLoad + KeepAlive) and starts it at
+  login. caffeinate -i prevents idle sleep from interrupting a recording.
+
+  Install/control from SSH (same user) with launchagent.sh, or directly:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.par.ytstreamer.plist
+    launchctl kickstart -k gui/$(id -u)/com.par.ytstreamer      # restart
+    launchctl bootout   gui/$(id -u)/com.par.ytstreamer         # stop/unload
+
+  Paths are absolute and machine-specific (user 'admin', repo under /Users/admin).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.par.ytstreamer</string>
+
+    <!-- Launch the SIGNED app launcher (com.par.ytstreamer), not python directly:
+         it is the promptable/grantable TCC identity the camera grant attaches to.
+         It forks `caffeinate -i venv/python watchdog.py` and stays alive as that
+         identity. Launching python directly here reproduces the org.python.python
+         no-usage-string instant-deny (the bug this whole setup fixes). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/admin/P.A.R./YT-Streamer/PARRecorder.app/Contents/MacOS/parrecorder</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/admin/P.A.R./YT-Streamer</string>
+
+    <!-- launchd gives a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) that omits
+         Homebrew, so bare `ffmpeg` (device enumeration + snapshot stills, at
+         /opt/homebrew/bin) isn't found and the camera can't be enumerated. The old
+         nohup-from-Terminal setup inherited the interactive PATH; under launchd we
+         must set it explicitly. Inherited by the whole subtree (parrecorder → fork
+         → caffeinate → watchdog → daemon). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Start at login and keep the watchdog alive if it ever exits (e.g. after
+         it exhausts its own rapid-fail budget, launchd retries after the throttle
+         window instead of giving up forever). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Console output → the same file the nohup setup used. The daemon also keeps
+         its own stream.log independently. -->
+    <key>StandardOutPath</key>
+    <string>/Users/admin/P.A.R./YT-Streamer/stream_watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/admin/P.A.R./YT-Streamer/stream_watchdog.log</string>
+</dict>
+</plist>

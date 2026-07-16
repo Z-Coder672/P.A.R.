@@ -34,6 +34,7 @@ import requests
 import ftplib
 import ssl
 import os
+import signal
 import smtplib
 import base64
 import io
@@ -106,6 +107,12 @@ RECORDING_DIR          = Path("/tmp/recordings")
 LATEST_FRAME_PATH      = RECORDING_DIR / "latest_frame.jpg"
 # 1.5h hard cap on a single recording (safety net if the stop signal is lost).
 RECORD_MAX_SECONDS     = 90 * 60
+# Out-of-band watchdog ceiling. The cap above is enforced inside the orchestrator
+# loop, which shares its thread with the (native, blocking) stop() call — if stop
+# wedges, the cap can never fire. This grace is how far past the cap a recording
+# may run before the watchdog force-exits the process as a last resort, so a
+# single hung stop can never produce a multi-hour runaway recording again.
+RECORD_WATCHDOG_GRACE  = 5 * 60
 # A recording must run at least this long before the snapshot signal is allowed
 # to stop it. The snapshot flag is armed TWICE per print — once by next.php at
 # job start (content = gallery id) and once by the Arduino's snapshot-request at
@@ -114,6 +121,25 @@ RECORD_MAX_SECONDS     = 90 * 60
 # at least this far into the recording filters it out; the real display takes
 # minutes, so the post-display snapshot always clears this floor.
 MIN_RECORD_SECONDS     = 60
+# After start(), a healthy AVCaptureSession must actually deliver frames (movie
+# file growing on disk and/or sidecar buffers arriving) within this window. A
+# session that starts but streams nothing — the classic "camera not authorized in
+# a detached/launchd context" failure, where startRunning() succeeds but macOS
+# routes no frames and posts no synchronous error — is otherwise invisible: the
+# didFinishRecording delegate never fires, is_running() stays True, and the
+# orchestrator writes an empty file for the full 1.5h cap. This gate catches that
+# in seconds so the print can be logged/aborted instead of silently lost.
+FRAME_LIVENESS_TIMEOUT   = 12.0
+# Movie-file byte floor that proves real frames landed (used only when the sidecar
+# VideoDataOutput was rejected, so there's no per-buffer counter to trust). A
+# black/failed session leaves the file missing or ~0 bytes; a real 2500k H.264
+# stream blows past this within a second or two.
+FRAME_LIVENESS_MIN_BYTES = 64 * 1024
+# Human-readable AVCaptureDevice.authorizationStatusForMediaType_ values, logged
+# at recorder start so the daemon's ACTUAL camera-TCC state (as its own process
+# sees it) is visible in the log — the difference between an authorized
+# Terminal-launched run and a NotDetermined/Denied launchd-detached one.
+_CAMERA_AUTH_NAMES = {0: "NotDetermined", 1: "Restricted", 2: "Denied", 3: "Authorized"}
 
 # FTPS (port 21, explicit TLS). The Site5 addon FTP account is FTP-only —
 # SSH/SFTP on :22 is reserved for the main cPanel user, so paramiko can't
@@ -162,6 +188,10 @@ YT_VAULT_DMG           = Path(__file__).parent / os.getenv("YT_VAULT_DMG", "YT_s
 YT_VAULT_KEYCHAIN_KEY  = os.getenv("YT_VAULT_KEYCHAIN_KEY", "")
 YT_VAULT_SECRET_FILE   = os.getenv("YT_VAULT_SECRET_FILE", "")
 YT_VAULT_TOKEN_FILE    = "yt_token.json"
+# Background OAuth-token keepalive cadence (hours). The refresher runs even with
+# no start signals so a dead/expired refresh token surfaces in the log early
+# instead of wedging the next recording. Refresh-only — never interactive.
+YT_TOKEN_REFRESH_INTERVAL = float(os.getenv("YT_TOKEN_REFRESH_HOURS", "6")) * 3600.0
 
 _required = {
     "SNAPSHOT_SECRET": SNAPSHOT_SECRET,
@@ -208,6 +238,11 @@ _inflight_path: Path | None = None
 # poller so a snapshot popped with id=null (the Arduino's post-display touch) can
 # still be tied to the recording it belongs to. Guarded by _inflight_lock.
 _inflight_id: int | None = None
+# time.monotonic() stamp when the in-flight recording started (None when idle).
+# Read by the watchdog to enforce a hard wall-clock ceiling independent of the
+# orchestrator loop, so a wedged stop() can't record forever. Guarded by
+# _inflight_lock.
+_inflight_started: float | None = None
 # Snapshot-stop signal: the snapshot poller sets these after it grabs the
 # snapshot for an in-flight print; record_orchestrator polls them to know the
 # print is done and the recording should stop. _snapshot_stop_ts is a
@@ -218,12 +253,17 @@ _snapshot_stop_id: int | None = None
 _snapshot_stop_ts: float = 0.0
 # ───────────────────────────────────────────────────────────────────────────────
 
+# Anchor the log file to this script's directory, not the launch cwd — the
+# daemon is often started from the project root (or via launchd), and a bare
+# relative "stream.log" then lands wherever cwd happens to be, leaving the
+# expected YT-Streamer/stream.log empty.
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream.log")
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("stream.log"),
+        logging.FileHandler(_LOG_PATH),
     ]
 )
 log = logging.getLogger(__name__)
@@ -240,7 +280,7 @@ try:
     import CoreMedia as _CM
     import Quartz as _Quartz
     import libdispatch as _libdispatch
-    from Foundation import NSObject, NSURL
+    from Foundation import NSObject, NSURL, NSNotificationCenter
     _AVF_IMPORT_ERROR: Exception | None = None
 except Exception as _avf_e:                                    # pragma: no cover
     _AVF_IMPORT_ERROR = _avf_e
@@ -267,6 +307,20 @@ if _AVF_IMPORT_ERROR is None:
                 self, out, url, conns, error):
             self._rec._on_finish(error)
 
+        # AVCaptureSession reports post-startRunning() failures ONLY through these
+        # notifications — never synchronously from startRunning()/startRecording.
+        # Without observing them, a session that dies (camera unauthorized,
+        # yanked, or grabbed by another process) keeps is_running() True forever.
+        def sessionRuntimeError_(self, note):
+            err = note.userInfo().get(_AVF.AVCaptureSessionErrorKey) \
+                if note.userInfo() is not None else None
+            self._rec._on_session_failure("runtime-error", err)
+
+        def sessionWasInterrupted_(self, note):
+            reason = note.userInfo().get(_AVF.AVCaptureSessionInterruptionReasonKey) \
+                if note.userInfo() is not None else None
+            self._rec._on_session_failure(f"interrupted(reason={reason})", None)
+
     class _SidecarDelegate(NSObject):
         """VideoDataOutput callback — writes LATEST_FRAME_PATH ~1fps so the
         snapshot poller has a no-contention source while a recording owns the cam.
@@ -279,11 +333,13 @@ if _AVF_IMPORT_ERROR is None:
             self._path = str(path)
             self._tmp = self._path + ".tmp"
             self._last = 0.0
+            self._frames = 0  # every buffer, pre-throttle — the frame-liveness signal
             self._ctx = _Quartz.CIContext.context()
             self._cs = _Quartz.CGColorSpaceCreateDeviceRGB()
             return self
 
         def captureOutput_didOutputSampleBuffer_fromConnection_(self, out, sbuf, conn):
+            self._frames += 1
             now = time.monotonic()
             if now - self._last < 1.0:
                 return
@@ -325,8 +381,11 @@ class AVFRecorder:
         self._queue = None
         self._error = None
         self._finished = threading.Event()
+        self._recording_started = False
+        self._observing = False  # True once session notifications are registered
         self.device_name: str | None = None
         self.chosen_subtype: str | None = None
+        self.auth_status: int | None = None  # camera TCC status seen at start()
 
     # — public API —————————————————————————————————————————————————————————————
     def start(self) -> None:
@@ -334,6 +393,20 @@ class AVFRecorder:
         error (no PyObjC, no matching device, no suitable format, etc.)."""
         if _AVF_IMPORT_ERROR is not None:
             raise RuntimeError(f"PyObjC AVFoundation unavailable: {_AVF_IMPORT_ERROR!r}")
+
+        # Camera TCC status as THIS process sees it. Reads the grant; does not open
+        # the device. Anything other than Authorized(3) means the capture graph
+        # will start but deliver no frames (and can't prompt from a daemon), which
+        # is the silent-empty-recording failure — surface it loudly up front.
+        self.auth_status = _AVF.AVCaptureDevice.authorizationStatusForMediaType_(
+            _AVF.AVMediaTypeVideo)
+        _auth_name = _CAMERA_AUTH_NAMES.get(self.auth_status, "?")
+        if self.auth_status == 3:
+            log.info(f"[record] camera authorization = {self.auth_status} ({_auth_name})")
+        else:
+            log.error(f"[record] camera authorization = {self.auth_status} ({_auth_name}) "
+                      "— capture will start but stream NO frames; grant Camera "
+                      "access to the process that launches this daemon")
 
         dt = _AVF.AVCaptureDeviceDiscoverySession.discoverySessionWithDeviceTypes_mediaType_position_(
             [_AVF.AVCaptureDeviceTypeExternal,
@@ -430,19 +503,42 @@ class AVFRecorder:
         # first fresh frame lands.
         self.sidecar_path.unlink(missing_ok=True)
 
-        session.startRunning()
+        # Register the delegate + session-failure observers BEFORE startRunning so a
+        # runtime error raised during startup is caught (not just mid-recording).
         self._delegate = _RecordDelegate.alloc().initWithRecorder_(self)
+        nc = NSNotificationCenter.defaultCenter()
+        nc.addObserver_selector_name_object_(
+            self._delegate, b"sessionRuntimeError:",
+            _AVF.AVCaptureSessionRuntimeErrorNotification, session)
+        nc.addObserver_selector_name_object_(
+            self._delegate, b"sessionWasInterrupted:",
+            _AVF.AVCaptureSessionWasInterruptedNotification, session)
+        self._observing = True
+
+        session.startRunning()
         self.out_path.unlink(missing_ok=True)
         movie.startRecordingToOutputFileURL_recordingDelegate_(
             NSURL.fileURLWithPath_(str(self.out_path)), self._delegate)
+        self._recording_started = True
 
     def stop(self, timeout: float = 15.0) -> None:
         """Stop recording, flushing the moov atom, then tear down the session.
         Idempotent and exception-safe (called from the orchestrator finally
-        block and the Ctrl+C handler)."""
+        block and the Ctrl+C handler).
+
+        DEADLOCK NOTE: both stopRecording()'s finalize and stopRunning()'s graph
+        teardown deliver `graphWillStop` to the MAIN thread via
+        performSelector:onThread:<main> waitUntilDone:YES. That perform only runs
+        if the main thread is servicing a CFRunLoop. If the main thread is parked
+        (e.g. time.sleep), this call blocks FOREVER while the capture graph keeps
+        writing frames — the 13-hour-recording bug. The main thread therefore MUST
+        run a CFRunLoop whenever a recording can be stopped from a worker thread
+        (see __main__). Gate stopRecording() on our own start flag, NOT
+        movie_out.isRecording(): the latter has been observed returning False on a
+        live recording, which skipped the finalize and left the writer running."""
         try:
             mo = self._movie_out
-            if mo is not None and mo.isRecording():
+            if mo is not None and self._recording_started and not self._finished.is_set():
                 mo.stopRecording()
                 # Wait for the finish delegate (moov flush) before stopping the
                 # session, else the file can be left without a moov.
@@ -457,9 +553,24 @@ class AVFRecorder:
                     self._session.stopRunning()
             except Exception as e:
                 log.warning(f"[record] session stop error: {e!r}")
+            # Drop the notification observers so a torn-down session can't deliver
+            # a late runtime-error to a stale delegate.
+            if self._observing:
+                try:
+                    NSNotificationCenter.defaultCenter().removeObserver_(self._delegate)
+                except Exception as e:
+                    log.warning(f"[record] observer removal error: {e!r}")
+                self._observing = False
 
     def is_running(self) -> bool:
-        return self._movie_out is not None and self._movie_out.isRecording()
+        # Liveness = "started and not yet finished". Do NOT use
+        # movie_out.isRecording(): startRecordingToOutputFileURL: is async, so
+        # isRecording() stays False for a short window right after start() — the
+        # orchestrator's first loop iteration would read that as capture-ended
+        # at 0s. _finished is set only by the didFinishRecording delegate
+        # (_on_finish), i.e. when recording truly ends (stop() or a device
+        # error), so it has no startup race.
+        return not self._finished.is_set()
 
     @property
     def error(self):
@@ -493,8 +604,57 @@ class AVFRecorder:
         self._error = error
         self._finished.set()
 
+    def _on_session_failure(self, kind, error):
+        """AVCaptureSession runtime-error / interruption observer callback. Flips
+        the recorder to finished so is_running() goes False and the orchestrator
+        stops the (dead) recording instead of writing an empty file for 1.5h."""
+        self._error = error if error is not None else RuntimeError(f"session {kind}")
+        log.error(f"[record] AVCaptureSession {kind}: {error}")
+        self._finished.set()
+
+    def frames_seen(self) -> int | None:
+        """Count of camera buffers delivered to the sidecar output (pre-throttle),
+        or None if no sidecar output is attached (fall back to file-size growth)."""
+        d = self._data_delegate
+        if d is None:
+            return None
+        try:
+            return int(d._frames)
+        except Exception:
+            return None
+
+    def wait_until_streaming(self, timeout: float = FRAME_LIVENESS_TIMEOUT) -> bool:
+        """Block until the capture is provably producing output — camera buffers
+        arriving (preferred) or the movie file growing past FRAME_LIVENESS_MIN_BYTES
+        — or until the session posts a runtime error, whichever comes first.
+        Returns False on timeout (the silent black-session failure) so the caller
+        can abort the print instead of recording nothing. Safe to call from the
+        orchestrator worker thread; the main thread services the CFRunLoop."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._finished.is_set():
+                return False  # a runtime error already fired
+            frames = self.frames_seen()
+            if frames is not None:
+                if frames > 0:
+                    return True
+            else:
+                try:
+                    if self.out_path.stat().st_size >= FRAME_LIVENESS_MIN_BYTES:
+                        return True
+                except OSError:
+                    pass
+            time.sleep(0.5)
+        return False
+
 
 # ── YOUTUBE API ────────────────────────────────────────────────────────────────
+
+# Serialize all DMG mount/unmount across threads — two concurrent `hdiutil
+# attach` calls on the same vault (e.g. the token keepalive firing while an
+# upload reads the vault) can collide. RLock so a future nested vault op is safe.
+_vault_lock = threading.RLock()
+
 
 def _vault_get_password() -> str:
     """Read the vault passphrase from the macOS Keychain."""
@@ -514,28 +674,41 @@ def _vault_mount(password: str) -> tuple[str, str]:
     """
     Attach YT_VAULT_DMG with the given password.
     Returns (mount_point, device_node) parsed from hdiutil output.
+
+    Acquires _vault_lock on success and holds it until the paired
+    _vault_unmount — so concurrent threads can't run two `hdiutil attach`
+    calls on the same DMG at once. On any failure the lock is released before
+    raising (the caller's finally won't run since no device was returned).
     """
-    result = subprocess.run(
-        ["hdiutil", "attach", str(YT_VAULT_DMG), "-stdinpass", "-nobrowse"],
-        input=password.encode(),
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"hdiutil attach failed: {result.stderr.decode().strip()}"
+    _vault_lock.acquire()
+    try:
+        result = subprocess.run(
+            ["hdiutil", "attach", str(YT_VAULT_DMG), "-stdinpass", "-nobrowse"],
+            input=password.encode(),
+            capture_output=True,
         )
-    # Output lines: "<device>\t<type>\t<mount_point>"
-    for line in result.stdout.decode().splitlines():
-        parts = [p.strip() for p in line.split("\t")]
-        if len(parts) >= 3 and parts[2].startswith("/Volumes/"):
-            return parts[2], parts[0]
-    raise RuntimeError(
-        f"Could not parse mount point from hdiutil output:\n{result.stdout.decode()}"
-    )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"hdiutil attach failed: {result.stderr.decode().strip()}"
+            )
+        # Output lines: "<device>\t<type>\t<mount_point>"
+        for line in result.stdout.decode().splitlines():
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) >= 3 and parts[2].startswith("/Volumes/"):
+                return parts[2], parts[0]
+        raise RuntimeError(
+            f"Could not parse mount point from hdiutil output:\n{result.stdout.decode()}"
+        )
+    except BaseException:
+        _vault_lock.release()
+        raise
 
 
 def _vault_unmount(device: str):
-    subprocess.run(["hdiutil", "detach", device, "-quiet"], capture_output=True)
+    try:
+        subprocess.run(["hdiutil", "detach", device, "-quiet"], capture_output=True)
+    finally:
+        _vault_lock.release()
 
 
 def _vault_read_token() -> str | None:
@@ -652,6 +825,70 @@ def get_youtube_service():
         _vault_write_token(creds.to_json())
 
     return build("youtube", "v3", credentials=creds)
+
+
+def refresh_youtube_token_once() -> bool:
+    """Refresh-only keepalive for the cached OAuth token — NEVER interactive.
+
+    Reads yt_token.json from the vault and, if it carries a refresh_token,
+    forces a refresh (which both keeps the access token warm AND proves the
+    refresh token is still alive), then writes the fresh token back. On failure
+    it logs LOUDLY and returns False — it deliberately does NOT fall back to the
+    browser flow the way get_youtube_service does, because this runs on a
+    background thread with no human present and an interactive flow there would
+    wedge silently. Returns True iff a usable token is present after the attempt.
+    """
+    token_json = _vault_read_token()
+    if not token_json:
+        log.info("[youtube-refresh] no token in vault yet — nothing to refresh "
+                 "(auth happens on the first recording)")
+        return False
+    try:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), YT_SCOPES)
+    except Exception as e:
+        log.warning(f"[youtube-refresh] token unreadable: {e!r}")
+        return False
+    if not creds.refresh_token:
+        log.warning("[youtube-refresh] token has no refresh_token — cannot keep alive")
+        return False
+    try:
+        creds.refresh(Request())
+    except Exception as e:
+        log.error(
+            f"[youtube-refresh] refresh FAILED: {e!r} — the refresh token is "
+            f"expired/revoked. The NEXT start signal will block recording+upload "
+            f"until you re-auth (open the URL the daemon prints). NOTE: if this "
+            f"OAuth app is in Google 'Testing' status its refresh tokens die 7 "
+            f"days after issuance regardless of use — publish it to production to "
+            f"stop this recurring.")
+        return False
+    try:
+        _vault_write_token(creds.to_json())
+    except Exception as e:
+        log.warning(f"[youtube-refresh] refreshed OK but could not persist to vault: {e!r}")
+    log.info(f"[youtube-refresh] token refreshed OK (access-token expiry {creds.expiry})")
+    return True
+
+
+def poll_token_refresh():
+    """Background OAuth-token keepalive thread.
+
+    Refreshes the cached token every YT_TOKEN_REFRESH_INTERVAL seconds
+    independent of any start signal, so an expired/revoked refresh token shows
+    up in the log hours early instead of first surfacing as a wedged recording.
+    Refresh-only (see refresh_youtube_token_once). Its own loop so a transient
+    error in one cycle never kills the keepalive (unlike _safe_run's run-once)."""
+    hrs = YT_TOKEN_REFRESH_INTERVAL / 3600.0
+    log.info(f"[youtube-refresh] keepalive started (every {hrs:.1f}h)")
+    # Small initial delay so a boot-time keepalive doesn't race a first-recording
+    # auth for the vault lock.
+    time.sleep(min(120.0, YT_TOKEN_REFRESH_INTERVAL))
+    while True:
+        try:
+            refresh_youtube_token_once()
+        except Exception as e:
+            log.warning(f"[youtube-refresh] unexpected error: {e!r}")
+        time.sleep(YT_TOKEN_REFRESH_INTERVAL)
 
 
 def upload_recording(youtube, out_path: Path, title: str) -> str | None:
@@ -1632,13 +1869,36 @@ def record_orchestrator() -> None:
         log.info(f"[record] recording #{gallery_id} -> {out_path.name} "
                  f"(device={rec.device_name!r}, format={rec.chosen_subtype}, "
                  f"{CAMERA_REC_W}x{CAMERA_REC_H}@{CAMERA_FRAMERATE})")
+
+        # Frame-liveness gate: a session can start cleanly yet stream nothing
+        # (camera unauthorized in this launch context, device grabbed by another
+        # opener, etc.). If no frames land within the window, abort now — otherwise
+        # the loop below would "record" an empty file until the 1.5h cap and the
+        # upload would silently skip it (the exact multi-print outage this guards).
+        if not rec.wait_until_streaming():
+            log.error(f"[record] #{gallery_id}: NO frames within "
+                      f"{FRAME_LIVENESS_TIMEOUT:.0f}s (camera auth={rec.auth_status} "
+                      f"[{_CAMERA_AUTH_NAMES.get(rec.auth_status, '?')}], "
+                      f"err={rec.error}) — aborting, nothing recorded for #{gallery_id}")
+            try:
+                rec.stop(timeout=5.0)
+            except Exception as e:
+                log.warning(f"[record] abort stop error: {e!r}")
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            time.sleep(STREAM_POLL_INTERVAL)
+            continue
+
         _recording_active.set()  # pause the camera keeper while we record
+        started = time.monotonic()
         with _inflight_lock:
-            global _inflight_rec, _inflight_path, _inflight_id
+            global _inflight_rec, _inflight_path, _inflight_id, _inflight_started
             _inflight_rec = rec
             _inflight_path = out_path
             _inflight_id = gallery_id
-        started = time.monotonic()
+            _inflight_started = started
         deadline = started + RECORD_MAX_SECONDS
         stop_reason = "unknown"
 
@@ -1664,6 +1924,7 @@ def record_orchestrator() -> None:
                 _inflight_rec = None
                 _inflight_path = None
                 _inflight_id = None
+                _inflight_started = None
             # Clear the snapshot-stop signal so a stale one can't immediately
             # stop the next recording.
             with _snapshot_stop_lock:
@@ -1696,6 +1957,36 @@ def _safe_run(name, fn, *args):
         log.error(f"[{name}] crashed: {e!r} — subsystem disabled, others continue")
 
 
+def record_watchdog() -> None:
+    """Last-resort wall-clock backstop for a runaway recording.
+
+    The orchestrator's RECORD_MAX_SECONDS cap is checked inside the record loop,
+    which shares its thread with the blocking native stop() call. If stop() ever
+    wedges (it did: an AVFoundation graph-teardown deadlock recorded for 13h), the
+    loop is frozen and the cap can never fire while the capture graph keeps writing
+    — a multi-GB runaway file. This watchdog runs on its own thread, owns no AVF
+    objects, and simply force-exits the whole process if any single recording
+    outlives RECORD_MAX_SECONDS + RECORD_WATCHDOG_GRACE. Exiting kills the runaway
+    capture immediately; the operator (or a launchd KeepAlive) restarts the daemon.
+    A hard os._exit avoids running atexit/finalizers that could themselves block on
+    the same wedged AVF state."""
+    limit = RECORD_MAX_SECONDS + RECORD_WATCHDOG_GRACE
+    while True:
+        time.sleep(30)
+        with _inflight_lock:
+            started = _inflight_started
+            gid = _inflight_id
+        if started is None:
+            continue
+        elapsed = time.monotonic() - started
+        if elapsed > limit:
+            log.critical(
+                f"[watchdog] recording #{gid} has run {elapsed:.0f}s "
+                f"(> cap {RECORD_MAX_SECONDS}s + grace {RECORD_WATCHDOG_GRACE}s) — "
+                f"stop() is wedged; force-exiting to kill the runaway capture")
+            os._exit(1)
+
+
 if __name__ == "__main__":
     log.info("═" * 50)
     log.info("  P.A.R. Recorder + Snapshot/Mod Pollers")
@@ -1708,6 +1999,34 @@ if __name__ == "__main__":
     if _AVF_IMPORT_ERROR is not None:
         log.error(f"  WARNING: PyObjC AVFoundation unavailable ({_AVF_IMPORT_ERROR!r}); "
                   f"recording will fail until pyobjc is installed")
+    else:
+        # Camera-TCC status THIS process sees at boot. Authorized(3) → recordings
+        # will stream; anything else → the capture graph starts but delivers no
+        # frames (a daemon can't show the consent prompt), so every recording is
+        # silently empty. Logged here so the state is visible without waiting for
+        # the first print. See the frame-liveness gate in record_orchestrator.
+        _boot_auth = _AVF.AVCaptureDevice.authorizationStatusForMediaType_(
+            _AVF.AVMediaTypeVideo)
+        _boot_auth_name = _CAMERA_AUTH_NAMES.get(_boot_auth, "?")
+        if _boot_auth == 3:
+            log.info(f"  Camera : TCC authorization = {_boot_auth} ({_boot_auth_name})")
+        else:
+            log.error(f"  Camera : TCC authorization = {_boot_auth} ({_boot_auth_name}) "
+                      f"— recordings will stream NO frames until Camera access is "
+                      f"granted to this daemon's launch context")
+            # NotDetermined: proactively raise the system consent prompt now, so a
+            # GUI login session (physical screen OR Screen Sharing into a headless,
+            # auto-logged-in mini) shows the dialog immediately — no need to wait
+            # for a print. The decision is recorded system-wide once clicked, so the
+            # completion handler is best-effort; the main CFRunLoop services it. Only
+            # NotDetermined(0) can prompt — Denied/Restricted never re-prompt.
+            if _boot_auth == 0:
+                def _cam_grant(granted):
+                    log.info(f"  Camera : consent dialog answered — granted={bool(granted)}")
+                _AVF.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                    _AVF.AVMediaTypeVideo, _cam_grant)
+                log.info("  Camera : consent prompt requested — click Allow in the GUI "
+                         "session (Screen Sharing works headless) to authorize permanently")
     log.info("═" * 50)
 
     # Start mod poller FIRST so it's running regardless of camera/YouTube state.
@@ -1729,6 +2048,14 @@ if __name__ == "__main__":
         daemon=True, name="camera-keeper",
     ).start()
 
+    # YouTube token keepalive — refreshes the cached OAuth token on a timer
+    # even with no start signals, so a dead refresh token is caught early in the
+    # log rather than wedging the next recording. Refresh-only, never interactive.
+    threading.Thread(
+        target=_safe_run, args=("youtube-refresh", poll_token_refresh),
+        daemon=True, name="youtube-refresh",
+    ).start()
+
     # Recording orchestrator — listens for stream-start.php hits, records,
     # uploads, attaches video_id to gallery. Lazily authenticates YouTube
     # on first hit.
@@ -1737,20 +2064,23 @@ if __name__ == "__main__":
         daemon=True, name="record",
     ).start()
 
-    # Main thread idles so daemon threads keep running.
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        log.info("Interrupted by user. Stopping.")
+    # Watchdog — force-exits if a recording ever outlives the hard ceiling, in
+    # case stop() wedges (see record_watchdog).
+    threading.Thread(
+        target=_safe_run, args=("watchdog", record_watchdog),
+        daemon=True, name="watchdog",
+    ).start()
+
+    def _shutdown_inflight():
         # Clean up any in-flight recording: stop the capture, delete the partial
-        # mov. The orchestrator thread is a daemon and will be killed at
-        # interpreter shutdown, so we have to do this here on the main thread.
+        # mov. Runs on the main thread, where stop()'s graph-teardown perform
+        # executes inline. The orchestrator thread is a daemon killed at
+        # interpreter shutdown, so cleanup must happen here.
         with _inflight_lock:
             rec = _inflight_rec
             path = _inflight_path
         if rec is not None:
-            log.info("[record] Ctrl+C — stopping in-flight recording")
+            log.info("[record] shutdown — stopping in-flight recording")
             try:
                 rec.stop()
             except Exception as e:
@@ -1761,4 +2091,45 @@ if __name__ == "__main__":
                 log.info(f"[record] removed in-flight {path.name}")
             except Exception as e:
                 log.warning(f"[record] could not unlink {path}: {e!r}")
+
+    # The main thread MUST service a CoreFoundation run loop: AVCaptureSession
+    # tears its graph down (stopRecording / stopRunning) by performing
+    # `graphWillStop` on the MAIN thread with waitUntilDone:YES. With the main
+    # thread parked in time.sleep() that perform is never serviced and the stop
+    # call from the orchestrator (worker) thread deadlocks forever while the
+    # capture keeps writing — the root cause of the 13-hour runaway recording.
+    # Servicing the run loop lets those performs execute. When PyObjC is
+    # unavailable, recording is disabled (no session is ever created), so a plain
+    # idle loop is sufficient.
+    #
+    # Shutdown: a CFRunLoop does NOT raise KeyboardInterrupt the way time.sleep
+    # does, so register explicit SIGINT/SIGTERM handlers that set a stop flag and
+    # kick the run loop. Short (0.25s) slices bound how long the loop can sit
+    # between flag checks, so shutdown is prompt even if CFRunLoopStop is missed.
+    _stop_evt = threading.Event()
+
+    def _on_signal(signum, _frame):
+        _stop_evt.set()
+        if _AVF_IMPORT_ERROR is None:
+            try:
+                import CoreFoundation as _CF
+                _CF.CFRunLoopStop(_CF.CFRunLoopGetMain())
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        if _AVF_IMPORT_ERROR is None:
+            import CoreFoundation
+            while not _stop_evt.is_set():
+                CoreFoundation.CFRunLoopRunInMode(
+                    CoreFoundation.kCFRunLoopDefaultMode, 0.25, False)
+        else:
+            while not _stop_evt.is_set():
+                time.sleep(0.5)
+    finally:
+        log.info("Shutting down.")
+        _shutdown_inflight()
         sys.exit(0)
