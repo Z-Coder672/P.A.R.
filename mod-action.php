@@ -13,7 +13,9 @@ declare(strict_types=1);
 //   email_sent  — mark status=email_sent so mod-next.php stops returning it
 //                 while a human reviews via the email link (called by Python)
 
-const MAX_MAIN_QUEUE_LENGTH = 20;
+const MAX_MAIN_QUEUE_LENGTH = 100;
+
+require_once __DIR__ . '/lib/private_store.php';
 
 foreach (@file(__DIR__ . '/.env', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
     if (strpos($line, '=') !== false) {
@@ -86,9 +88,9 @@ if ($found === null) {
 }
 
 if ($verdict === 'approve') {
-    // Append to main queue. We bypass MAX_QUEUE_LENGTH because moderation
-    // is an explicit admin action — but we still cap it generously so a
-    // bug can't blow it up.
+    // Append to main queue. Promotion is an explicit admin action, so we only
+    // enforce MAX_MAIN_QUEUE_LENGTH here as a generous backstop against a bug
+    // blowing the queue up.
     if (!file_exists($mainFile)) {
         file_put_contents($mainFile, '');
     }
@@ -98,8 +100,14 @@ if ($verdict === 'approve') {
         $mainLines = preg_split('/\R/', $mainContents ?: '') ?: [];
         $mainLines = array_values(array_filter($mainLines, static fn (string $l): bool => trim($l) !== ''));
         if (count($mainLines) < MAX_MAIN_QUEUE_LENGTH) {
+            // Carry sub_id so next.php can bind the (off-webroot) email to the
+            // gallery id when the Arduino picks the item up. No email here.
             $promoted = json_encode(
-                ['item' => $found['item'] ?? '', 'name' => $found['name'] ?? ''],
+                [
+                    'item'   => $found['item'] ?? '',
+                    'name'   => $found['name'] ?? '',
+                    'sub_id' => (string) ($found['id'] ?? ''),
+                ],
                 JSON_UNESCAPED_UNICODE
             );
             fseek($mainHandle, 0, SEEK_END);
@@ -109,6 +117,12 @@ if ($verdict === 'approve') {
         flock($mainHandle, LOCK_UN);
         fclose($mainHandle);
     }
+}
+
+// A rejected submission will never print, so discard any stored email now
+// rather than letting it linger unbound in the private store.
+if ($verdict === 'reject') {
+    par_delete_submission_email((string) ($found['id'] ?? ''));
 }
 
 ftruncate($handle, 0);

@@ -6,8 +6,8 @@
 // erase the very data we're trying to recover.
 //
 // The flash slice constants here MUST match persistent_log.cpp:
-//   PLOG_FS_OFFSET = 0xFC0000
-//   PLOG_FS_SIZE   = 0x040000
+//   PLOG_FS_OFFSET = 0x800000  (upper 8 MB)
+//   PLOG_FS_SIZE   = 0x800000  (8 MB)
 //   mount name     = "plog"
 //   log path       = /plog/log.txt
 
@@ -15,8 +15,8 @@
 #include <FlashIAPBlockDevice.h>
 #include <LittleFileSystem.h>
 
-#define PLOG_FS_OFFSET (0xFC0000)
-#define PLOG_FS_SIZE   (0x040000)
+#define PLOG_FS_OFFSET (0x800000)
+#define PLOG_FS_SIZE   (0x800000)
 #define PLOG_PATH      "/plog/log.txt"
 
 static FlashIAPBlockDevice s_bd(XIP_BASE + PLOG_FS_OFFSET, PLOG_FS_SIZE);

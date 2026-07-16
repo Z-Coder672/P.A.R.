@@ -24,13 +24,89 @@
 
     <!-- Main Content -->
     <main class="main-content">
-        <!-- Latest Tab -->
+        <!-- Latest / Home Tab -->
         <section id="latest" class="tab-content active">
-            <div class="latest-container">
+            <!-- Hero -->
+            <div class="home-hero reveal">
+                <p class="home-eyebrow">Pixel Art Robot</p>
+                <h1 class="home-title">P.A.R.</h1>
+                <p class="home-subtitle">A machine that draws your pixel art in the real world, one flipped <em>squisk</em> at a time.</p>
+                <div class="home-cta">
+                    <a href="/upload" class="home-btn home-btn-primary nav-link" data-tab="upload"><i class="fa-solid fa-pen-ruler"></i> Start drawing</a>
+                    <a href="/gallery" class="home-btn home-btn-ghost nav-link" data-tab="gallery"><i class="fa-solid fa-images"></i> Browse the gallery</a>
+                    <button type="button" id="howItWorksBtn" class="home-btn home-btn-ghost"><i class="fa-solid fa-circle-info"></i> See how it works</button>
+                </div>
             </div>
-            <p class="latest-links">
-                <a href="/upload" class="nav-link" data-tab="upload">Upload your own pixel art</a>, watch the latest recording above, <a href="/gallery" class="nav-link" data-tab="gallery">explore the gallery</a>, or <a href="/about" class="nav-link" data-tab="about">find out more about P.A.R.</a>.
-            </p>
+
+            <!-- Hero video: the drawing timelapse -->
+            <div class="home-hero-video reveal">
+                <video class="hero-video" autoplay muted loop playsinline preload="auto">
+                    <source src="/media/drawing-timelapse.mp4" type="video/mp4">
+                </video>
+                <p class="home-hero-video-caption">P.A.R. drawing a full board, sped up.</p>
+            </div>
+
+            <!-- Featured latest recording (filled by loadLatestRecording) -->
+            <div class="home-featured reveal">
+                <p class="home-featured-label">Latest print</p>
+                <div class="latest-container"></div>
+            </div>
+
+            <!-- Showcase: squisk assembly -->
+            <section id="how-it-works" class="home-showcase reverse reveal">
+                <div class="home-showcase-text">
+                    <h2>Meet the squisk</h2>
+                    <p>The display is a grid of <em>squisks</em> &mdash; square discs &mdash; black on one side and cyan on the other. Each pixel of your art is shown on one. Every one is assembled by hand.</p>
+                </div>
+                <div class="media-frame">
+                    <video class="showcase-video" autoplay muted loop playsinline preload="metadata">
+                        <source src="/media/squisk-assembly.mp4" type="video/mp4">
+                    </video>
+                </div>
+            </section>
+
+            <!-- Showcase: building the machine -->
+            <section class="home-showcase reveal">
+                <div class="home-showcase-text">
+                    <h2>Built from scratch</h2>
+                    <p>P.A.R. is a custom robot with a one-of-a-kind toolhead: a color sensor, a servo motor, and a pusher. Over a thousand 3D-printed parts, dozens of wires, and hundreds of hours went into P.A.R.</p>
+                </div>
+                <div class="media-frame">
+                    <video class="showcase-video" autoplay muted loop playsinline preload="metadata">
+                        <source src="/media/machine-build.mp4" type="video/mp4">
+                    </video>
+                </div>
+            </section>
+
+            <!-- How it works, three steps -->
+            <section class="home-steps reveal">
+                <h2 class="home-steps-title">How a print happens</h2>
+                <div class="home-steps-grid">
+                    <div class="home-step">
+                        <div class="home-step-icon"><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i></div>
+                        <h3>1 &middot; Scan</h3>
+                        <p>P.A.R. reads every disc on the board with its color sensor to learn the current state.</p>
+                    </div>
+                    <div class="home-step">
+                        <div class="home-step-icon"><i class="fa-solid fa-rotate" aria-hidden="true"></i></div>
+                        <h3>2 &middot; Flip</h3>
+                        <p>It grabs your art from the queue and flips only the squisks that need to change.</p>
+                    </div>
+                    <div class="home-step">
+                        <div class="home-step-icon"><i class="fa-solid fa-circle-check" aria-hidden="true"></i></div>
+                        <h3>3 &middot; Check</h3>
+                        <p>A final rescan catches any missed flips and fixes them, then the photo is taken.</p>
+                    </div>
+                </div>
+                <a href="/about" class="home-steps-link nav-link" data-tab="about">See the full breakdown &rarr;</a>
+            </section>
+
+            <!-- Final call to action -->
+            <div class="home-final reveal">
+                <h2>Make something for P.A.R.</h2>
+                <p>Draw a picture or upload a photo. it&rsquo;s free, and you&rsquo;ll get a video of it being printed!</p>
+                <a href="/upload" class="home-btn home-btn-primary nav-link" data-tab="upload"><i class="fa-solid fa-pen-ruler"></i> Start drawing</a>
+            </div>
         </section>
 
         <!-- Upload Tab -->
@@ -140,6 +216,8 @@
                         <h2 class="name-modal-title">Add a name for your picture</h2>
                         <input type="text" id="pictureName" class="name-modal-input" placeholder="Enter a name..." maxlength="100" autocomplete="off">
                         <p id="pictureNameError" class="name-modal-error hidden">A name is required.</p>
+                        <input type="email" id="pictureEmail" class="name-modal-input" placeholder="Email to be notified when it prints (optional)" maxlength="254" autocomplete="email" inputmode="email">
+                        <p id="pictureEmailError" class="name-modal-error hidden">Please enter a valid email, or leave it blank.</p>
                         <div id="nameModalPreview" class="preview-grid name-modal-preview" aria-hidden="true"></div>
                         <div class="name-modal-actions">
                             <button id="cancelNameModal" class="queue-modal-button queue-modal-cancel">Cancel</button>

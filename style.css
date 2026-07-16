@@ -111,7 +111,8 @@ body {
     text-align: center;
 }
 
-.latest-iframe {
+.latest-iframe,
+.latest-iframe-wrapper iframe {
     width: 100%;
     height: 100%;
     border: 0;
@@ -185,6 +186,396 @@ body {
 
 .no-latest-box a:hover {
     text-decoration: underline;
+}
+
+/* ============================================================
+   Home / landing page (Latest tab)
+   ============================================================ */
+
+/* Let the landing page stack top-aligned instead of vertically
+   centering a single video. */
+#latest.tab-content.active {
+    justify-content: flex-start;
+    align-items: center;
+    gap: 5rem;
+    padding-top: 3rem;
+    padding-bottom: 4rem;
+}
+
+/* Scroll-reveal: elements fade + rise into view once. */
+.reveal {
+    opacity: 0;
+    transform: translateY(28px);
+    transition: opacity 0.7s ease, transform 0.7s ease;
+    will-change: opacity, transform;
+}
+
+.reveal.in-view {
+    opacity: 1;
+    transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .reveal {
+        opacity: 1;
+        transform: none;
+        transition: none;
+    }
+}
+
+/* --- Hero --- */
+.home-hero {
+    width: 100%;
+    max-width: 760px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    /* stretch (not center) so flex children take the container width and wrap /
+       clamp internally instead of shrink-wrapping and overflowing on mobile. */
+    align-items: stretch;
+    gap: 0.6rem;
+}
+
+.home-eyebrow {
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: #02b2d9;
+    margin: 0;
+}
+
+.home-title {
+    font-size: clamp(3.5rem, 12vw, 6.5rem);
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    color: #ffffff;
+    margin: 0.25rem 0 0.5rem;
+}
+
+.home-subtitle {
+    font-size: clamp(1.05rem, 2.6vw, 1.4rem);
+    color: #cccccc;
+    max-width: 40ch;
+    margin: 0 auto;
+}
+
+.home-subtitle em {
+    color: #02b2d9;
+    font-style: italic;
+}
+
+.home-cta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 1rem;
+    margin-top: 1.5rem;
+}
+
+.home-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.85rem 1.6rem;
+    font-size: 1rem;
+    font-weight: 700;
+    border-radius: 8px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.home-btn-primary {
+    background-color: #02b2d9;
+    color: #001014;
+    box-shadow: 0 4px 14px rgba(2, 178, 217, 0.3);
+}
+
+.home-btn-primary:hover {
+    background-color: #29c6e8;
+    transform: translateY(-2px);
+    box-shadow: 0 8px 22px rgba(2, 178, 217, 0.45);
+}
+
+.home-btn-ghost {
+    background-color: transparent;
+    color: #ffffff;
+    border: 1px solid #333333;
+}
+
+.home-btn-ghost:hover {
+    border-color: #02b2d9;
+    color: #02b2d9;
+    transform: translateY(-2px);
+}
+
+.home-btn:active {
+    transform: translateY(0);
+}
+
+/* --- Hero video (drawing timelapse) --- */
+.home-hero-video {
+    width: 100%;
+    max-width: 880px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.7rem;
+}
+
+.home-hero-video .hero-video {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    display: block;
+    border-radius: 12px;
+    border: 1px solid #2a2a2a;
+    background-color: #000000;
+}
+
+.home-hero-video-caption {
+    font-size: 0.85rem;
+    color: #888888;
+    margin: 0;
+    text-align: center;
+}
+
+/* --- Featured latest recording --- */
+.home-featured {
+    width: 100%;
+    max-width: 680px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.9rem;
+}
+
+.home-featured .latest-links {
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.home-featured-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: #777777;
+    margin: 0;
+}
+
+.home-featured .latest-container {
+    max-width: 680px;
+}
+
+/* --- Showcase sections (text + media) --- */
+.home-showcase {
+    width: 100%;
+    max-width: 1000px;
+    display: grid;
+    grid-template-columns: 1fr 1.25fr;
+    align-items: center;
+    gap: 2.5rem;
+}
+
+.home-showcase.reverse .home-showcase-text {
+    order: 2;
+}
+
+/* Offset the scroll target so "See how it works" lands the section below the
+   fixed navbar rather than under it. */
+#how-it-works {
+    scroll-margin-top: calc(var(--navbar-height, 64px) + 1.5rem);
+}
+
+.home-showcase-text h2 {
+    font-size: clamp(1.6rem, 4vw, 2.2rem);
+    color: #ffffff;
+    margin: 0 0 0.75rem;
+}
+
+.home-showcase-text p {
+    color: #bbbbbb;
+    font-size: 1.05rem;
+    margin: 0;
+}
+
+.home-showcase-text em {
+    color: #02b2d9;
+    font-style: italic;
+}
+
+.media-frame {
+    width: 100%;
+    aspect-ratio: 16 / 10;
+    border: 1px solid #2a2a2a;
+    border-radius: 12px;
+    overflow: hidden;
+    background-color: #0d0d0d;
+}
+
+.media-frame video,
+.media-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.media-placeholder {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 0.6rem;
+    padding: 1.5rem;
+    color: #555555;
+    background-image:
+        repeating-linear-gradient(45deg, transparent 0 14px, rgba(255, 255, 255, 0.015) 14px 28px);
+    transition: color 0.2s ease, border-color 0.2s ease;
+}
+
+.media-frame:hover .media-placeholder {
+    color: #6a6a6a;
+}
+
+.media-placeholder i {
+    font-size: 2.4rem;
+    color: #02b2d9;
+    opacity: 0.55;
+}
+
+.media-placeholder-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #999999;
+    max-width: 26ch;
+}
+
+.media-placeholder-note {
+    font-size: 0.75rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #4a4a4a;
+}
+
+/* --- How it works, three steps --- */
+.home-steps {
+    width: 100%;
+    max-width: 1000px;
+    text-align: center;
+}
+
+.home-steps-title {
+    font-size: clamp(1.6rem, 4vw, 2.2rem);
+    color: #ffffff;
+    margin: 0 0 2rem;
+}
+
+.home-steps-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
+}
+
+.home-step {
+    background-color: #0d0d0d;
+    border: 1px solid #2a2a2a;
+    border-radius: 12px;
+    padding: 1.75rem 1.5rem;
+    text-align: center;
+    transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.home-step:hover {
+    border-color: #02b2d9;
+    transform: translateY(-4px);
+}
+
+.home-step-icon {
+    font-size: 1.6rem;
+    color: #02b2d9;
+    margin-bottom: 0.9rem;
+}
+
+.home-step h3 {
+    color: #ffffff;
+    font-size: 1.1rem;
+    margin: 0 0 0.5rem;
+}
+
+.home-step p {
+    color: #999999;
+    font-size: 0.95rem;
+    margin: 0;
+}
+
+.home-steps-link {
+    display: inline-block;
+    margin-top: 1.75rem;
+    color: #02b2d9;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.home-steps-link:hover {
+    text-decoration: underline;
+}
+
+/* --- Final CTA --- */
+.home-final {
+    width: 100%;
+    max-width: 760px;
+    text-align: center;
+    background-color: #0d0d0d;
+    border: 1px solid #2a2a2a;
+    border-radius: 16px;
+    padding: 3rem 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.home-final h2 {
+    font-size: clamp(1.6rem, 4vw, 2.2rem);
+    color: #ffffff;
+    margin: 0;
+}
+
+.home-final p {
+    color: #bbbbbb;
+    margin: 0 0 1rem;
+    max-width: 44ch;
+}
+
+@media (max-width: 768px) {
+    #latest.tab-content.active {
+        gap: 3.5rem;
+    }
+
+    .home-showcase {
+        grid-template-columns: 1fr;
+        gap: 1.25rem;
+    }
+
+    .home-showcase.reverse .home-showcase-text {
+        order: 0;
+    }
+
+    .home-showcase-text {
+        text-align: center;
+    }
+
+    .home-steps-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 /* Upload Container */

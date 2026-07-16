@@ -51,12 +51,16 @@ const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/�
 const int SERVO_US_ENGAGE = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
-// Second-catch arm angle for the error-reduction pass: ~10° below RELEASE.
-// Pulse mapping is 544–2400µs over 0–180° (~10.3µs/°), so 10° ≈ 103µs. Derived
-// from RELEASE minus a computed offset rather than a hardcoded µs value, so
-// retuning RELEASE carries this with it.
+// Lowered arm angles below RELEASE. RELEASE2 (~10° below) is the second-catch
+// error-reduction pass; SCAN (12.5° below) is the scan sweep, where the dropped
+// arm brushes the board to push half-rotated stage-1 squisks through. Pulse
+// mapping is 544–2400µs over 0–180° (~10.3µs/°), so 10° ≈ 103µs and 12.5° ≈
+// 129µs. Both derived from RELEASE minus a computed offset rather than a
+// hardcoded µs value, so retuning RELEASE carries them.
 const int SERVO_US_10_DEG = 103;
+const int SERVO_US_12_5_DEG = 129;
 const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
+const int SERVO_US_SCAN = SERVO_US_RELEASE - SERVO_US_12_5_DEG;
 const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 
@@ -172,6 +176,14 @@ int qHead = 0;
 int qTail = 0;
 int bufferFill = 0;
 
+// Diagnostic counters for the streaming path. A healthy sweep keeps gOksAcked
+// tracking gCmdsSent; a growing gap (or bufferFill/queue depth that won't drain
+// to ~0 between rows) means GRBL is not consuming what we send — i.e. moves are
+// being dropped, which surfaces as flips that never physically happen even
+// though displayBitmap issued them. Logged per row by displayBitmap().
+unsigned long gCmdsSent = 0;
+unsigned long gOksAcked = 0;
+
 // error:N retry bookkeeping. When the same command errors repeatedly we cap
 // at MAX_ERROR_RETRIES then MCU-reset as a last resort.
 const int MAX_ERROR_RETRIES = 10;
@@ -248,6 +260,13 @@ void ensureWiFi() {
 }
 
 void enqueue(const char* cmd, int len) {
+  // QUEUE_SIZE slots should always exceed the in-flight count (bufferFill is
+  // capped at RX_BUFFER_SAFE), so a full ring here means accounting is already
+  // wrong (an ok went missing) and we're about to clobber an un-acked slot —
+  // which corrupts cmdLengths[] and permanently desyncs bufferFill.
+  if ((qTail + 1) % QUEUE_SIZE == qHead) {
+    plog::logf("QUEUE FULL overwrite qH=%d qT=%d buf=%d", qHead, qTail, bufferFill);
+  }
   strncpy(cmdTexts[qTail], cmd, MAX_CMD_LEN - 1);
   cmdTexts[qTail][MAX_CMD_LEN - 1] = '\0';
   cmdLengths[qTail] = len;
@@ -344,10 +363,17 @@ void drainResponses() {
       // dequeues a stale slot, desyncing bufferFill so waitForIdle hangs.
       if (qHead != qTail) {
         bufferFill -= dequeue();
+        gOksAcked++;
         // A clean ok in between errors resets the consecutive-error counter —
         // we only MCU-reset when the *same* command keeps failing.
         errorRetryCount = 0;
         lastErrorCmd[0] = '\0';
+      } else {
+        // An ok with nothing queued is a spurious/duplicate ack. The guard
+        // keeps it from under-flowing bufferFill, but each one means GRBL
+        // emitted more oks than we sent commands — log it; a run of these is
+        // the accounting desync that lets later sends overrun GRBL's RX buffer.
+        plog::log("GRBL ok but queue empty (spurious ack)");
       }
     } else if (resp.startsWith("ALARM")) {
       // Log the command GRBL was processing when it alarmed — for ALARM:2
@@ -419,10 +445,18 @@ void drainResponses() {
       cmdTexts[qTail][MAX_CMD_LEN - 1] = '\0';
       cmdLengths[qTail] = rlen;
       qTail = (qTail + 1) % QUEUE_SIZE;
+    } else {
+      // Anything else — status reports `<...>` from `?`, settings lines
+      // `$N=...` from `$$`, `[MSG:...]`, welcome banner `Grbl ...` — is not
+      // tied to a queued command, so don't dequeue and don't halt. Log it:
+      // a mid-sweep `Grbl ` banner means the MEGA itself reset (brownout /
+      // watchdog). That clears GRBL's planner + RX buffer and drops it into
+      // alarm, while our bufferFill/queue still think commands are in flight —
+      // so every flip we stream afterward is silently discarded by GRBL. That
+      // is a gradual, no-RP2040-reset way for the tail of the sweep (the top
+      // rows) to never execute.
+      plog::logf("GRBL other: %.30s", resp.c_str());
     }
-    // Anything else — status reports `<...>` from `?`, settings lines `$N=...`
-    // from `$$`, welcome banner `Grbl ...`, `[MSG:...]`, `ALARM:...` — is not
-    // tied to a queued command, so don't dequeue and don't halt.
   }
 }
 
@@ -450,6 +484,7 @@ void sendGcode(const char* cmd) {
   Serial1.write('\n');
   bufferFill += cmdLen;
   enqueue(cmd, cmdLen);
+  gCmdsSent++;
 }
 
 void waitForIdle() {
@@ -493,6 +528,23 @@ void tcsSelect(TcsFilter f) {
   digitalWrite(TCS_S3, (f & 0x01) ? HIGH : LOW);
 }
 
+// (Re-)assert the color-sensor pin config. S0/S1 = HIGH/LOW selects 20% output
+// frequency scaling — the regime the classifier was trained on. Called once at
+// boot and again by scanGrid()'s bad-regime recovery: on some cold boots the
+// front-end has come up reading 2-4x too bright on every channel (every cell
+// then classifies "black" and the board reads as empty), and re-driving these
+// pins re-establishes the intended scaling without a full MCU reset.
+void initColorSensor() {
+  pinMode(TCS_S0, OUTPUT);
+  pinMode(TCS_S1, OUTPUT);
+  pinMode(TCS_S2, OUTPUT);
+  pinMode(TCS_S3, OUTPUT);
+  pinMode(TCS_OUT, INPUT);
+  digitalWrite(TCS_S0, HIGH);
+  digitalWrite(TCS_S1, LOW);
+  tcsSelect(TCS_CLEAR);
+}
+
 // OUT is a 50%-duty square wave whose frequency tracks light intensity for
 // the active filter. pulseIn times one half-period; doubling gives the full
 // period. 100 ms timeout keeps a dark / disconnected sensor from hanging.
@@ -529,6 +581,11 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
   b = sb / 5;
   c = sc / 5;
 }
+
+// Diagnostic: log per-cell raw RGBC + pre-threshold logit for EVERY scanned
+// cell (not just the zero-reading rows). ~666 lines/scan — relies on the raised
+// PLOG_MAX_BYTES in persistent_log.cpp. Comment out to log only rows 0,1,2,9,14.
+#define SCAN_PX_LOG_ALL
 
 // Sensor head sits offset from the flip actuator on the gantry.
 const float SCAN_OFFSET_X = -23.0f;
@@ -568,11 +625,37 @@ void rehome() {
   waitForIdle();
 }
 
-void scanGrid() {
+// A scan is untrustworthy when many cells read implausibly bright: at 20%
+// scaling no real disc — black (~3000 Hz clear) or blue (~450 Hz) — reads a
+// clear-channel frequency above ~3500. When the sensor front-end comes up in a
+// blown regime (see initColorSensor / the boot-3 failure), the whole board
+// reads 2-4x too bright, every cell classifies "black", and the board reads as
+// empty — displayBitmap then draws onto a phantom-blank board and the check
+// pass re-flips everything. Counting cells over this ceiling cleanly separates
+// that from any legitimate content (even an all-black board stays under ~3500).
+const unsigned long SCAN_C_CEILING = 4000;   // no normal cell exceeds ~3500
+const int SCAN_OVERBRIGHT_LIMIT = 8;         // healthy scans: exactly 0; blown: 250+
+const int SCAN_REINIT_MAX = 2;               // re-init + re-scan up to this many times
+
+// One full scan sweep. Returns the count of over-bright (untrustworthy) cells.
+// When allowBail is true, aborts the sweep as soon as that count crosses
+// SCAN_OVERBRIGHT_LIMIT so a blown scan doesn't burn ~12 min before recovery.
+int scanGridOnce(bool allowBail) {
   rehome();
+  // Run the scan sweep with the flip arm dropped to SCAN (~33.5°, 12.5° below
+  // RELEASE) rather than parked at REST. The sensor trails the flip head by SCAN_OFFSET_X (−23mm,
+  // ~one cell pitch), so the lowered arm brushes the whole board over the
+  // serpentine and pushes through any squisk accidentally left at stage 1 (90°,
+  // half-rotated). The HOMING moves keep the arm at REST — the initial rehome()
+  // above runs before this drop (the caller always enters scanGrid with the arm
+  // parked), and the mid-scan rehome below lifts it first — because a dropped
+  // arm dragged diagonally across the populated board is what snapped the flip
+  // arm before. Parked back at REST once the scan completes.
+  writeServoUs(SERVO_US_SCAN, SERVO_50_DEG_SETTLE_MS);
   // Serpentine top-to-bottom: alternating row direction so the only Y travel
   // between rows happens at an X soft-limit (handled by moveToYSafe).
   bool ltr = true;
+  int overBright = 0;
   moveToYSafe(grid[0][0].x + SCAN_OFFSET_X,
               clampScanY(grid[0][0].y + SCAN_OFFSET_Y));
   for (int y = 0; y < GRID_H; y++) {
@@ -586,19 +669,86 @@ void scanGrid() {
 
       unsigned long r, g, b, c;
       tcsReadRGBC(r, g, b, c);
-      uint8_t color = classifyDisc(r, g, b, c);
+      if (c > SCAN_C_CEILING) overBright++;
+      float rgbc[4] = { (float)r, (float)g, (float)b, (float)c };
+      float lg = classifier_logit(rgbc);   // raw pre-threshold score; >0 => blue
+      uint8_t color = lg > 0.0f ? 1 : 0;
       gridState[y][x] = color;
+      // Per-cell raw sensor RGBC + pre-threshold logit (×100). Lets us tell, when
+      // the head is on the discs but they read off, whether the SENSOR sees a
+      // dark value on a lit disc (shadow/lighting/arm) or the MODEL misclassifies
+      // a clearly-cyan reading (logit<0 on cyan RGBC). With SCAN_PX_LOG_ALL every
+      // cell is logged (~666 lines/scan, needs the raised PLOG_MAX_BYTES);
+      // otherwise only the zero-reading rows (0,1,2,9) + control row 14.
+#ifdef SCAN_PX_LOG_ALL
+      const bool logpx = true;
+#else
+      const bool logpx = (y == 0 || y == 1 || y == 2 || y == 9 || y == 14);
+#endif
+      if (logpx) {
+        plog::logf("px y%dc%d r%lu g%lu b%lu c%lu L%d", y, x, r, g, b, c, (int)(lg * 100));
+      }
+    }
+    // Per-row count of cells read as "on". Cross-check against displayBitmap's
+    // `dB y=N diff=M`: if the board physically shows the old (dense) image but a
+    // top row logs a low on-count here, scanGrid misread it (sensing/position),
+    // so the diff legitimately finds nothing to flip and the row is skipped at
+    // the diff — not after it. If the on-count matches the physical board, the
+    // skip is downstream (issued-but-dropped move).
+    int scanOn = 0;
+    for (int x = 0; x < GRID_W; x++) scanOn += gridState[y][x];
+    plog::logf("scan y=%d on=%d", y, scanOn);
+    // Blown-front-end recovery: bail the sweep the moment we've seen enough
+    // over-bright cells that the read is untrustworthy, so scanGrid() can
+    // re-init the sensor and retry instead of drawing onto a phantom-blank board.
+    if (allowBail && overBright >= SCAN_OVERBRIGHT_LIMIT) {
+      plog::logf("scan bad regime: %d over-bright by y=%d, aborting sweep", overBright, y);
+      break;
     }
     if (y + 1 < GRID_H) {
       // Re-home midway (after the 9th row) so accumulated step drift can't
-      // skew the rest of the scan.
-      if (y == 8) rehome();
+      // skew the rest of the scan. Lift the arm to REST first — GRBL's homing
+      // cycle drives a diagonal toward the corner, and a dropped arm dragged
+      // across the populated board is the move that snapped the flip arm before.
+      // Drop back to SCAN after so the rest of the sweep keeps catching
+      // stage-1 squisks.
+      if (y == 8) {
+        writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
+        rehome();
+        writeServoUs(SERVO_US_SCAN, SERVO_50_DEG_SETTLE_MS);
+      }
       moveToYSafe(grid[y + 1][endCol].x + SCAN_OFFSET_X,
                   clampScanY(grid[y + 1][endCol].y + SCAN_OFFSET_Y));
       ltr = !ltr;
     }
   }
+  // Scan done (and any stage-1 squisks swept through) — park the flip arm at REST.
+  writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
   gridStateFresh = true;
+  return overBright;
+}
+
+// scanGrid wrapper: run the sweep, and if the sensor is in a blown-bright
+// regime (see SCAN_C_CEILING), re-init the front-end in place and re-scan.
+// Deliberately does NOT reset the MCU — a reset here would leave the already-
+// popped gallery item drawn-never (next.php created its entry before pickup).
+// The final attempt runs with bailing disabled so gridState is always fully
+// populated; if it's still bad we log loudly and proceed rather than orphan.
+void scanGrid() {
+  for (int attempt = 0; ; attempt++) {
+    bool last = (attempt >= SCAN_REINIT_MAX);
+    int over = scanGridOnce(!last);
+    if (over < SCAN_OVERBRIGHT_LIMIT) return;  // trustworthy scan
+    if (last) {
+      plog::logf("scan STILL bad after %d re-inits (over=%d) - proceeding, no reset",
+                 attempt, over);
+      return;
+    }
+    plog::logf("scan bad (over=%d) - re-init sensor, retry %d/%d",
+               over, attempt + 1, SCAN_REINIT_MAX);
+    initColorSensor();
+    delay(50);
+  }
 }
 
 // `G4 P0` is a dwell that GRBL syncs through the planner before acking, so
@@ -732,16 +882,31 @@ int displayBitmap(uint8_t* bitmap) {
     }
   }
   if (firstY < 0) return 0;
+  plog::logf("dB band y=%d..%d", lastY, firstY);
 
   int flipped = 0;
   bool ltr = true;
   for (int y = firstY; y >= lastY; y--) {
-    // Skip rows that don't need any changes — don't move to them at all.
-    bool rowHasFlip = false;
+    // Per-row diff count, logged so a plog dump shows exactly how many flips
+    // each row attempts. Reading the dump against the known target:
+    //   * row visibly still on the OLD image but logged diff=0  -> the flip was
+    //     never queued because gridState already matched the target here, i.e.
+    //     a scan misread (skip happens AT the diff, gridState is wrong).
+    //   * row logged the expected diff but didn't change physically -> it WAS
+    //     attempted and the flip itself failed (botch / dropped GRBL move).
+    // This pins skip-vs-botch per row without guessing.
+    int rowFlips = 0;
     for (int x = 0; x < GRID_W; x++) {
-      if (bitmapBit(bitmap, x, y) != gridState[y][x]) { rowHasFlip = true; break; }
+      if (bitmapBit(bitmap, x, y) != gridState[y][x]) rowFlips++;
     }
-    if (!rowHasFlip) continue;
+    // Snapshot at row entry (the previous row's waitForMotion has drained, so
+    // buf/qd should be ~0 here). buf or qd stuck high, or snt running away from
+    // ack as the sweep climbs, means GRBL stopped consuming our stream — the
+    // top rows (streamed last) would then never execute even though diff>0.
+    plog::logf("dB y=%d diff=%d buf=%d qd=%d snt=%lu ack=%lu", y, rowFlips,
+               bufferFill, (qTail - qHead + QUEUE_SIZE) % QUEUE_SIZE,
+               gCmdsSent, gOksAcked);
+    if (rowFlips == 0) continue;  // no changes — don't move to this row at all
 
     int startCol = ltr ? 0 : GRID_W - 1;
     int endCol = ltr ? GRID_W - 1 : 0;
@@ -772,6 +937,8 @@ int displayBitmap(uint8_t* bitmap) {
     waitForMotion();
     ltr = !ltr;
   }
+  plog::logf("dB end flipped=%d buf=%d snt=%lu ack=%lu", flipped, bufferFill,
+             gCmdsSent, gOksAcked);
   return flipped;
 }
 
@@ -819,17 +986,11 @@ void setup() {
 
   initGrid();
 
-  pinMode(TCS_S0, OUTPUT);
-  pinMode(TCS_S1, OUTPUT);
-  pinMode(TCS_S2, OUTPUT);
-  pinMode(TCS_S3, OUTPUT);
-  pinMode(TCS_OUT, INPUT);
   // S0/S1 = 1/0 → 20% output frequency scaling. Full-speed (HIGH/HIGH) tops
   // out near 600 kHz, which is past what pulseIn can resolve cleanly on the
-  // RP2040 here; 20% keeps us well inside that envelope.
-  digitalWrite(TCS_S0, HIGH);
-  digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  // RP2040 here; 20% keeps us well inside that envelope. (Helper so scanGrid's
+  // bad-regime recovery can re-assert the same config mid-run.)
+  initColorSensor();
 
   delay(2000);  // GRBL boot wait (Serial1) + servo settle
 

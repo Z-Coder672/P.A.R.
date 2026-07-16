@@ -1,6 +1,14 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/lib/ratelimit.php';
+par_rate_limit('gallery', [
+    'ip_rate'     => 0.5,  // ~30/min per IP (frontend polls every 5s = 12/min)
+    'ip_burst'    => 30,
+    'global_rate' => 5.0,
+    'global_burst' => 100,
+]);
+
 header('Content-Type: application/json; charset=UTF-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 
@@ -54,6 +62,16 @@ if (is_dir($galleryDir)) {
                 $entry['image'] = 'gallery/' . $id . '/' . $imageName . '?v=' . filemtime($imagePath);
                 break;
             }
+        }
+
+        // A photo only ever lands after the board has displayed and been shot
+        // (post check-pass), so image.jpg present means the print is done — treat
+        // the entry as completed even if its file is still pending.json (e.g. the
+        // pending->info rename was lost to a dropped/failed call). Without this,
+        // the modal would show "In progress" on top of a finished print that
+        // already has a real photo.
+        if ($entry['image'] !== null) {
+            $entry['pending'] = false;
         }
 
         $items[] = $entry;

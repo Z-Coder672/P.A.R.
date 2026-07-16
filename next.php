@@ -4,6 +4,8 @@ declare(strict_types=1);
 const MAX_CONCURRENT_REQUESTS = 5;
 const EXPECTED_BITMAP_BYTES = 84;
 
+require_once __DIR__ . '/lib/private_store.php';
+
 function nextGalleryIndex(string $galleryDir): int
 {
     $max = 0;
@@ -126,6 +128,7 @@ fclose($handle);
 $parsed = json_decode($nextItem, true);
 $bitmapBase64 = is_array($parsed) ? ($parsed['item'] ?? $nextItem) : $nextItem;
 $itemName = is_array($parsed) ? ($parsed['name'] ?? '') : '';
+$subId = is_array($parsed) ? (string) ($parsed['sub_id'] ?? '') : '';
 
 $galleryDir = __DIR__ . '/gallery';
 if (!is_dir($galleryDir)) {
@@ -140,6 +143,12 @@ if (mkdir($entryDir, 0777, true)) {
             $entryDir . '/pending.json',
             json_encode(['name' => $itemName, 'bitmap' => $bitmapBase64], JSON_UNESCAPED_UNICODE)
         );
+        // Bind any stored notification email (kept off-webroot) to this gallery
+        // id so snapshot-request.php can notify the submitter when it completes.
+        // The email itself never enters pending.json.
+        if ($subId !== '') {
+            par_bind_email_to_gallery($subId, $galleryIndex);
+        }
         header('X-Gallery-Id: ' . $galleryIndex);
         // Snapshot flag is NOT armed here — the Arduino POSTs
         // /snapshot-request.php with the gallery id after its check (fix)
