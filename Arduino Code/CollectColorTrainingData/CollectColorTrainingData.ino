@@ -13,20 +13,20 @@
 // Set the discs to that pattern using the reversed PNG shipped alongside
 // (the camera/sensor sees the back, so the PNG is mirrored).
 
-#include <Servo.h>
-
 const int   GRID_W = 37;
 const int   GRID_H = 18;
 
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
+const float Y_TRAVEL = 412.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 
-// TCS3200 sensor pins (matches P.A.R.Main).
-const int TCS_S0  = 4;
-const int TCS_S1  = 5;
-const int TCS_S2  = 6;
-const int TCS_S3  = 7;
-const int TCS_OUT = 8;
+// TCS3200 sensor pins (matches P.A.R.Main), plus an LED illumination bank on
+// D10 (via NPN, HIGH = on) for ambient-subtracted reads.
+const int TCS_S0  = D4;
+const int TCS_S1  = D5;
+const int TCS_S2  = D6;
+const int TCS_S3  = D7;
+const int TCS_OUT = D8;
+const int TCS_LED = D10;
 
 enum TcsFilter {
   TCS_RED   = 0,
@@ -46,6 +46,63 @@ const float SAMPLE_RADIUS = 1.0f;
 // sensor visits land at the same physical points main scans during verify.
 const float SCAN_OFFSET_X = -23.0f;
 const float SCAN_OFFSET_Y =   4.0f;
+
+// ---- Servo link (hardware UART, NOT a PWM servo output) ------------------
+// D9 is the TX line of a hardware 9600-baud UART (Serial2) feeding the
+// dedicated 5V ServoNano, which parses one integer µs value per line and
+// drives the SG90 flip servo itself. The old Servo.h/attach(9) PWM path is
+// RETIRED — writing 50 Hz PWM here would be decoded by the ServoNano as
+// garbage frames and can throw the flip arm to a random angle.
+// UART: the ESP32-S3 GPIO matrix routes Serial2's TX to D9, so this is a real
+// UART peripheral -- GRBL's Serial1 RX ISR cannot disturb its bit timing.
+const int SERVO_TX_PIN = D9;
+
+// The flip arm is parked at REST for the entire collection sweep (this sketch
+// only scans; it never flips a disc).
+const int SERVO_US_REST = 544;  // ≈0°, arm parked
+const int SERVO_90_DEG_SETTLE_MS = 300;
+
+// PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
+// with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The
+// ESP32-S3 GPIO matrix routes a real UART to any pin, so the link is now
+// hardware Serial2 TX on the SAME physical D9 wire -- same 9600 8N1 framing, no
+// ISR blackout, no bit-period tuning. RX is unused (-1): the link is still
+// one-way; the ack is the separate D2 level line.
+
+// The link is ONE-WAY with no ack, so a dropped byte silently LOSES a command
+// and the arm simply stays where it was. That broke the flip arm once: a lost
+// REST left it at ENGAGE, and flipDisc then ran both X strokes with the arm
+// buried in the board. A receiver-side check cannot help -- a command that never
+// arrives cannot be rejected -- so every command is sent SERVO_TX_REPEATS times.
+// writeMicroseconds() is idempotent, so the repeats are free: re-commanding the
+// position the servo already holds does nothing. Losing a command now takes
+// SERVO_TX_REPEATS independent dropouts instead of one.
+//
+// The repeats also fix LATE application: if only the trailing newline is lost,
+// the stranded digits sit in the ServoNano's buffer until the NEXT command's
+// leading newline flushes them -- which without repeats is up to a full settle
+// period later, i.e. after the stroke has already started. The next repeat
+// flushes them SERVO_TX_REPEAT_GAP_MS later instead.
+const int SERVO_TX_REPEATS = 3;
+const int SERVO_TX_REPEAT_GAP_MS = 6;
+
+void servoTxLine(int us) {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "\n%d\n", us);
+  for (int r = 0; r < SERVO_TX_REPEATS; r++) {
+    Serial2.print(buf);
+    // Block until the last stop bit is actually on the wire, so this call
+    // stays synchronous like the old bit-bang did -- callers time their
+    // settle delay from here.
+    Serial2.flush();
+    if (r + 1 < SERVO_TX_REPEATS) delay(SERVO_TX_REPEAT_GAP_MS);
+  }
+}
+
+void writeServoUs(int us, int settle_ms) {
+  servoTxLine(us);
+  delay(settle_ms);
+}
 
 // GRBL character-counting streaming protocol (same setup as P.A.R.Main).
 #define RX_BUFFER_SAFE 120
@@ -128,8 +185,8 @@ unsigned long tcsReadFrequencyHz() {
   return 500000UL / halfUs;
 }
 
-// 5-frame averaged RGBC, matches the input distribution P.A.R.Main feeds
-// the classifier.
+// 5-frame averaged RGBC. Called twice per read by readAmbientSubtracted()
+// (once LEDs-off, once LEDs-on).
 void tcsReadRGBC(unsigned long& r, unsigned long& g,
                  unsigned long& b, unsigned long& c) {
   uint32_t sr = 0, sg = 0, sb = 0, sc = 0;
@@ -140,6 +197,24 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
     tcsSelect(TCS_CLEAR); delay(2); sc += tcsReadFrequencyHz();
   }
   r = sr / 5; g = sg / 5; b = sb / 5; c = sc / 5;
+}
+
+// LED settle after toggling the illumination bank before reading.
+const int LED_SETTLE_MS = 20;
+
+// One ambient-subtracted RGBC read: LEDs-off average subtracted from LEDs-on
+// average. Room light cancels; result depends only on the disc + our LEDs.
+// Logged as training/tuning data so the collected RGBC matches what PARMain's
+// threshold actually sees. Negatives clamped to 0. LEDs left off.
+void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
+  unsigned long ar, ag, ab, ac, lr, lg, lb, lc;
+  digitalWrite(TCS_LED, LOW);  delay(LED_SETTLE_MS); tcsReadRGBC(ar, ag, ab, ac);
+  digitalWrite(TCS_LED, HIGH); delay(LED_SETTLE_MS); tcsReadRGBC(lr, lg, lb, lc);
+  digitalWrite(TCS_LED, LOW);
+  r = (long)lr - (long)ar; if (r < 0) r = 0;
+  g = (long)lg - (long)ag; if (g < 0) g = 0;
+  b = (long)lb - (long)ab; if (b < 0) b = 0;
+  c = (long)lc - (long)ac; if (c < 0) c = 0;
 }
 
 // Returns 1 if the cell at (x,y) is expected to be blue, 0 if black.
@@ -156,8 +231,8 @@ void sampleAndPrint(int x, int y, float dx, float dy) {
          grid[y][x].y + SCAN_OFFSET_Y + dy);
   waitForMotion();
 
-  unsigned long r, g, b, c;
-  tcsReadRGBC(r, g, b, c);
+  long r, g, b, c;
+  readAmbientSubtracted(r, g, b, c);
 
   char prefix = expectedColor(x, y) ? 'b' : 'k';
   Serial.print(prefix); Serial.print(',');
@@ -171,16 +246,28 @@ bool started = false;
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200);
+  // Serial0 owns D0/D1 by default on the Nano ESP32; hand them to Serial1 so
+  // the GRBL link keeps its identifier and its physical wires.
+  Serial0.end();
+  Serial1.begin(115200, SERIAL_8N1, D0, D1);
   while (!Serial);
 
   initGrid();
+
+  // Park the flip arm at REST BEFORE any GRBL motion — homing would otherwise
+  // drag a randomly-positioned arm across the populated board.
+  Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
+  delay(100);
+  servoTxLine(SERVO_US_REST);
+  delay(SERVO_90_DEG_SETTLE_MS);
 
   pinMode(TCS_S0, OUTPUT);
   pinMode(TCS_S1, OUTPUT);
   pinMode(TCS_S2, OUTPUT);
   pinMode(TCS_S3, OUTPUT);
   pinMode(TCS_OUT, INPUT);
+  pinMode(TCS_LED, OUTPUT);
+  digitalWrite(TCS_LED, LOW);
   // 20% output frequency scaling (S0=H, S1=L) — keeps pulseIn within range.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);

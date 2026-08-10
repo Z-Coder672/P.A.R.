@@ -3,28 +3,30 @@
 //
 // "Flip everything to blue" can't be a blind flip of every cell: flipping an
 // already-blue disc would turn it black. So we scan each bottom-row cell with
-// the TCS3200, classify blue/black with the production ternary model, and call
-// flipDisc only on the cells currently reading black. Already-blue cells are
-// left alone — after the pass the whole bottom row is blue.
+// the TCS3200, classify cyan/black by a simple clear-channel threshold on the
+// LED ambient-subtracted read, and call flipDisc only on the cells currently
+// reading black. Already-blue cells are left alone — after the pass the whole
+// bottom row is blue.
 //
-// Drives the same GRBL streaming + D9→ServoNano bit-banged path + classifier as
-// PARMain.ino. Motion constants, flipDisc, moveToYSafe, the scan offsets, and
-// the TCS read/classify chain are copied verbatim from PARMain — keep in sync.
-
-#include "classifier.h"  // tiny ternary transformer for blue/black RGBC
+// Drives the same GRBL streaming + D9→ServoNano hardware-UART path + read/classify
+// as PARMain.ino. Motion constants, flipDisc, moveToYSafe, the scan offsets, and
+// the TCS ambient-subtracted read + threshold are copied from PARMain — keep in
+// sync.
 
 const int GRID_W = 37;
 const int GRID_H = 18;
 
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131
+const float Y_TRAVEL = 412.0f;  // MUST equal GRBL $131
 
-// TCS3200 color sensor: S0-S3 + OUT on D4..D8.
-const int TCS_S0 = 4;
-const int TCS_S1 = 5;
-const int TCS_S2 = 6;
-const int TCS_S3 = 7;
-const int TCS_OUT = 8;
+// TCS3200 color sensor: S0-S3 + OUT on D4..D8, plus an LED illumination bank on
+// D10 (via NPN, HIGH = on) for ambient-subtracted reads.
+const int TCS_S0 = D4;
+const int TCS_S1 = D5;
+const int TCS_S2 = D6;
+const int TCS_S3 = D7;
+const int TCS_OUT = D8;
+const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 
 enum TcsFilter {
   TCS_RED = 0,    // S2=L, S3=L
@@ -47,27 +49,44 @@ const float FLIP_OFFSET_X = 16.8f;
 // Optional second-catch pass — mirror PARMain.ino; off by default.
 //#define FLIP_SECOND_CATCH
 
-// Servo offloaded to a 5V Nano over a bit-banged 9600-baud software UART on D9.
-const int SERVO_TX_PIN = 9;
-const int SERVO_TX_BIT_US = 102;
+// Servo offloaded to a 5V Nano over a hardware 9600-baud UART (Serial2) on D9.
+const int SERVO_TX_PIN = D9;
 
-void servoTxByte(uint8_t b) {
-  noInterrupts();
-  digitalWrite(SERVO_TX_PIN, LOW);
-  delayMicroseconds(SERVO_TX_BIT_US);
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(SERVO_TX_PIN, (b >> i) & 1);
-    delayMicroseconds(SERVO_TX_BIT_US);
-  }
-  digitalWrite(SERVO_TX_PIN, HIGH);
-  interrupts();
-  delayMicroseconds(SERVO_TX_BIT_US);  // stop bit
-}
+// PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
+// with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The
+// ESP32-S3 GPIO matrix routes a real UART to any pin, so the link is now
+// hardware Serial2 TX on the SAME physical D9 wire -- same 9600 8N1 framing, no
+// ISR blackout, no bit-period tuning. RX is unused (-1): the link is still
+// one-way; the ack is the separate D2 level line.
+
+// The link is ONE-WAY with no ack, so a dropped byte silently LOSES a command
+// and the arm simply stays where it was. That broke the flip arm once: a lost
+// REST left it at ENGAGE, and flipDisc then ran both X strokes with the arm
+// buried in the board. A receiver-side check cannot help -- a command that never
+// arrives cannot be rejected -- so every command is sent SERVO_TX_REPEATS times.
+// writeMicroseconds() is idempotent, so the repeats are free: re-commanding the
+// position the servo already holds does nothing. Losing a command now takes
+// SERVO_TX_REPEATS independent dropouts instead of one.
+//
+// The repeats also fix LATE application: if only the trailing newline is lost,
+// the stranded digits sit in the ServoNano's buffer until the NEXT command's
+// leading newline flushes them -- which without repeats is up to a full settle
+// period later, i.e. after the stroke has already started. The next repeat
+// flushes them SERVO_TX_REPEAT_GAP_MS later instead.
+const int SERVO_TX_REPEATS = 3;
+const int SERVO_TX_REPEAT_GAP_MS = 6;
 
 void servoTxLine(int us) {
   char buf[12];
-  int n = snprintf(buf, sizeof(buf), "%d\n", us);
-  for (int i = 0; i < n; i++) servoTxByte((uint8_t)buf[i]);
+  snprintf(buf, sizeof(buf), "\n%d\n", us);
+  for (int r = 0; r < SERVO_TX_REPEATS; r++) {
+    Serial2.print(buf);
+    // Block until the last stop bit is actually on the wire, so this call
+    // stays synchronous like the old bit-bang did -- callers time their
+    // settle delay from here.
+    Serial2.flush();
+    if (r + 1 < SERVO_TX_REPEATS) delay(SERVO_TX_REPEAT_GAP_MS);
+  }
 }
 
 void writeServoUs(int us, int settle_ms) {
@@ -187,16 +206,42 @@ const float SCAN_OFFSET_Y = 4.0f;
 const float SCAN_Y_MAX = -0.05f;
 static inline float clampScanY(float y) { return y > SCAN_Y_MAX ? SCAN_Y_MAX : y; }
 
-uint8_t classifyDisc(unsigned long r, unsigned long g,
-                     unsigned long b, unsigned long c) {
-  float rgbc[4] = { (float)r, (float)g, (float)b, (float)c };
-  return classifier_is_blue(rgbc) ? 1 : 0;
+// LED settle after toggling the illumination bank before reading.
+const int LED_SETTLE_MS = 20;
+
+// One ambient-subtracted RGBC read: LEDs-off average subtracted from LEDs-on
+// average. Room light cancels; result depends only on the disc + our LEDs.
+// Negatives clamped to 0. LEDs left off.
+void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
+  unsigned long ar, ag, ab, ac, lr, lg, lb, lc;
+  digitalWrite(TCS_LED, LOW);  delay(LED_SETTLE_MS); tcsReadRGBC(ar, ag, ab, ac);
+  digitalWrite(TCS_LED, HIGH); delay(LED_SETTLE_MS); tcsReadRGBC(lr, lg, lb, lc);
+  digitalWrite(TCS_LED, LOW);
+  r = (long)lr - (long)ar; if (r < 0) r = 0;
+  g = (long)lg - (long)ag; if (g < 0) g = 0;
+  b = (long)lb - (long)ab; if (b < 0) b = 0;
+  c = (long)lc - (long)ac; if (c < 0) c = 0;
 }
+
+// Simple threshold on the ambient-subtracted clear channel. 1 = cyan/on
+// (front), 0 = black/off. The sensor views the disc BACK: an ON disc shows its
+// BLACK back (LOW clear), an OFF disc shows its cyan back (HIGH clear), so front
+// cyan = clear below the threshold.
+// Classification threshold. Physically the BLUE channel, not clear — the S2/S3
+// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
+// Full explanation and the measurements are in PARMain.ino at this constant.
+// 3535 = geometric mean of the measured populations; was 6000, which was
+// lopsided (3.69x / 1.28x) toward the failure side.
+const long SCAN_ON_BLUE_MAX = 3535;
+static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
 
 void rehome() {
   sendGcode("$H");
   waitForIdle();
   sendGcode("$1=255");
+  waitForIdle();  // sync past the $1 EEPROM write before pipelining more — grbl
+                  // disables interrupts during the commit and drops Serial1 RX
   sendGcode("G21");
   sendGcode("G90");
   waitForIdle();
@@ -248,10 +293,12 @@ void flipDisc(int gx, int gy, bool catchByNextMove) {
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200);
+  // Serial0 owns D0/D1 by default on the Nano ESP32; hand them to Serial1 so
+  // the GRBL link keeps its identifier and its physical wires.
+  Serial0.end();
+  Serial1.begin(115200, SERIAL_8N1, D0, D1);
 
-  pinMode(SERVO_TX_PIN, OUTPUT);
-  digitalWrite(SERVO_TX_PIN, HIGH);  // UART idle = high
+  Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
   delay(100);
   servoTxLine(SERVO_US_REST);
 
@@ -260,6 +307,8 @@ void setup() {
   pinMode(TCS_S2, OUTPUT);
   pinMode(TCS_S3, OUTPUT);
   pinMode(TCS_OUT, INPUT);
+  pinMode(TCS_LED, OUTPUT);
+  digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);   // 20% output scaling
   digitalWrite(TCS_S1, LOW);
   tcsSelect(TCS_CLEAR);
@@ -285,9 +334,9 @@ void setup() {
            clampScanY(grid[yRow][x].y + SCAN_OFFSET_Y));
     waitForMotion();
 
-    unsigned long r, g, b, c;
-    tcsReadRGBC(r, g, b, c);
-    uint8_t color = classifyDisc(r, g, b, c);
+    long r, g, b, c;
+    readAmbientSubtracted(r, g, b, c);
+    uint8_t color = classifyDisc(c);
     rowState[x] = color;
 
     Serial.print("scan x="); Serial.print(x);

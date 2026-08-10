@@ -1,16 +1,29 @@
-// Tiny append-only log persisted to a slice of the RP2040's QSPI flash via
-// mbed LittleFS. Use ONLY for connection-layer events (WiFi associate / drop,
+// Tiny append-only log persisted to the ESP32-S3's LittleFS data partition.
+// (Was a hand-carved slice of the RP2040's QSPI flash via mbed LittleFS; the
+// ESP32 has a real partition table, so we mount the factory "ffat" partition —
+// 9.375 MB. Build normally, with NO PartitionScheme flag; see the long comment
+// in persistent_log.cpp for why "spiffs" is unreachable over DFU.)
+// Use ONLY for connection-layer events (WiFi associate / drop,
 // HTTPS connect/status/timeout, poll outcomes, /complete.php retries) — never
 // for GRBL chatter or general status. The whole point is that across an MCU
 // reset (e.g. the WiFi/GRBL stall watchdog firing) we can read back what was
 // happening *just before* the reset.
 //
 // All entries are millis()-stamped at log time. The ring is bounded by
-// rotation at boot: if log.txt is larger than PLOG_MAX_BYTES, we drop it on
-// the floor and start fresh. Crude, but it stops the file from growing
-// without bound across years of uptime.
+// rotation at boot: if log.txt is larger than PLOG_MAX_BYTES, the OLDEST bytes
+// are trimmed away down to PLOG_KEEP_BYTES (a rolling trim, not a wipe — recent
+// history survives), which stops the file from growing without bound across
+// years of uptime.
 #pragma once
 #include <Arduino.h>
+
+// Live mirror of every logged line to USB serial (see plog::log()).
+//   0 = flash only  — PARMain: headless production firmware, no USB CDC work.
+//   1 = mirror on   — the bench sketches, where you watch a run live.
+// THIS IS THE ONLY LINE THAT DIFFERS between the copies of this file. Keep the
+// rest byte-identical across PARMain / FlipAllTest / FlipAllMaskedTest /
+// ScanColorLidarTest / ScanColorAmbientTest.
+#define PLOG_SERIAL_MIRROR 0
 
 namespace plog {
   // Mount LittleFS, format on first boot, rotate if oversized, and capture

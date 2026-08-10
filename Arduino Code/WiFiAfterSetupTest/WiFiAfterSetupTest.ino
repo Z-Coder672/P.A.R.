@@ -2,12 +2,23 @@
 // runs, then polls /gallery.php like WiFiConnectionTest. The plain WiFi smoke
 // test passes on this rig, but the real sketch sits ~60s after scanGrid() and
 // reboots via the WiFi stall watchdog. This sketch lets us bisect *which* part
-// of PARMain's pre-WiFi setup wedges the NINA module.
+// of PARMain's pre-WiFi setup wedges the radio.
+//
+// PORT (Arduino Nano ESP32): this sketch was written to bisect a NINA
+// co-processor wedge — an SPI-attached radio starved by noInterrupts() windows
+// and blocking pulseIn storms. On the ESP32-S3 the radio is on-die and driven
+// by its own core/task, and the servo link is a hardware UART with no interrupt
+// blackout at all, so the original prime suspects (steps 2-5) are largely moot.
+// The steps are kept because the *rest* of the hypothesis space — power sag
+// from the steppers, sustained Serial1 pressure, gantry motion — is unchanged
+// and still worth bisecting.
 //
 // Toggle these defines and reflash to isolate the culprit:
 //   STEP_SERIAL1   — open Serial1 to GRBL (no traffic, just the port)
 //   STEP_TCS_PINS  — configure TCS3200 pins + S0/S1 scaling
-//   STEP_SERVO     — attach Servo on D9 and command REST
+//   STEP_SERVO     — send a REST command down the D9 servo UART (Serial2)
+//                    (the D9 line is always brought up and parked at REST at
+//                    the top of setup(); this toggle only adds a second frame)
 //   STEP_PULSEIN   — run a scanGrid-shaped pulseIn loop (no motion, no Serial1
 //                    traffic) to stress the same blocking-read path
 //   STEP_GRBL_BOOT — actually send $H / $1=255 / G21 / G90 like PARMain does
@@ -25,10 +36,11 @@
 //   1. All STEP_* off → confirms WiFi still works in this sketch's skeleton.
 //   2. Enable STEP_SERIAL1. Reflash. If WiFi breaks, it's the UART init.
 //   3. Add STEP_TCS_PINS. If WiFi breaks, it's the TCS pin config.
-//   4. Add STEP_SERVO. If WiFi breaks now and was fine before, it's the Servo
-//      lib grabbing a timer/PWM slice the NINA driver needs.
-//   5. Add STEP_PULSEIN. If WiFi breaks, the long blocking pulseIn storm is
-//      starving the NINA SPI link.
+//   4. Add STEP_SERVO. On the RP2040 this was the bit-bang UART's
+//      noInterrupts() windows starving the NINA driver; Serial2 has no such
+//      window, so a break here now would point at the ServoNano's 5V rail.
+//   5. Add STEP_PULSEIN. On the RP2040 a long blocking pulseIn storm starved
+//      the NINA SPI link; the ESP32-S3 radio does not share that path.
 //   6. Add STEP_GRBL_BOOT (only with the rig live). If WiFi only breaks here,
 //      it's power sag from the steppers, not a software conflict.
 //   7. Add STEP_GCODE_STREAM. If WiFi breaks, sustained Serial1 traffic is the
@@ -36,9 +48,11 @@
 //   8. Add STEP_FULL_SCAN. If WiFi only breaks here, the difference between
 //      this and step 7 is *gantry motion* — almost certainly power sag.
 
-#include <WiFiNINA.h>
-#include <Servo.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <esp_system.h>      // esp_restart()
 #include "env.h"
+#include "par_root_ca.h"     // 6-root bundle; see setCACert() below
 
 // ── Bisection toggles ────────────────────────────────────────────────────────
 #define STEP_SERIAL1   1
@@ -60,17 +74,64 @@ const unsigned long WIFI_STALL_TIMEOUT_MS    = 60000;
 const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 15000;
 const unsigned long POLL_INTERVAL_MS         = 10000;
 
-// ── TCS3200 / Servo pins (mirror PARMain) ────────────────────────────────────
-const int TCS_S0  = 4;
-const int TCS_S1  = 5;
-const int TCS_S2  = 6;
-const int TCS_S3  = 7;
-const int TCS_OUT = 8;
+// ── TCS3200 / servo-link pins (mirror PARMain) ───────────────────────────────
+const int TCS_S0  = D4;
+const int TCS_S1  = D5;
+const int TCS_S2  = D6;
+const int TCS_S3  = D7;
+const int TCS_OUT = D8;
+const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 
-const int SERVO_PIN       = 9;
+// D9 is NOT a PWM servo output. The SG90 flip servo is driven by a dedicated
+// 5V Arduino Nano (ServoNano.ino); D9 is a 9600-baud UART TX line into that
+// Nano's RX (shared GND, one-way). Driving 50Hz servo PWM on this pin feeds the
+// Nano garbage frames, which occasionally parse as an integer and throw the flip
+// arm to a random angle — that already snapped the arm once.
+const int SERVO_TX_PIN = D9;
+
 const int SERVO_US_REST   = 544;
 
-Servo flipServo;
+// PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
+// with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The
+// ESP32-S3 GPIO matrix routes a real UART to any pin, so the link is now
+// hardware Serial2 TX on the SAME physical D9 wire -- same 9600 8N1 framing, no
+// ISR blackout, no bit-period tuning. RX is unused (-1): the link is still
+// one-way; the ack is the separate D2 level line.
+
+// The link is ONE-WAY with no ack, so a dropped byte silently LOSES a command
+// and the arm simply stays where it was. That broke the flip arm once: a lost
+// REST left it at ENGAGE, and flipDisc then ran both X strokes with the arm
+// buried in the board. A receiver-side check cannot help -- a command that never
+// arrives cannot be rejected -- so every command is sent SERVO_TX_REPEATS times.
+// writeMicroseconds() is idempotent, so the repeats are free: re-commanding the
+// position the servo already holds does nothing. Losing a command now takes
+// SERVO_TX_REPEATS independent dropouts instead of one.
+//
+// The repeats also fix LATE application: if only the trailing newline is lost,
+// the stranded digits sit in the ServoNano's buffer until the NEXT command's
+// leading newline flushes them -- which without repeats is up to a full settle
+// period later, i.e. after the stroke has already started. The next repeat
+// flushes them SERVO_TX_REPEAT_GAP_MS later instead.
+const int SERVO_TX_REPEATS = 3;
+const int SERVO_TX_REPEAT_GAP_MS = 6;
+
+void servoTxLine(int us) {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "\n%d\n", us);
+  for (int r = 0; r < SERVO_TX_REPEATS; r++) {
+    Serial2.print(buf);
+    // Block until the last stop bit is actually on the wire, so this call
+    // stays synchronous like the old bit-bang did -- callers time their
+    // settle delay from here.
+    Serial2.flush();
+    if (r + 1 < SERVO_TX_REPEATS) delay(SERVO_TX_REPEAT_GAP_MS);
+  }
+}
+
+void writeServoUs(int us, int settle_ms) {
+  servoTxLine(us);
+  delay(settle_ms);
+}
 
 // scanGrid is 18*37 = 666 cells; each cell does 5 frames × 4 filters = 20
 // pulseIn calls. We approximate the same blocking-read load here without any
@@ -84,8 +145,9 @@ void ensureWiFi() {
   unsigned long stallT0 = millis();
   for (int attempt = 1; ; attempt++) {
     Serial.print("WiFi attempt "); Serial.print(attempt); Serial.print(": ");
-    WiFi.disconnect();
-    WiFi.end();
+    // WiFi.end() on WiFiNINA powered the co-processor down; the ESP32
+    // equivalent is disconnect(true), which also releases the station config.
+    WiFi.disconnect(true);
     delay(100);
     WiFi.begin(SSID, PASSWORD);
     unsigned long t0 = millis();
@@ -104,7 +166,7 @@ void ensureWiFi() {
       Serial.println("!!! WiFi stall, forcing MCU reset");
       Serial.flush();
       delay(50);
-      NVIC_SystemReset();
+      esp_restart();
     }
   }
 }
@@ -118,7 +180,14 @@ void ensureWiFi() {
 // pending entries that never get a real photo). The smoke test is safe to run
 // only when the queue is empty (body will be "NONE").
 bool fetchNext(int& outStatus, String& outGalleryId, String& outBody) {
-  WiFiSSLClient ssl;
+  // WiFiNINA's WiFiSSLClient validated against the NINA's own baked-in root
+  // store. WiFiClientSecure has no default store, so the roots must be supplied
+  // or the handshake fails. par_root_ca.h carries SIX roots on purpose: the site
+  // sits behind Cloudflare, which rotates issuing CAs without notice — pinning a
+  // single root would break the rig on a rotation.
+  WiFiClientSecure ssl;
+  ssl.setCACert(PAR_ROOT_CA);
+  ssl.setTimeout(HTTP_RESPONSE_TIMEOUT_MS / 1000);
   if (!ssl.connect(SERVER, PORT)) {
     Serial.println("connect() failed");
     return false;
@@ -224,7 +293,9 @@ bool fetchNext(int& outStatus, String& outGalleryId, String& outBody) {
 // Fake-scanGrid: just hammers pulseIn on TCS_OUT with no gantry motion. If the
 // sensor is wired in this'll see real edges; if not, each pulseIn will time
 // out after 100ms, which is also fine — we're measuring whether the storm of
-// blocking reads alone wedges WiFiNINA's SPI link.
+// blocking reads alone disturbs the radio. (On the RP2040 this starved the
+// NINA's SPI link; the ESP32-S3 radio is on-die and does not share that path,
+// so this step is now expected to be clean.)
 void fakeScanPulseInStorm() {
   Serial.print("pulseIn storm: "); Serial.print(PULSEIN_CELL_COUNT);
   Serial.print(" cells x "); Serial.print(PULSEIN_READS_PER_CELL);
@@ -323,7 +394,7 @@ void gcodeStreamStress() {
 const int   GRID_W = 37;
 const int   GRID_H = 18;
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
+const float Y_TRAVEL = 412.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 const float SCAN_OFFSET_X = -23.0f;
 const float SCAN_OFFSET_Y =   4.0f;
 
@@ -368,10 +439,28 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
   r = sr/5; g = sg/5; b = sb/5; c = sc/5;
 }
 
+// LED settle after toggling the illumination bank before reading.
+const int LED_SETTLE_MS = 20;
+
+// LED ambient-subtracted RGBC read (mirrors PARMain). This is a smoke test with
+// no classifier — the ambient read is here only so the pulseIn/UART pressure and
+// pin usage match production. Negatives clamped to 0. LEDs left off.
+void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
+  unsigned long ar, ag, ab, ac, lr, lg, lb, lc;
+  digitalWrite(TCS_LED, LOW);  delay(LED_SETTLE_MS); tcsReadRGBC(ar, ag, ab, ac);
+  digitalWrite(TCS_LED, HIGH); delay(LED_SETTLE_MS); tcsReadRGBC(lr, lg, lb, lc);
+  digitalWrite(TCS_LED, LOW);
+  r = (long)lr - (long)ar; if (r < 0) r = 0;
+  g = (long)lg - (long)ag; if (g < 0) g = 0;
+  b = (long)lb - (long)ab; if (b < 0) b = 0;
+  c = (long)lc - (long)ac; if (c < 0) c = 0;
+}
+
 void rehomeReplica() {
   streamSend("$H");
   streamWaitIdle();
   streamSend("$1=255");
+  streamWaitIdle();  // sync past the $1 EEPROM write — grbl drops Serial1 RX during the commit
   streamSend("G21");
   streamSend("G90");
   streamWaitIdle();
@@ -389,8 +478,8 @@ void fullScanReplica() {
     for (int x = startCol; x != endCol + step; x += step) {
       streamMoveTo(gridX(x) + SCAN_OFFSET_X, gridY(y) + SCAN_OFFSET_Y);
       streamWaitMotion();
-      unsigned long r, g, b, c;
-      tcsReadRGBC(r, g, b, c);
+      long r, g, b, c;
+      readAmbientSubtracted(r, g, b, c);
     }
     if (y + 1 < GRID_H) {
       if (y == 8) rehomeReplica();
@@ -406,6 +495,13 @@ void fullScanReplica() {
 }
 
 void setup() {
+  // Bring the servo TX UART up and park the arm at REST FIRST — before WiFi,
+  // before Serial1/GRBL, before any homing or traverse. A randomly-positioned
+  // arm dragged across a populated board is how the flip arm got snapped once.
+  Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
+  delay(100);
+  servoTxLine(SERVO_US_REST);
+
   Serial.begin(115200);
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 3000) {}
@@ -421,7 +517,10 @@ void setup() {
   Serial.println();
 
 #if STEP_SERIAL1
-  Serial1.begin(115200);
+  // Serial0 owns D0/D1 by default on the Nano ESP32; hand them to Serial1 so
+  // the GRBL link keeps its identifier and its physical wires.
+  Serial0.end();
+  Serial1.begin(115200, SERIAL_8N1, D0, D1);
   Serial.println("Serial1 opened.");
 #endif
 
@@ -431,6 +530,8 @@ void setup() {
   pinMode(TCS_S2, OUTPUT);
   pinMode(TCS_S3, OUTPUT);
   pinMode(TCS_OUT, INPUT);
+  pinMode(TCS_LED, OUTPUT);
+  digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
   digitalWrite(TCS_S2, HIGH);  // TCS_CLEAR
@@ -439,9 +540,8 @@ void setup() {
 #endif
 
 #if STEP_SERVO
-  flipServo.attach(SERVO_PIN);
-  flipServo.writeMicroseconds(SERVO_US_REST);
-  Serial.println("Servo attached at REST.");
+  writeServoUs(SERVO_US_REST, 300);
+  Serial.println("Servo commanded to REST over the D9 UART (Serial2).");
 #endif
 
   delay(2000); // matches PARMain's GRBL boot wait

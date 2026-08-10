@@ -1,32 +1,30 @@
 // Walks every row of the known-pattern board, samples the center of each
-// cell with the TCS3200, runs the trained classifier, and prints the
-// resulting blue/black accuracy.
+// cell with the TCS3200, classifies each disc with the LED ambient-subtracted
+// read + clear-channel threshold, and prints the resulting cyan/black accuracy.
 //
 // Uses the same homing/grid/streaming setup as CollectColorTrainingData,
-// but only one sample per cell — this is a quick model sanity check, not
+// but only one sample per cell — this is a quick threshold sanity check, not
 // a training pass.
 //
 // Assumed board pattern: the "Luv" bitmap (heart + "u" letters) packed
 // 37x18 = 666 bits MSB-first into 84 bytes; bit 1 = blue disc, bit 0 =
 // black disc. Same packing as the site's bitmap format.
-//
-// Drop a trained model_weights.h into this sketch folder before flashing.
-
-#include "classifier.h"
 
 const int   GRID_W = 37;
 const int   GRID_H = 18;
 const int   AVG_WINDOW = 5;
 
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 402.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
+const float Y_TRAVEL = 412.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 
-// TCS3200 sensor pins (matches P.A.R.Main).
-const int TCS_S0  = 4;
-const int TCS_S1  = 5;
-const int TCS_S2  = 6;
-const int TCS_S3  = 7;
-const int TCS_OUT = 8;
+// TCS3200 sensor pins (matches P.A.R.Main), plus an LED illumination bank on
+// D10 (via NPN, HIGH = on) for ambient-subtracted reads.
+const int TCS_S0  = D4;
+const int TCS_S1  = D5;
+const int TCS_S2  = D6;
+const int TCS_S3  = D7;
+const int TCS_OUT = D8;
+const int TCS_LED = D10;
 
 enum TcsFilter {
   TCS_RED   = 0,
@@ -161,10 +159,41 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
   c = ringSum[3] / AVG_WINDOW;
 }
 
+// LED settle after toggling the illumination bank before reading.
+const int LED_SETTLE_MS = 20;
+
+// One ambient-subtracted RGBC read: LEDs-off average subtracted from LEDs-on
+// average. Room light cancels. Negatives clamped to 0. LEDs left off.
+void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
+  unsigned long ar, ag, ab, ac, lr, lg, lb, lc;
+  digitalWrite(TCS_LED, LOW);  delay(LED_SETTLE_MS); tcsReadRGBC(ar, ag, ab, ac);
+  digitalWrite(TCS_LED, HIGH); delay(LED_SETTLE_MS); tcsReadRGBC(lr, lg, lb, lc);
+  digitalWrite(TCS_LED, LOW);
+  r = (long)lr - (long)ar; if (r < 0) r = 0;
+  g = (long)lg - (long)ag; if (g < 0) g = 0;
+  b = (long)lb - (long)ab; if (b < 0) b = 0;
+  c = (long)lc - (long)ac; if (c < 0) c = 0;
+}
+
+// Simple threshold on the ambient-subtracted clear channel. 1 = cyan/on
+// (front), 0 = black/off. Sensor views the disc BACK, so front cyan = clear
+// below the threshold.
+// Classification threshold. Physically the BLUE channel, not clear — the S2/S3
+// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
+// Full explanation and the measurements are in PARMain.ino at this constant.
+// 3535 = geometric mean of the measured populations; was 6000, which was
+// lopsided (3.69x / 1.28x) toward the failure side.
+const long SCAN_ON_BLUE_MAX = 3535;
+static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+
+// classifyDisc returns the FRONT/displayed color; LUV_BITMAP encodes the BACK
+// view the sensor sees (mirror of the front, matching the training convention),
+// so invert it to get the expected front color.
 uint8_t expectedColor(int x, int y) {
   int bitIndex = y * GRID_W + x;
   uint8_t byte = LUV_BITMAP[bitIndex >> 3];
-  return (byte >> (7 - (bitIndex & 7))) & 0x01;  // 1 = blue, 0 = black
+  return ((byte >> (7 - (bitIndex & 7))) & 0x01) ? 0 : 1;  // FRONT = !back
 }
 
 int totalSamples = 0;
@@ -174,11 +203,10 @@ void sampleAndCheck(int x, int y) {
   moveTo(grid[y][x].x, grid[y][x].y);
   waitForMotion();
 
-  unsigned long r, g, b, c;
-  tcsReadRGBC(r, g, b, c);
+  long r, g, b, c;
+  readAmbientSubtracted(r, g, b, c);
 
-  float rgbc[4] = { (float)r, (float)g, (float)b, (float)c };
-  bool predBlue = classifier_is_blue(rgbc);
+  bool predBlue = classifyDisc(c) != 0;
   bool expBlue  = expectedColor(x, y) != 0;
   bool ok = (predBlue == expBlue);
 
@@ -201,7 +229,10 @@ bool started = false;
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200);
+  // Serial0 owns D0/D1 by default on the Nano ESP32; hand them to Serial1 so
+  // the GRBL link keeps its identifier and its physical wires.
+  Serial0.end();
+  Serial1.begin(115200, SERIAL_8N1, D0, D1);
   while (!Serial);
 
   initGrid();
@@ -211,6 +242,8 @@ void setup() {
   pinMode(TCS_S2, OUTPUT);
   pinMode(TCS_S3, OUTPUT);
   pinMode(TCS_OUT, INPUT);
+  pinMode(TCS_LED, OUTPUT);
+  digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
   tcsSelect(TCS_CLEAR);

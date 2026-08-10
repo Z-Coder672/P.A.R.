@@ -10,11 +10,11 @@
 // at REST (the sanctioned "straight up on either edge" move). The servo only
 // actuates while the carriage is stationary.
 //
-// Production bit-banged-UART -> ServoNano servo path. Robust+logged GRBL handling
+// Production hardware-UART -> ServoNano servo path. Robust+logged GRBL handling
 // (retries error:N, parks+halts with a printed cause on ALARM/stall).
 
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 402.0f;
+const float Y_TRAVEL = 412.0f;
 const float X_LEFT  = -775.0f;  // left edge (main visible here at Y~top); inside -X soft limit
 const float X_RIGHT = -31.0f;   // rightmost disc column (col 36) — "all the way right"
 const float Y_TOP   = -3.0f;    // near top (Y=0 is the +Y soft limit)
@@ -26,16 +26,31 @@ const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 
-const int SERVO_TX_PIN = 9;
-const int SERVO_TX_BIT_US = 102;
-void servoTxByte(uint8_t b) {
-  noInterrupts();
-  digitalWrite(SERVO_TX_PIN, LOW); delayMicroseconds(SERVO_TX_BIT_US);
-  for (int i = 0; i < 8; i++) { digitalWrite(SERVO_TX_PIN, (b >> i) & 1); delayMicroseconds(SERVO_TX_BIT_US); }
-  digitalWrite(SERVO_TX_PIN, HIGH); interrupts();
-  delayMicroseconds(SERVO_TX_BIT_US);
-}
-void servoTxLine(int us) { char b[12]; int n = snprintf(b, sizeof(b), "%d\n", us); for (int i=0;i<n;i++) servoTxByte((uint8_t)b[i]); }
+const int SERVO_TX_PIN = D9;
+// PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
+// with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The
+// ESP32-S3 GPIO matrix routes a real UART to any pin, so the link is now
+// hardware Serial2 TX on the SAME physical D9 wire -- same 9600 8N1 framing, no
+// ISR blackout, no bit-period tuning. RX is unused (-1): the link is still
+// one-way; the ack is the separate D2 level line.
+// The link is ONE-WAY with no ack, so a dropped byte silently LOSES a command
+// and the arm simply stays where it was. That broke the flip arm once: a lost
+// REST left it at ENGAGE, and flipDisc then ran both X strokes with the arm
+// buried in the board. A receiver-side check cannot help -- a command that never
+// arrives cannot be rejected -- so every command is sent SERVO_TX_REPEATS times.
+// writeMicroseconds() is idempotent, so the repeats are free: re-commanding the
+// position the servo already holds does nothing. Losing a command now takes
+// SERVO_TX_REPEATS independent dropouts instead of one.
+//
+// The repeats also fix LATE application: if only the trailing newline is lost,
+// the stranded digits sit in the ServoNano's buffer until the NEXT command's
+// leading newline flushes them -- which without repeats is up to a full settle
+// period later, i.e. after the stroke has already started. The next repeat
+// flushes them SERVO_TX_REPEAT_GAP_MS later instead.
+const int SERVO_TX_REPEATS = 3;
+const int SERVO_TX_REPEAT_GAP_MS = 6;
+
+void servoTxLine(int us) { char b[12]; snprintf(b, sizeof(b), "\n%d\n", us); for (int r=0;r<SERVO_TX_REPEATS;r++) { Serial2.print(b); Serial2.flush(); if (r+1<SERVO_TX_REPEATS) delay(SERVO_TX_REPEAT_GAP_MS); } }
 void writeServoUs(int us, int s) { servoTxLine(us); delay(s); }
 void cycleServo() {
   writeServoUs(SERVO_US_ENGAGE,  SERVO_90_DEG_SETTLE_MS);
@@ -92,8 +107,11 @@ unsigned long iter = 0, startMs = 0;
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200);
-  pinMode(SERVO_TX_PIN, OUTPUT); digitalWrite(SERVO_TX_PIN, HIGH);
+  // Serial0 owns D0/D1 by default on the Nano ESP32; hand them to Serial1 so
+  // the GRBL link keeps its identifier and its physical wires.
+  Serial0.end();
+  Serial1.begin(115200, SERIAL_8N1, D0, D1);
+  Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
   while (!Serial && millis() < 3000) ;
   servoTxLine(SERVO_US_REST);
   delay(2000); while (Serial1.available()) Serial1.read();
