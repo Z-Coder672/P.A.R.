@@ -104,7 +104,21 @@ const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
 // ~20° and changing scanning behaviour as a side effect of a FLIP change. So it
 // is PINNED to its old absolute value. If the sweep ever needs retuning, retune
 // this literal directly; do not re-derive it from RELEASE.
-const int SERVO_US_SCAN = 889;  // ~33.5°; was SERVO_US_RELEASE - SERVO_US_12_5_DEG at RELEASE=1018
+// CHANGED 2026-08-10: the scan now runs with the arm PARKED AT REST.
+// It was 889µs (~33.5°), a deliberately dropped arm that brushed the board so
+// half-rotated stage-1 squisks got nudged through as scanGrid swept past. That
+// secondary settling job is now abandoned: the arm stays up for the whole scan.
+// Consequences, both intended:
+//   * the "carriage moves only with the servo at REST" invariant now holds
+//     trivially for the entire scan, not just its entry and the rehome — the
+//     dropped arm dragged across a populated board is what snapped the flip arm.
+//   * half-rotated discs are NO LONGER nudged during scanning, so a disc left
+//     mid-rotation stays mid-rotation until the check pass re-flips it. If
+//     ambiguous reads start showing up on cells that were mid-rotation, this is
+//     why — restore a value above REST rather than re-deriving from RELEASE.
+// Kept as its own constant (rather than replacing the call sites) so the BOOT
+// line still reports the scan angle a run actually used.
+const int SERVO_US_SCAN = SERVO_US_REST;   // 544µs, arm parked
 const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 // Extra travel on the CATCH stroke — the one that runs with the arm down at
@@ -582,12 +596,25 @@ char lastErrorCmd[MAX_CMD_LEN] = "";
 bool inStartupPhase = false;
 volatile bool grblStartupFault = false;
 
-// True when gridState[] reflects a scan that's still trustworthy — i.e.
-// nothing has happened since that could have disturbed the board (no $1=0
-// idle, no power cycle). Set after each scanGrid() completes, cleared right
-// before the motors-off idle at the end of a job. Lets us skip the redundant
-// re-scan on the first job after boot.
+// True when gridState[] is trustworthy enough to draw against without a fresh
+// scan. Set after each scanGrid() completes; at the end of a job it is carried
+// over only when gridStateFromScan says the state is still *measured* (see
+// below). Lets us skip the redundant re-scan on the first job after boot, and
+// after any job whose last board-touching action was a scan.
 bool gridStateFresh = false;
+
+// True when gridState[] came straight from a scanGrid() and nothing has flipped
+// a disc since — i.e. it is a measured picture of the board, not one inferred
+// from the flips we *believe* landed. Cleared by displayBitmap() as soon as it
+// commits to flipping anything. The check pass frequently ends with a scan and
+// no fix (<= CHECK_FIX_MAX_SKIP wrong), and in that case this stays true, so
+// the next job can reuse that scan instead of paying another ~70 min sweep.
+bool gridStateFromScan = false;
+
+// True when the steppers were released ($1=0) since the last homing cycle, so
+// the gantry may have been nudged and must re-home before any motion. scanGrid()
+// homes on its own; this covers the path where the scan is skipped.
+bool needsRehome = false;
 
 // Park the servo at REST before any reset so the gantry doesn't reboot with the
 // arm mid-flip — leaving it engaged can foul the next homing pass. The 5V Nano
@@ -736,6 +763,7 @@ void grblAlarmRecover() {
 
   // The board state is unknown after an ALARM — force a re-scan next job.
   gridStateFresh = false;
+  gridStateFromScan = false;
   plog::log("ALARM recovery complete");
 }
 
@@ -1075,6 +1103,7 @@ void rehome() {
   sendGcode("G21");
   sendGcode("G90");
   waitForIdle();
+  needsRehome = false;
 }
 
 // One full scan sweep: re-home, drop the flip arm to SCAN, sweep the sensor over
@@ -1166,6 +1195,7 @@ void scanGrid() {
   // Scan done (and any stage-1 squisks swept through) — park the flip arm at REST.
   writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
   gridStateFresh = true;
+  gridStateFromScan = true;
 }
 
 // `G4 P0` is a dwell that GRBL syncs through the planner before acking, so
@@ -1368,6 +1398,10 @@ int displayBitmap(uint8_t* bitmap) {
   }
   if (firstY < 0) return 0;
   plog::logf("dB band y=%d..%d", lastY, firstY);
+  // From here on we will move discs, so gridState[] stops being a measured scan
+  // and becomes what we *believe* the flips achieved. Cleared before the first
+  // flip so an abort mid-sweep can't leave the stale "measured" claim standing.
+  gridStateFromScan = false;
 
   int flipped = 0;
   bool ltr = true;
@@ -1725,15 +1759,25 @@ void loop() {
         pendingGalleryId[sizeof(pendingGalleryId) - 1] = '\0';
       }
 
-      // Re-scan the board before each job IF the board state could have
-      // drifted since we last scanned. The post-display idle drops motors
-      // ($1=0) and sleeps 10 min — during that window the gantry can lose
-      // position and discs can be touched, so gridStateFresh gets cleared.
-      // The very first job after boot reuses setup()'s scan and skips this.
+      // Re-scan the board before each job IF gridState[] isn't already a
+      // trustworthy *measured* picture of the discs. Two ways it can be:
+      //   * the very first job after boot reuses setup()'s scan;
+      //   * the previous job ended on a scan with no fix after it (check pass
+      //     found <= CHECK_FIX_MAX_SKIP wrong, or the draw flipped nothing at
+      //     all) — see the end-of-job carry-over below.
+      // Any flip since that scan makes the state inferred rather than measured,
+      // so we pay the full sweep again.
       if (!gridStateFresh) {
         plog::log("scanGrid begin");
         scanGrid();
       } else {
+        // The scan homes on its own; skipping it means we still owe a homing
+        // cycle if the steppers were released for the idle (the gantry can be
+        // nudged with the motors off).
+        if (needsRehome) {
+          plog::log("rehome (scan skipped)");
+          rehome();
+        }
         plog::log("scanGrid skipped (state fresh)");
       }
 
@@ -1775,10 +1819,14 @@ void loop() {
       // poller grab a photo mid-draw.
       sendSnapshotRequest(pendingGalleryId[0] ? pendingGalleryId : galleryId.c_str());
       onDisplayComplete();
-      // Motors are about to go off and the gantry will be idle for 10 min —
-      // anything could happen to the board in that window, so the next job
-      // must re-scan.
-      gridStateFresh = false;
+      // Carry the scan over to the next job when gridState[] is still a
+      // measured picture of the board — i.e. the last thing that touched the
+      // discs was a scan, with no fixing after it (check pass re-scanned and
+      // found <= CHECK_FIX_MAX_SKIP wrong, or the draw itself flipped nothing).
+      // That scan already describes the final board, so re-running it next job
+      // costs ~70 min to learn what we just measured. If anything flipped after
+      // the last scan, the state is only inferred and the next job re-scans.
+      gridStateFresh = gridStateFromScan;
       // Release steppers for the long idle. $1=0 only takes effect on the
       // next idle transition, so kick a tiny jog (X-0.1, away from the X=0
       // soft limit) to trigger the disable. Reassert G21/G90 first — error:2
@@ -1787,6 +1835,8 @@ void loop() {
       sendGcode("G21");
       sendGcode("G90");
       sendGcode("$1=0");
+      // Steppers are about to go limp — whatever happens next must home first.
+      needsRehome = true;
       // $1=0 actually changes the value (255->0), so grbl commits the settings
       // block to the Mega's EEPROM — and each changed byte runs under cli() with
       // a busy-wait on EEPE (a few ms with the Serial1 RX ISR dead). Anything

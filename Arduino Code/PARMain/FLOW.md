@@ -26,7 +26,7 @@
 ## Main Loop (`loop`)
 
 ```
-poll server → got bitmap? → re-scan board → display it → check pass → snapshot request → mark complete → 10 min sleep → repeat
+poll server → got bitmap? → re-scan board (skipped if last action was a clean scan) → display it → check pass → snapshot request → mark complete → 10 min sleep → repeat
              no bitmap?  → wait 10s → repeat
 ```
 
@@ -40,13 +40,17 @@ poll server → got bitmap? → re-scan board → display it → check pass → 
 
 **3. Decode** — base64 → 84 bytes = 666 bits (last 6 bits are unused padding), one bit per disc
 
-**4. `scanGrid()`** — re-home and re-read every cell with the TCS3200. The 10-min idle disables steppers, so position can drift and discs may have been moved; this reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ. The reading sweep runs with the **flip arm dropped to SCAN (`SERVO_US_SCAN` = 889 µs, ~33.5°)** instead of parked at REST: the sensor trails the flip head by `SCAN_OFFSET_X` (−24.005 mm ≈ one cell pitch), so the lowered arm brushes the whole board during the serpentine and pushes through any squisk accidentally left at stage 1 (90°, half-rotated). Homing moves still run with the arm at REST (the initial home is before the drop; the mid-scan rehome lifts it first) — a dropped arm dragged diagonally across the populated board is what snapped the flip arm before. The arm is parked back at REST as soon as the scan completes. Each cell is read with **LED ambient-subtraction** and classified by a simple clear-channel threshold (see Color Classification below); ambient subtraction removed the old room-light "blown regime", so the former `SCAN_C_CEILING` guard / sensor re-init recovery is gone.
+**4. `scanGrid()` (conditional)** — re-home and re-read every cell with the TCS3200. **Skipped when `gridStateFresh` is set**, i.e. when `gridState[]` is already a *measured* picture of the board: on the first job after boot (reusing `setup()`'s scan), and after any job whose last board-touching action was a scan with no fixing after it — the check pass re-scanned and found ≤`CHECK_FIX_MAX_SKIP` wrong, or the draw flipped nothing at all (`gridStateFromScan`, carried across the idle at the end of the job). That scan already describes the final board, so repeating it costs ~70 min to learn what was just measured. Any flip after a scan makes the state *inferred* rather than measured (`displayBitmap` clears `gridStateFromScan` before its first flip), and the next job re-scans. When the scan is skipped, `rehome()` still runs if `needsRehome` is set — the end-of-job `$1=0` releases the steppers, so the gantry may have been nudged.
+
+Otherwise the full sweep runs. It reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ. The reading sweep runs with the **flip arm parked at REST** (`SERVO_US_SCAN` = `SERVO_US_REST` = 544 µs, changed 2026-08-10). It used to be dropped to ~33.5° so that — since the sensor trails the flip head by `SCAN_OFFSET_X` (−24.005 mm ≈ one cell pitch) — the lowered arm brushed the board and pushed through any squisk left at stage 1 (90°, half-rotated). That secondary settling job is abandoned: the arm now stays up for the whole scan, so the "carriage moves only with the servo at REST" invariant holds trivially (a dropped arm dragged across a populated board is what snapped the flip arm before), and half-rotated discs are no longer nudged during scanning — one left mid-rotation stays mid-rotation until the check pass re-flips it. Each cell is read with **LED ambient-subtraction** and classified by a simple clear-channel threshold (see Color Classification below); ambient subtraction removed the old room-light "blown regime", so the former `SCAN_C_CEILING` guard / sensor re-init recovery is gone.
 
 **5. `displayBitmap()`** — over the band of rows that contain at least one differing cell, flip cells where `desired bit ≠ gridState`. Rows with no differing cells are **skipped entirely** (no move to them — the next flipping row is still entered via `moveToYSafe`, so Y travel stays at an X soft-limit). Returns the number of cells flipped (= cells that were wrong vs the target), used to gate the check pass.
 
 **5b. Check pass** — after the first `displayBitmap()` completes, conditionally re-scan + re-fix. Two short-circuits, both keyed on `CHECK_FIX_MAX_SKIP` (=5):
 - **First draw flipped ≤5 cells** → tiny job, few chances to fail → **skip the whole check pass** (no re-scan, no re-fix).
 - **Otherwise** → re-run `scanGrid()` (reseeds `gridState[]` from the physical board, catching discs that didn't flip cleanly or were misclassified), then count mismatches vs the target. Re-run `displayBitmap()` **only if >5 cells are still wrong**; ≤5 are left as-is. The color sensor is ~99.5% accurate, so a full 666-cell scan misreads ~3 cells on average — ≤5 mismatches sit within that noise floor, so re-flipping them would more likely flip a *correct* disc than fix a real miss. Tolerating ≤5 doesn't lower display accuracy. One corrective pass at most.
+
+When the check pass ends on that skip-the-fix branch, its scan is the last thing that touched the board — so it is carried over as the *next* job's scan (see step 4) instead of being thrown away.
 
 **6. `flipDisc(x, y, catchByNextMove, inverted)`** — two-stage 180° rotation (+ optional second catch)
 
