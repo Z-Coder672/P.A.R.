@@ -4,6 +4,7 @@
 #include <base64.hpp>
 #include <esp_system.h>      // esp_restart()
 #include <time.h>            // NTP wall clock for the daily cadence
+#include "esp_sntp.h"        // sync-notification callback — clockValid() anchor
 #include <Wire.h>            // I2C for the VL53L4CD (A4/A5)
 #include <VL53L4CD.h>        // Pololu lib — daily lidar standoff scan
 #include <LittleFS.h>        // cadence record; shares plog's "ffat" mount
@@ -645,6 +646,11 @@ bool gridStateFromScan = false;
 // the gantry may have been nudged and must re-home before any motion. scanGrid()
 // homes on its own; this covers the path where the scan is skipped.
 bool needsRehome = false;
+// GRBL brought up + homed this boot. False until grblBringup() runs — which
+// loop() only calls once cadenceGate() says the rig is clear to operate
+// (trusted NTP clock AND daytime). Never home from setup(): a nocturnal or
+// clockless reset must not move the gantry (review F2/F3).
+bool grblHomed = false;
 
 // Park the servo at REST before any reset so the gantry doesn't reboot with the
 // arm mid-flip — leaving it engaged can foul the next homing pass. The 5V Nano
@@ -1538,29 +1544,54 @@ const int LIDAR_SCAN_CUTOFF_HOUR = 18;   // 6:00 pm
 
 static bool timeConfigured = false;
 
+// HARD RULE: time comes from a TIME SERVER, never from the internal clock
+// alone. The RTC only interpolates between SNTP fixes, so a trusted clock
+// requires (a) at least one fix this boot and (b) a fix recent enough that the
+// interpolation is still anchored. onNtpSync() stamps every fix SNTP lands;
+// clockValid() enforces both. Without a valid clock the rig NEVER MOVES — no
+// polling, no scanning, not even homing (see cadenceGate / grblBringup).
+static volatile time_t lastNtpSyncEpoch = 0;
+static void onNtpSync(struct timeval*) { lastNtpSyncEpoch = time(nullptr); }
+// Max fix age. Must exceed the longest legitimate NTP-less stretch — the 16 h
+// past-cutoff sleep with WiFi dropped — with margin; 24 h keeps "one missed
+// nightly re-sync" from parking the rig, while a router dead for a day does
+// park it (that is the intent: no fresh server time, no motion).
+const time_t CLOCK_MAX_SYNC_AGE_S = 24L * 3600L;
+
+bool clockValid() {
+  time_t now = time(nullptr);
+  if (lastNtpSyncEpoch == 0) return false;          // never synced this boot
+  if (now <= TIME_VALID_FLOOR) return false;        // clock is garbage
+  if (now - lastNtpSyncEpoch > CLOCK_MAX_SYNC_AGE_S) return false;  // fix too old
+  return true;
+}
+
 // Start SNTP. Idempotent — configTzTime() is cheap but re-running it restarts
 // the sync, so it is guarded. Called once WiFi is up (in setup and at the top
-// of loop); SNTP then re-polls on its own and survives a WiFi bounce.
+// of loop); SNTP then re-polls on its own and survives a WiFi bounce. The
+// notification callback must be registered BEFORE the first sync can land.
 void timeBegin() {
   if (timeConfigured) return;
+  sntp_set_time_sync_notification_cb(onNtpSync);
   configTzTime(PAR_TZ, NTP_SERVER_1, NTP_SERVER_2);
   timeConfigured = true;
   plog::logf("ntp start tz=%s", PAR_TZ);
 }
 
-// Local broken-down time, or false if the clock has not synced yet. EVERY
-// cadence path goes through this — see TIME_VALID_FLOOR.
+// Local broken-down time, or false unless the clock is currently trusted
+// (synced from a time server, recently — see clockValid). EVERY cadence and
+// motion-gating path goes through this.
 bool localNow(struct tm& out) {
+  if (!clockValid()) return false;
   time_t now = time(nullptr);
-  if (now <= TIME_VALID_FLOOR) return false;
   localtime_r(&now, &out);
   return true;
 }
 
-// Bounded wait for the first SNTP fix, used once at boot so the boot-time
-// night check has a clock to look at. Bounded because a failure here must not
-// wedge the rig: if the clock never arrives we simply run the pre-cadence
-// behaviour (poll, draw, linger) until it does.
+// Bounded wait for the first SNTP fix, used once at boot so the first gate
+// pass has a clock to look at. Bounded because a dead network must not wedge
+// setup() forever — but failure here does NOT unlock anything: with no valid
+// clock the loop holds parked (no motion, no polling) and just keeps retrying.
 bool timeWaitForSync(unsigned long timeout_ms) {
   unsigned long t0 = millis();
   struct tm t;
@@ -1573,7 +1604,7 @@ bool timeWaitForSync(unsigned long timeout_ms) {
     }
     delay(500);
   }
-  plog::logf("ntp NOT synced after %lu ms - cadence idle", timeout_ms);
+  plog::logf("ntp NOT synced after %lu ms - rig holds parked", timeout_ms);
   return false;
 }
 
@@ -1749,20 +1780,25 @@ void cadenceLoadRecord() {
 // plog's rotation. A brownout mid-swap can lose the record, and losing it costs
 // exactly one extra scan.
 void cadenceSaveRecord() {
-  if (!cadenceFsReady()) return;
+  // The RAM copy is complete and coherent no matter what the flash write does,
+  // so it is marked valid UP FRONT — that is the RAM-only fallback (review
+  // F6): with a broken FS the schedule still knows today's scan ran, and the
+  // failure costs one extra scan after the next reboot instead of a 50-minute
+  // sweep on every gate pass all day.
   cadenceRec.checksum = cadenceChecksum(cadenceRec);
+  cadenceRecValid = true;
+  if (!cadenceFsReady()) return;
   File t = LittleFS.open(CADENCE_TMP, "w");
-  if (!t) { plog::log("cadence: record open failed"); return; }
+  if (!t) { plog::log("cadence: record open failed (RAM-only until reboot)"); return; }
   size_t wrote = t.write((const uint8_t*)&cadenceRec, sizeof(LidarScanRecord));
   t.close();
   if (wrote != sizeof(LidarScanRecord)) {
-    plog::logf("cadence: record short write %u", (unsigned)wrote);
+    plog::logf("cadence: record short write %u (RAM-only until reboot)", (unsigned)wrote);
     LittleFS.remove(CADENCE_TMP);
     return;
   }
   LittleFS.remove(CADENCE_PATH);
   LittleFS.rename(CADENCE_TMP, CADENCE_PATH);
-  cadenceRecValid = true;
   plog::logf("cadence: record saved y%d d%d ok%lu",
              (int)(cadenceRec.year + 1900), (int)cadenceRec.yday,
              (unsigned long)cadenceRec.cellsOk);
@@ -1803,6 +1839,10 @@ void runDailyLidarScan(const struct tm& day) {
 
   if (lidarEnsure()) {
     cadenceRec.sensorOk = 1;
+    // The gate runs this scan before loop() reaches its grblBringup() call, so
+    // the first motion of a fresh boot can be this very sweep — bring GRBL up
+    // (homing) first. No-op every day thereafter.
+    grblBringup();
     rehome();
     // Explicit park even though every path into here leaves it parked — the
     // arm's position is the one thing a 50-minute sweep must not get wrong.
@@ -1933,7 +1973,11 @@ void sleepUntilMorning() {
              t.tm_hour, t.tm_min, LIDAR_SCAN_HOUR);
 
   writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
-  if (!needsRehome) releaseSteppers();      // needsRehome set <=> already limp
+  // Release only if GRBL has been brought up this boot: before grblBringup()
+  // the Mega is in its power-on alarm state and any G-code would error:9 into
+  // the retry-then-reset path. An un-brought-up GRBL has its steppers
+  // unpowered anyway — there is nothing to release.
+  if (grblHomed && !needsRehome) releaseSteppers();  // needsRehome set <=> already limp
 
   // Backstop against a wedged/garbage clock: at most 17 h, which is longer than
   // the longest legitimate sleep (18:00 -> 10:00 = 16 h, the past-cutoff case)
@@ -1946,9 +1990,8 @@ void sleepUntilMorning() {
   while (millis() - t0 < MAX_SLEEP_MS) {
     delay(TICK_MS);
     ticks++;
-    time_t now = time(nullptr);
-    if (now <= TIME_VALID_FLOOR) continue;  // clock lost — hold under the backstop
-    if (now >= wake) break;
+    if (!clockValid()) continue;            // clock lost/stale — hold under the backstop
+    if (time(nullptr) >= wake) break;
     if ((ticks % 120) == 0 && localNow(t))  // ~hourly heartbeat so the log shows life
       plog::logf("cadence: sleeping %02d:%02d", t.tm_hour, t.tm_min);
   }
@@ -1958,45 +2001,95 @@ void sleepUntilMorning() {
   timeBegin();
 }
 
-// The gate every loop iteration passes through before it is allowed to poll.
-// Order matters: sleep first, then scan — so the morning wake always lands on
-// the scan check and the day starts with fresh standoff data.
-void cadenceGate() {
+// The clear-to-operate gate. Every loop iteration passes through here before
+// it is allowed to poll — or MOVE. Returns true only when the rig holds a
+// trusted time-server clock AND is inside the awake window with today's
+// obligations met; false means "stay parked, do nothing, retry later".
+//
+// HARD RULE (review F3): no valid NTP-anchored clock => no motion of any
+// kind — no polling, no scanning, not even homing. There is deliberately no
+// "uncadenced" fallback anymore.
+bool cadenceGate() {
   struct tm t;
   if (!localNow(t)) {
-    // No wall clock (NTP not synced yet, or the network never came up). Fall
-    // back to the pre-cadence behaviour rather than acting on a garbage time:
-    // running the schedule off an unset RTC would sleep at the wrong hour and
-    // stamp a scan against 1970.
     static unsigned long lastWarn = 0;
     if (lastWarn == 0 || millis() - lastWarn > 300000UL) {
       lastWarn = millis();
-      plog::log("cadence: no valid clock - running uncadenced");
+      plog::log("cadence: no trusted clock - holding parked (no motion, no polling)");
     }
-    return;
+    return false;
   }
 
-  if (isNightHour(t.tm_hour)) {
+  // Sleep whenever it is night, OR today's scan is still owed at/after the
+  // 18:00 cutoff (the day is written off — scan at 10:00 tomorrow instead of
+  // sweeping ~50 min into the evening). A WHILE, not an if (review F1): the
+  // condition is re-tested after EVERY wake, so a spurious exit from
+  // sleepUntilMorning() — e.g. the 17 h backstop firing after SNTP stepped the
+  // clock backwards — lands straight back in sleep instead of falling through
+  // to a scan and a poll at 04:00.
+  while (isNightHour(t.tm_hour) ||
+         (!lidarScanDoneOn(t) && t.tm_hour >= LIDAR_SCAN_CUTOFF_HOUR)) {
     sleepUntilMorning();
-    if (!localNow(t)) return;               // woke on the backstop with no clock
+    if (!localNow(t)) return false;         // woke with no trusted clock: hold parked
   }
 
-  // Today's scan hasn't run — covers both "it just turned 10:00" and "we
-  // booted at 14:00 and owe today's scan". But an owed scan is only STARTED
-  // before the 18:00 cutoff: later than that, the day is written off — sleep
-  // to 10:00 and scan then, rather than sweeping ~50 min into the evening.
+  // Daytime, before the cutoff, scan owed — covers "it just turned 10:00",
+  // "we booted at 14:00", and the morning after a written-off day.
   if (!lidarScanDoneOn(t)) {
-    if (t.tm_hour < LIDAR_SCAN_CUTOFF_HOUR) {
-      runDailyLidarScan(t);
-    } else {
-      sleepUntilMorning();
-      // Morning: run the (now yesterday's-owed, today-due) scan immediately so
-      // the wake still lands on fresh standoff data. Guarded exactly like the
-      // normal path — a backstop wake with a dead clock must not start a sweep.
-      if (localNow(t) && !lidarScanDoneOn(t) && t.tm_hour < LIDAR_SCAN_CUTOFF_HOUR)
-        runDailyLidarScan(t);
-    }
+    runDailyLidarScan(t);
+    // The sweep runs ~50 min (review F4): re-verify before letting the caller
+    // poll — a mid-scan SNTP step could have landed us inside the night
+    // window. Returning false re-enters this gate, which then sleeps.
+    if (!localNow(t) || isNightHour(t.tm_hour)) return false;
   }
+  return true;
+}
+
+// GRBL bring-up + homing, moved OUT of setup() (review F2/F3). loop() calls
+// this on the first pass where cadenceGate() says the rig is clear to operate,
+// so a nocturnal or clockless reset sits parked — servo at REST, not one byte
+// of G-code — until 10:00 with a trusted clock. Retries on GRBL error/ALARM by
+// bouncing Serial1 (forces GRBL to re-init its half of the link) and re-running
+// the full startup sequence; without that, a power-on alarm during $H would
+// wedge the rig until a manual reset.
+void grblBringup() {
+  if (grblHomed) return;
+  delay(2000);  // GRBL boot margin — cheap, and covers a Mega that reset late
+
+  inStartupPhase = true;
+  for (int attempt = 1;; attempt++) {
+    grblStartupFault = false;
+    qHead = qTail = 0;
+    bufferFill = 0;
+    while (Serial1.available()) Serial1.read();
+
+    plog::logf("homing attempt %d", attempt);
+    sendGcode("$H");
+    waitForIdle();
+    if (grblStartupFault) goto restart_grbl;
+
+    // $1=255 keeps steppers energized while idle so the gantry holds position
+    // between motions; we drop back to $1=0 + a tiny jog at job end to release.
+    sendGcode("$1=255");
+    waitForIdle();  // sync past the $1 EEPROM write before pipelining more (see rehome)
+    if (grblStartupFault) goto restart_grbl;
+    sendGcode("G21");
+    sendGcode("G90");
+    waitForIdle();
+    if (grblStartupFault) goto restart_grbl;
+
+    plog::log("homed");
+    break;
+
+restart_grbl:
+    plog::log("GRBL restart + retry homing");
+    Serial1.end();
+    delay(200);
+    Serial1.begin(115200, SERIAL_8N1, D0, D1);
+    delay(2000);  // GRBL boot wait after re-opening Serial1
+  }
+  inStartupPhase = false;
+  grblHomed = true;
 }
 
 void setup() {
@@ -2086,44 +2179,11 @@ void setup() {
   // (ColorSensorTest / ScanColorAmbientTest) before trusting a print.
   initColorSensor();
 
-  delay(2000);  // GRBL boot wait (Serial1) + servo settle
-
-  // Retry homing on GRBL error/ALARM: bounce Serial1 (forces GRBL to re-init
-  // its half of the link) and re-run the full startup sequence. Without this,
-  // a power-on alarm during $H would wedge the rig until a manual reset.
-  inStartupPhase = true;
-  for (int attempt = 1;; attempt++) {
-    grblStartupFault = false;
-    qHead = qTail = 0;
-    bufferFill = 0;
-    while (Serial1.available()) Serial1.read();
-
-    plog::logf("homing attempt %d", attempt);
-    sendGcode("$H");
-    waitForIdle();
-    if (grblStartupFault) goto restart_grbl;
-
-    // $1=255 keeps steppers energized while idle so the gantry holds position
-    // between motions; we drop back to $1=0 + a tiny jog at job end to release.
-    sendGcode("$1=255");
-    waitForIdle();  // sync past the $1 EEPROM write before pipelining more (see rehome)
-    if (grblStartupFault) goto restart_grbl;
-    sendGcode("G21");
-    sendGcode("G90");
-    waitForIdle();
-    if (grblStartupFault) goto restart_grbl;
-
-    plog::log("homed");
-    break;
-
-restart_grbl:
-    plog::log("GRBL restart + retry homing");
-    Serial1.end();
-    delay(200);
-    Serial1.begin(115200, SERIAL_8N1, D0, D1);
-    delay(2000);  // GRBL boot wait after re-opening Serial1
-  }
-  inStartupPhase = false;
+  // GRBL bring-up + homing happens LAZILY in loop() via grblBringup(), never
+  // here (review F2/F3): homing is full-travel motion, and setup() runs on
+  // every reset — including a brownout at 02:00 or a boot with no NTP. The
+  // gantry must not move until cadenceGate() confirms a trusted clock and
+  // daytime.
 
   // scanGrid();
 
@@ -2135,9 +2195,9 @@ restart_grbl:
   client.setHttpResponseTimeout(15000);
 
   // Daily cadence bring-up. WiFi has to be up first because the wall clock
-  // comes from NTP; the wait is bounded so a dead network delays the schedule
-  // instead of blocking the rig (loop()'s gate re-checks every iteration and
-  // starts the cadence as soon as a clock appears).
+  // comes from NTP; the wait is bounded only so a dead network can't wedge
+  // setup() — failure unlocks nothing. With no time-server fix, loop()'s gate
+  // holds the rig parked (no motion, no polling) and retries until one lands.
   ensureWiFi();
   timeBegin();
   timeWaitForSync(30000);
@@ -2269,10 +2329,17 @@ void sendSnapshotRequest(const char* galleryId) {
 void loop() {
   ensureWiFi();
   timeBegin();
-  // Night sleep and the daily lidar scan happen here, BEFORE any server
-  // ingestion — so a rig that boots at 2 am sleeps instead of printing, and the
-  // first poll of the day happens on freshly-scanned standoff data.
-  cadenceGate();
+  // Clear-to-operate gate, BEFORE any motion or server ingestion: trusted
+  // NTP clock + awake window + today's lidar scan. A rig that boots at 2 am
+  // sleeps; a rig with no time-server fix holds parked and just retries here
+  // (HARD RULE: no server time => no motion, not even homing).
+  if (!cadenceGate()) {
+    delay(30000);
+    return;
+  }
+  // First clear daytime pass since boot: bring GRBL up and home now. No-op on
+  // every later pass.
+  grblBringup();
   plog::log("poll start");
   int status = 0;
   String galleryId = "";
