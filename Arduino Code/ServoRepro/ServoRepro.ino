@@ -7,7 +7,7 @@
 // flipDisc with second-catch OFF (so the servo ALWAYS returns to REST between
 // flips). The carriage therefore only ever moves with the servo at REST, except
 // inside a flip — satisfying the hardware-safety rule. Servo is driven via the
-// production bit-banged-UART -> ServoNano path. No WiFi, no sensor, no scan.
+// production hardware-UART -> ServoNano path. No WiFi, no sensor, no scan.
 //
 // Loop alternates a top-row+bottom-row pattern on/off, forcing 74 flips per pass
 // with full-width X sweeps at top and bottom and a full-height Y transition
@@ -17,7 +17,7 @@
 const int GRID_W = 37;
 const int GRID_H = 18;
 const float X_TRAVEL = 777.695f;
-const float Y_TRAVEL = 402.0f;
+const float Y_TRAVEL = 412.0f;
 
 // ---- Production servo pulse widths / settles (match PARMain.ino) ----
 const int SERVO_US_REST    = 544;
@@ -26,27 +26,50 @@ const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
+// Inverted flip, applied on LEFT-TO-RIGHT rows: clearing slide -X, catch slide
+// +X. Unwinds the column-rod twist the RTL rows wind in, and its return stroke
+// ends the way the sweep is already heading so the head stops backtracking
+// before the next cell. The flip target shifts right by this much because the
+// arm meets the opposite face of the squisk. Mirrors PARMain.ino.
+const float FLIP_INVERT_OFFSET_X = 11.0f;
 
-// ---- Production bit-banged servo TX (match PARMain.ino exactly) ----
-const int SERVO_TX_PIN = 9;
-const int SERVO_TX_BIT_US = 102;
+// ---- Production servo TX over Serial2 (match PARMain.ino exactly) ----
+const int SERVO_TX_PIN = D9;
 
-void servoTxByte(uint8_t b) {
-  noInterrupts();
-  digitalWrite(SERVO_TX_PIN, LOW);
-  delayMicroseconds(SERVO_TX_BIT_US);
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(SERVO_TX_PIN, (b >> i) & 1);
-    delayMicroseconds(SERVO_TX_BIT_US);
-  }
-  digitalWrite(SERVO_TX_PIN, HIGH);
-  interrupts();
-  delayMicroseconds(SERVO_TX_BIT_US);
-}
+// PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
+// with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The
+// ESP32-S3 GPIO matrix routes a real UART to any pin, so the link is now
+// hardware Serial2 TX on the SAME physical D9 wire -- same 9600 8N1 framing, no
+// ISR blackout, no bit-period tuning. RX is unused (-1): the link is still
+// one-way; the ack is the separate D2 level line.
+// The link is ONE-WAY with no ack, so a dropped byte silently LOSES a command
+// and the arm simply stays where it was. That broke the flip arm once: a lost
+// REST left it at ENGAGE, and flipDisc then ran both X strokes with the arm
+// buried in the board. A receiver-side check cannot help -- a command that never
+// arrives cannot be rejected -- so every command is sent SERVO_TX_REPEATS times.
+// writeMicroseconds() is idempotent, so the repeats are free: re-commanding the
+// position the servo already holds does nothing. Losing a command now takes
+// SERVO_TX_REPEATS independent dropouts instead of one.
+//
+// The repeats also fix LATE application: if only the trailing newline is lost,
+// the stranded digits sit in the ServoNano's buffer until the NEXT command's
+// leading newline flushes them -- which without repeats is up to a full settle
+// period later, i.e. after the stroke has already started. The next repeat
+// flushes them SERVO_TX_REPEAT_GAP_MS later instead.
+const int SERVO_TX_REPEATS = 3;
+const int SERVO_TX_REPEAT_GAP_MS = 6;
+
 void servoTxLine(int us) {
   char buf[12];
-  int n = snprintf(buf, sizeof(buf), "%d\n", us);
-  for (int i = 0; i < n; i++) servoTxByte((uint8_t)buf[i]);
+  snprintf(buf, sizeof(buf), "\n%d\n", us);
+  for (int r = 0; r < SERVO_TX_REPEATS; r++) {
+    Serial2.print(buf);
+    // Block until the last stop bit is actually on the wire, so this call
+    // stays synchronous like the old bit-bang did -- callers time their
+    // settle delay from here.
+    Serial2.flush();
+    if (r + 1 < SERVO_TX_REPEATS) delay(SERVO_TX_REPEAT_GAP_MS);
+  }
 }
 void writeServoUs(int us, int settle_ms) { servoTxLine(us); delay(settle_ms); }
 
@@ -155,15 +178,20 @@ void moveToYSafe(float targetX, float targetY) {
 
 // flipDisc with second-catch OFF: arm always parks at REST at the end, so every
 // inter-cell / inter-row move runs with the servo at REST (hardware-safe rule).
-void flipDisc(int gx, int gy) {
-  moveTo(grid[gy][gx].x, grid[gy][gx].y);
+// `inverted` mirrors the X excursion (see FLIP_INVERT_OFFSET_X) — pass it on
+// left-to-right sweep rows.
+void flipDisc(int gx, int gy, bool inverted) {
+  float fx = grid[gy][gx].x + (inverted ? FLIP_INVERT_OFFSET_X : 0.0f);
+  moveTo(fx, grid[gy][gx].y);
   waitForMotion();
 
   writeServoUs(SERVO_US_ENGAGE, SERVO_90_DEG_SETTLE_MS);
   writeServoUs(SERVO_US_REST,   SERVO_90_DEG_SETTLE_MS);
 
-  float dx = FLIP_OFFSET_X;
-  if (grid[gy][gx].x + dx > 0.0f) dx = -grid[gy][gx].x;
+  // Capped against both soft limits — inverted (LTR) rows slide toward -X_TRAVEL.
+  float dx = inverted ? -FLIP_OFFSET_X : FLIP_OFFSET_X;
+  if (fx + dx > 0.0f) dx = -fx;
+  if (fx + dx < -X_TRAVEL) dx = -X_TRAVEL - fx;
   char cmd[32];
   sendGcode("G91"); snprintf(cmd, sizeof(cmd), "G0 X%.3f", dx);  sendGcode(cmd); sendGcode("G90"); waitForMotion();
 
@@ -199,7 +227,7 @@ void displayBitmap(uint8_t* bitmap) {
         unsigned long el = (millis() - startMs) / 1000UL;
         Serial.print("FLIP x="); Serial.print(x); Serial.print(" y="); Serial.print(y);
         Serial.print(" t="); Serial.print(el); Serial.println("s");
-        flipDisc(x, y);
+        flipDisc(x, y, ltr);  // mirrored flip on LTR rows
         gridState[y][x] = bitmapBit(bitmap, x, y);
       }
     }
@@ -229,9 +257,11 @@ bool patternOn = false;
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(115200);
-  pinMode(SERVO_TX_PIN, OUTPUT);
-  digitalWrite(SERVO_TX_PIN, HIGH);
+  // Serial0 owns D0/D1 by default on the Nano ESP32; hand them to Serial1 so
+  // the GRBL link keeps its identifier and its physical wires.
+  Serial0.end();
+  Serial1.begin(115200, SERIAL_8N1, D0, D1);
+  Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
   while (!Serial && millis() < 3000) ;
 
   servoTxLine(SERVO_US_REST);   // park servo before any motion
