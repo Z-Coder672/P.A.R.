@@ -1531,6 +1531,10 @@ const time_t TIME_VALID_FLOOR = 1735689600;
 // the scan check.
 const int LIDAR_SCAN_HOUR  = 10;   // 10:00 am
 const int NIGHT_START_HOUR = 20;   // 8:00 pm
+// A scan still owed for today is only STARTED before this hour. The sweep runs
+// ~50 min, and a late boot shouldn't spend the evening scanning and then print
+// into the night — at/after 18:00 the rig sleeps to 10:00 and scans then.
+const int LIDAR_SCAN_CUTOFF_HOUR = 18;   // 6:00 pm
 
 static bool timeConfigured = false;
 
@@ -1907,25 +1911,45 @@ void releaseSteppers() {
 void sleepUntilMorning() {
   struct tm t;
   if (!localNow(t)) return;                 // no clock: never sleep blind
-  plog::logf("cadence: night sleep at %02d:%02d until %02d:00",
+
+  // Wake target: the NEXT 10:00 local, as an epoch. An epoch compare rather
+  // than "hour left the night window" because this is no longer only entered
+  // at night — the past-cutoff owed-scan case enters as early as 18:00, where
+  // an hour-window test would bounce straight out. mktime with tm_isdst = -1
+  // re-resolves DST for the target day, so a sleep spanning the spring/fall
+  // change still ends at 10:00 wall-clock.
+  struct tm tgt = t;
+  tgt.tm_hour = LIDAR_SCAN_HOUR;
+  tgt.tm_min = 0;
+  tgt.tm_sec = 0;
+  tgt.tm_isdst = -1;
+  time_t wake = mktime(&tgt);
+  if (wake <= time(nullptr)) {              // 10:00 already passed today -> tomorrow's
+    tgt.tm_mday += 1;                       // mktime normalizes month/year rollover
+    tgt.tm_isdst = -1;
+    wake = mktime(&tgt);
+  }
+  plog::logf("cadence: sleep at %02d:%02d until %02d:00",
              t.tm_hour, t.tm_min, LIDAR_SCAN_HOUR);
 
   writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
   if (!needsRehome) releaseSteppers();      // needsRehome set <=> already limp
 
-  // Backstop against a wedged/garbage clock: at most 15 h, which is longer than
-  // the longest legitimate night (20:00 -> 10:00 = 14 h) and short enough that
-  // a stuck clock costs at most one day rather than forever.
-  const unsigned long MAX_SLEEP_MS = 15UL * 60UL * 60UL * 1000UL;
+  // Backstop against a wedged/garbage clock: at most 17 h, which is longer than
+  // the longest legitimate sleep (18:00 -> 10:00 = 16 h, the past-cutoff case)
+  // and short enough that a stuck clock costs at most one day rather than
+  // forever.
+  const unsigned long MAX_SLEEP_MS = 17UL * 60UL * 60UL * 1000UL;
   const unsigned long TICK_MS = 30000;
   unsigned long t0 = millis();
   unsigned long ticks = 0;
   while (millis() - t0 < MAX_SLEEP_MS) {
     delay(TICK_MS);
     ticks++;
-    if (!localNow(t)) continue;             // clock lost — hold under the backstop
-    if (!isNightHour(t.tm_hour)) break;
-    if ((ticks % 120) == 0)                 // ~hourly heartbeat so the log shows life
+    time_t now = time(nullptr);
+    if (now <= TIME_VALID_FLOOR) continue;  // clock lost — hold under the backstop
+    if (now >= wake) break;
+    if ((ticks % 120) == 0 && localNow(t))  // ~hourly heartbeat so the log shows life
       plog::logf("cadence: sleeping %02d:%02d", t.tm_hour, t.tm_min);
   }
 
@@ -1957,9 +1981,22 @@ void cadenceGate() {
     if (!localNow(t)) return;               // woke on the backstop with no clock
   }
 
-  // At or past LIDAR_SCAN_HOUR and today's scan hasn't run — which covers both
-  // "it just turned 10:00" and "we booted at 14:00 and owe today's scan".
-  if (!lidarScanDoneOn(t)) runDailyLidarScan(t);
+  // Today's scan hasn't run — covers both "it just turned 10:00" and "we
+  // booted at 14:00 and owe today's scan". But an owed scan is only STARTED
+  // before the 18:00 cutoff: later than that, the day is written off — sleep
+  // to 10:00 and scan then, rather than sweeping ~50 min into the evening.
+  if (!lidarScanDoneOn(t)) {
+    if (t.tm_hour < LIDAR_SCAN_CUTOFF_HOUR) {
+      runDailyLidarScan(t);
+    } else {
+      sleepUntilMorning();
+      // Morning: run the (now yesterday's-owed, today-due) scan immediately so
+      // the wake still lands on fresh standoff data. Guarded exactly like the
+      // normal path — a backstop wake with a dead clock must not start a sweep.
+      if (localNow(t) && !lidarScanDoneOn(t) && t.tm_hour < LIDAR_SCAN_CUTOFF_HOUR)
+        runDailyLidarScan(t);
+    }
+  }
 }
 
 void setup() {
