@@ -19,8 +19,7 @@
 3. **Configure TCS3200** — S0/S1 = HIGH/LOW → 20% freq scaling (full speed is too fast to measure)
 4. **Wait 2s** for GRBL to boot, flush any junk bytes
 5. **Send G-code init** — `G21` (mm), `G90` (absolute), then `$H` to home the CNC
-6. **`scanGrid()`** — move sensor over every cell, read color, store current disc states in `gridState[]`
-7. **Connect WiFi** → `timeBegin()` starts NTP → `timeWaitForSync(30 s)` (bounded — a dead network delays the schedule, it does not block the rig) → `cadenceLoadRecord()` reads the last lidar scan's date off flash → ready to poll
+6. **Connect WiFi** → `timeBegin()` starts NTP → `timeWaitForSync(30 s)` (bounded — a dead network delays the schedule, it does not block the rig) → `cadenceLoadRecord()` reads the last lidar scan's date off flash → `lidarEnsure()` brings the VL53L4CD up so a wiring fault surfaces in the log at boot, not at 10:00 → ready to poll. The boot `scanGrid()` is commented out — the first color scan happens lazily in `loop()` (first job, `gridStateFresh` false).
 
 Nothing is *scheduled* from `setup()`. The boot-time night sleep and the "we booted at 14:00 and still owe today's lidar scan" case are both handled by `cadenceGate()` at the top of `loop()`, so the whole schedule lives in one place.
 
@@ -40,7 +39,7 @@ poll server  → got bitmap? → re-scan board (skipped if last action was a cle
 
 **0. `cadenceGate()`** — runs before any server ingestion. See **Daily Cadence** below. With no valid wall clock it returns immediately and the loop behaves exactly as it did before the cadence existed.
 
-**1. Poll** — `fetchNext()` opens a raw TLS socket to the server, `GET /next.php`
+**1. Poll** — `fetchNext()` opens a raw TLS socket to the server, `POST /next.php` (must be POST — intermediates may silently retry GETs, and each retry would pop a queue item the board never sees)
 
 **2. Parse response**
 - Status 200 + body = new bitmap (base64, 112 chars max)

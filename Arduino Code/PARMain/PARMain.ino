@@ -2105,6 +2105,11 @@ restart_grbl:
   timeBegin();
   timeWaitForSync(30000);
   cadenceLoadRecord();
+  // Bring the ranger up now rather than lazily at the first 10:00 scan, so a
+  // wiring fault surfaces in the log at boot. Bounded (10 attempts) and
+  // idempotent — runDailyLidarScan()'s own lidarEnsure() re-tries anyway if
+  // this one fails, so a dead ranger costs ~10 s of boot, never the rig.
+  lidarEnsure();
   // Nothing is scheduled from here — loop()'s cadenceGate() owns the boot-time
   // night sleep and the "we owe today's scan" case, so both live in one place.
 }
