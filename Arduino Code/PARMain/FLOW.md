@@ -4,10 +4,11 @@
 
 | Thing | What it does |
 |---|---|
-| Arduino Nano RP2040 | Main brain — WiFi, HTTP, servo, color sensor |
+| Arduino Nano ESP32 | Main brain — WiFi, HTTP, NTP clock, servo, color sensor |
 | Arduino Mega + GRBL | Motion controller — moves the gantry via Serial1 |
 | Servo (D9) | Flips individual discs (black ↔ blue) |
 | TCS3200 (D4–D8) | Color sensor — reads which side of a disc is showing |
+| VL53L4CD (A4/A5, I²C) | ToF ranger — per-cell standoff, daily 10:00 scan only |
 
 ---
 
@@ -19,18 +20,25 @@
 4. **Wait 2s** for GRBL to boot, flush any junk bytes
 5. **Send G-code init** — `G21` (mm), `G90` (absolute), then `$H` to home the CNC
 6. **`scanGrid()`** — move sensor over every cell, read color, store current disc states in `gridState[]`
-7. **Connect WiFi** → ready to poll
+7. **Connect WiFi** → `timeBegin()` starts NTP → `timeWaitForSync(30 s)` (bounded — a dead network delays the schedule, it does not block the rig) → `cadenceLoadRecord()` reads the last lidar scan's date off flash → ready to poll
+
+Nothing is *scheduled* from `setup()`. The boot-time night sleep and the "we booted at 14:00 and still owe today's lidar scan" case are both handled by `cadenceGate()` at the top of `loop()`, so the whole schedule lives in one place.
 
 ---
 
 ## Main Loop (`loop`)
 
 ```
-poll server → got bitmap? → re-scan board (skipped if last action was a clean scan) → display it → check pass → snapshot request → mark complete → 10 min sleep → repeat
-             no bitmap?  → wait 10s → repeat
+cadence gate → night (20:00–09:59)? → sleep until 10:00
+             → today's lidar scan not done? → run it (~50 min), persist to flash
+poll server  → got bitmap? → re-scan board (skipped if last action was a clean scan) → display it → check pass → snapshot request → mark complete
+                             → then: past 20:00? → sleep until 10:00 : 10 min linger
+             → no bitmap?  → wait 10s → repeat
 ```
 
 ### Step-by-step
+
+**0. `cadenceGate()`** — runs before any server ingestion. See **Daily Cadence** below. With no valid wall clock it returns immediately and the loop behaves exactly as it did before the cadence existed.
 
 **1. Poll** — `fetchNext()` opens a raw TLS socket to the server, `GET /next.php`
 
@@ -96,7 +104,37 @@ Each cell logs one plog line while the clearing slide runs: `f x<gx> y<gy> L|R r
 
 **7. `onDisplayComplete()`** — `GET /complete.php?id=<N>` tells the server the image is confirmed displayed.
 
-**8. Sleep 10 min** — release steppers (`$1=0` + tiny jog to trigger disable), then `delay(10 min)` before polling again. **Sync (`waitForIdle`) after the `$1=0` before the jog** — `$1=0` commits the settings block to the Mega's EEPROM, and grbl disables interrupts during the write, dropping the Serial1 RX bytes of anything pipelined behind it. Without the sync, the jog arrives garbled → `error:2` → the rest of the burst desyncs the `ok` accounting → 60 s `waitForIdle` watchdog → MCU reset. Same `waitForIdle`-after-`$1` guard is applied at boot and in `rehome()`.
+**8. Release steppers, then linger *or* sleep** — `releaseSteppers()` sends `$1=0` + a tiny jog (`G0 X-0.1`, away from the `X=0` soft limit) to trigger the disable, and sets `needsRehome`. **Sync (`waitForIdle`) after the `$1=0` before the jog** — `$1=0` commits the settings block to the Mega's EEPROM, and grbl disables interrupts during the write, dropping the Serial1 RX bytes of anything pipelined behind it. Without the sync, the jog arrives garbled → `error:2` → the rest of the burst desyncs the `ok` accounting → 60 s `waitForIdle` watchdog → MCU reset. Same `waitForIdle`-after-`$1` guard is applied at boot and in `rehome()`.
+
+Then the cadence decides how long to wait: local hour ≥ 20 → `sleepUntilMorning()`, otherwise the usual `delay(10 min)`. The check is here — not only at the top of `loop()` — so the rig never starts an hour-long job that would finish deep into the evening and then immediately start another.
+
+---
+
+## Daily Cadence
+
+Three coupled pieces: a real wall clock, a daily lidar standoff scan, and a night sleep. The board is powered 24/7, so this is a **schedule**, not power management.
+
+**Wall clock.** NTP over the WiFi link the poller already keeps up: `configTzTime(PAR_TZ, "pool.ntp.org", "time.nist.gov")`, timezone `MST7MDT,M3.2.0,M11.1.0` (US Mountain with DST) as a named constant. Started once WiFi is up and re-asserted (idempotently) at the top of every loop; SNTP re-polls on its own and survives a WiFi bounce. **Every** cadence decision goes through `localNow(struct tm&)`, which returns false unless `time()` exceeds `TIME_VALID_FLOOR` (2025-01-01 UTC) — the ESP32 RTC starts at the epoch and SNTP fills it in *asynchronously*, so the clock is readable long before it is true. With no valid clock the rig does not scan, does not sleep, and does not mark a day done; it just runs uncadenced and logs that once every 5 min.
+
+**Daily lidar scan (10:00 local).** `runDailyLidarScan()` sweeps the VL53L4CD over all 666 cells and writes the result to flash. It runs when the clock says the hour is ≥ 10 **and** the flash record's date isn't today — which covers both "it just turned 10:00" and "we rebooted at 14:00 and owe today's scan". Sensor mechanics are ported from `ScanColorLidarTest`: free-running at a 50 ms timing budget, one fresh 4 s window per cell (~80 samples), reduced to a **20 %-trimmed mean in tenths of a mm**; head offsets `LIDAR_OFFSET_X = +31.075` (calibrated so col 36 targets exactly the `X=0` machine limit) and `LIDAR_OFFSET_Y = SCAN_OFFSET_Y + 6.0 = +14.0` (the top row's target is −14.2 + 14 = −0.2, inside the envelope — this is what the `$131` 406→412 bump bought). Targets are clamped on **both** axes (`clampScanY`, and `clampScanX` as the mirror safety net).
+
+Readings are stored **RAW**, matching that sketch's `LIDAR_APPLY_CALIBRATION 0` run: the back-colour distance offsets are only meaningful against a same-pass colour classification, and this sweep does not run the colour sensor. A half-applied correction would be worse than none — the correction belongs in the offline fit that produces `LIDAR_FIT_CMM`.
+
+Motion obeys the same conventions `scanGrid()` does, for the same reasons: **flip arm parked at `SERVO_US_REST` for the whole pass** (a dropped arm dragged across a populated board is what snapped it before), serpentine order via `cellAt()` so end-of-row X equals start-of-next-row X, every cross-row leg through `moveToYSafe` (pure-Y travel only at an X soft limit), intra-row moves are pure X, nothing sensed until `waitForMotion()` confirms the carriage stopped, and a mid-scan `rehome()` after row 8 so step drift can't skew the second half. Per-cell flash writes are pipelined behind the travel to the next cell, exactly as in `scanGrid`. `gridState[]` is **not** touched — no disc is flipped, so `gridStateFresh`/`gridStateFromScan` carry through unchanged; `rehome()` clears `needsRehome`. Cost is ~4.3 s/cell ≈ **50 minutes**, which is why it is scheduled once a day and not paid by the print loop.
+
+If the ranger never initialises, `lidarEnsure()` gives up after 10 attempts (re-initing I²C between them) and — **unlike `ScanColorLidarTest`, which halts** — the rig carries on printing. The day is recorded with `sensorOk = 0` and no cells, so a dead ranger costs one day of data instead of putting the rig in a loop that re-attempts a 50-minute sweep all day.
+
+**Flash record.** One fixed-layout `LidarScanRecord` at `/cadence.bin` on the **same LittleFS mount plog uses** — the factory `ffat` partition (`LittleFS.begin(true, "/littlefs", 10, "ffat")`; see `persistent_log.cpp` for why it is not `spiffs`). plog mounts it at boot; `cadenceFsReady()` re-calls `begin()` only as a guard for the case where that mount *failed*, which returns true immediately when the label is already mounted, so plog's files are never touched or reformatted. The struct holds magic / version / grid geometry / `sensorOk` / local `(tm_year, tm_yday)` / unix epoch / OK-cell count / `uint16_t dist10[666]` / an FNV-1a checksum over everything preceding it. Written temp-then-rename, same crash policy as plog's rotation. Anything unexpected on load — missing, wrong size, wrong magic/version/geometry, bad checksum — is treated as "no scan on record", so the failure direction is *re-scan*, never *skip*. **The stored `(year, yday)` is the sole authority for "has today's scan run"** — not a RAM flag — so a reboot at any hour resumes the schedule correctly.
+
+`LidarScanRecord` is declared near the **top** of the .ino, next to `GRID_W`/`GRID_H` and far from the code that uses it, for the same reason `TcsFilter` is: the Arduino IDE injects its auto-generated forward declarations immediately above the first function in the file, so any type named in a function signature must be complete by that point.
+
+**Night sleep (20:00 → 10:00).** `isNightHour(h)` is `h >= 20 || h < 10`, written once so the post-print check and the boot-time check can never disagree about the boundary. `sleepUntilMorning()` parks the servo at REST, releases the steppers via `releaseSteppers()` if they're still energised, then idles: `delay(30 s)` ticks until the hour leaves the night window, with an hourly heartbeat line and a **15 h backstop** (longer than the longest legitimate night, short enough that a stuck clock costs one day rather than forever). On wake it re-establishes WiFi and re-asserts NTP. Nothing is polled and nothing is ingested during the sleep.
+
+It is a plain `delay()` loop, **not** light or deep sleep, on purpose: `delay()` yields to FreeRTOS so the idle task still feeds the watchdogs, the `millis()`-based GRBL/WiFi stall watchdogs stay coherent, and no reset-cause breadcrumb is fabricated — deep sleep would reboot the SoC, log `ESP_RST_DEEPSLEEP`, and re-run the whole homing sequence, defeating the point of that breadcrumb. The RTC free-runs without the network, so the wake decision never depends on NTP staying reachable.
+
+Ordering in `cadenceGate()` is sleep **first**, then scan, so the morning wake always lands on the scan check and the day's first print draws against fresh standoff data.
+
+Log lines: `ntp start`/`ntp synced`/`ntp NOT synced`, `cadence: record …`, `cadence: lidar scan begin|end`, per-cell `ld y<y>c<x> <mm.t> n<samples> mn<min> mx<max>`, `cadence: night sleep at HH:MM until 10:00`, `cadence: sleeping HH:MM`, `cadence: wake`, `cadence: no valid clock - running uncadenced`.
 
 ---
 
@@ -105,11 +143,11 @@ Each cell logs one plog line while the clearing slide runs: `f x<gx> y<gy> L|R r
 TCS3200 measures R/G/B/Clear light frequencies, read with **LED ambient-subtraction**: `readAmbientSubtracted()` averages `AMBIENT_FLASHES` (3) off/on flashes, each subtracting a 5-frame LEDs-off (ambient) read from a 5-frame LEDs-on (lit) read. This cancels room light so the value depends only on the disc + our own LEDs.
 
 ```
-if clear <  SCAN_ON_CLEAR_MAX (6000)  →  cyan/on (1)
-else                                  →  black/off (0)
+if channel <  SCAN_ON_BLUE_MAX (3535)  →  cyan/on (1)
+else                                   →  black/off (0)
 ```
 
-Single threshold on the ambient-subtracted **clear** channel — the two faces separate by ~10× (on-cluster ~1.8k, off-cluster ~16k), so no model is needed (the ternary classifier was retired). **The sensor views the disc BACK**: a displayed-on (cyan-front) disc shows its black back → reads LOW clear; displayed-off shows its cyan back → reads HIGH. `classifyDisc` returns the FRONT/displayed color (`on = clear below threshold`), matching `gridState`'s convention. Ambient subtraction removed the old "blown regime" (bright ambient made every cell read the same → garbled draw), so the former `SCAN_C_CEILING` guard / re-init recovery is gone.
+Single threshold on the ambient-subtracted channel that `tcsReadRGBC` returns as `c` — the two faces separate by ~10×, so no model is needed (the ternary classifier was retired). **That channel is physically BLUE, not clear:** the TCS3200 S2/S3 select lines are crossed on this rig, so the `TcsFilter` enum labels are wrong. Do **not** "fix" the wiring — blue discriminates the two disc faces 10.21× where true clear manages only 2.22×. 3535 is the geometric mean of the measured populations (black-back ceiling 1628, cyan-back floor 7677), replacing a historical 6000 that was lopsided toward the failing side. Full measurements are in `PARMain.ino` at `SCAN_ON_BLUE_MAX`. **The sensor views the disc BACK**: a displayed-on (cyan-front) disc shows its black back → reads LOW clear; displayed-off shows its cyan back → reads HIGH. `classifyDisc` returns the FRONT/displayed color (`on = clear below threshold`), matching `gridState`'s convention. Ambient subtraction removed the old "blown regime" (bright ambient made every cell read the same → garbled draw), so the former `SCAN_C_CEILING` guard / re-init recovery is gone.
 
 ---
 
@@ -127,6 +165,12 @@ GRBL's RX buffer = 128 bytes. Code tracks how many bytes are in-flight:
 
 | Situation | Response |
 |---|---|
-| GRBL `error:X` | Halt forever (`while(true)`) |
+| GRBL `error:N` | Re-send the same command, up to `MAX_ERROR_RETRIES` (10) at 3 s spacing per same-command run; a clean `ok` resets the counter. Exhausted → park servo → `esp_restart()` |
+| GRBL `ALARM` | `grblAlarmRecover()` — Ctrl-X soft reset → `$H` → reassert modals → clear the queue → force a re-scan next job. Any sub-step failing → `esp_restart()` |
+| GRBL comms wedged (60 s no progress) | `grblStallReset()` — park servo → `esp_restart()` |
+| Servo command unacked (`SERVO_ACK_MODE 2`) | Re-send and **retry forever**. Blocking is the safe failure: every call site is reached with GRBL idle. Deliberately does *not* reset — a reset re-homes, and homing with the arm possibly at ENGAGE is how the arm broke |
+| WiFi down > 60 s | Park servo → `esp_restart()` |
 | WiFi/HTTP failure | Log, wait 10s, retry |
 | Bitmap wrong length | Log, wait 10s, retry |
+| VL53L4CD init fails ×10 | Log, record the day with `sensorOk = 0`, **keep printing** |
+| NTP never syncs | Log every 5 min, run uncadenced (no scan, no sleep) |

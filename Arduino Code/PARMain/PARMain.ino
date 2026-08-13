@@ -3,6 +3,10 @@
 #include <ArduinoHttpClient.h>
 #include <base64.hpp>
 #include <esp_system.h>      // esp_restart()
+#include <time.h>            // NTP wall clock for the daily cadence
+#include <Wire.h>            // I2C for the VL53L4CD (A4/A5)
+#include <VL53L4CD.h>        // Pololu lib — daily lidar standoff scan
+#include <LittleFS.h>        // cadence record; shares plog's "ffat" mount
 #include "env.h"
 #include "persistent_log.h"  // flash-backed log for WiFi/HTTP/poll events only
 #include "par_root_ca.h"     // CA bundle for the TLS calls to SERVER
@@ -31,6 +35,32 @@ HttpClient client(wifi, SERVER, PORT);
 
 const int GRID_W = 37;
 const int GRID_H = 18;
+
+// Daily lidar standoff scan, as persisted to flash. Defined UP HERE, far from
+// the cadence code that uses it, for the same reason TcsFilter is: the Arduino
+// IDE injects its auto-generated forward declarations immediately above the
+// FIRST function in the file, so any type named in a function signature must
+// already be complete by that point. Declared next to the cadence helpers it
+// would only be visible ~1500 lines too late, and cadenceChecksum(const
+// LidarScanRecord&) would fail to compile in the generated prototype block.
+//
+// Fixed layout, written and read as raw bytes by the same firmware — there is
+// no cross-compiler portability requirement, only self-consistency, which the
+// magic/version/geometry/checksum fields enforce. The stored (year, yday) is
+// the authority for "has today's scan already run".
+struct LidarScanRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t gridW;
+  uint16_t gridH;
+  uint16_t sensorOk;                    // 0 = ranger never came up; cells are 0
+  int32_t  year;                        // tm_year (years since 1900), local
+  int32_t  yday;                        // tm_yday (0..365), local
+  uint32_t epoch;                       // unix seconds at completion
+  uint32_t cellsOk;                     // cells that returned >=1 sample
+  uint16_t dist10[GRID_H * GRID_W];     // trimmed mean, tenths of a mm; 0 = none
+  uint32_t checksum;                    // over every byte before this field
+};
 
 // CNC homes to full negatives, so the work area lives in negative coordinates.
 const float X_TRAVEL = 777.695f;
@@ -1465,6 +1495,473 @@ int displayBitmap(uint8_t* bitmap) {
   return flipped;
 }
 
+// ============================================================ daily cadence
+// Three things live here, and they only make sense together:
+//   * a real wall clock (NTP over the WiFi link the poller already keeps up),
+//   * a daily VL53L4CD standoff scan of all 666 cells at 10:00 local, whose
+//     results + completion date are written to flash so a reboot doesn't
+//     re-run (or skip) it,
+//   * a night sleep from 20:00 to 10:00 during which the rig ingests nothing.
+//
+// The board is assumed to be powered 24/7, so this is a *schedule*, not a
+// power-management feature — nothing here uses deep sleep. Deep sleep would
+// reboot the SoC on wake, which would show up as ESP_RST_DEEPSLEEP in the
+// reset-cause breadcrumb and re-run the whole homing sequence, and the whole
+// point of that breadcrumb is to make an unexpected reset mean something. The
+// night wait is an ordinary delay() loop: the loop task yields to FreeRTOS in
+// delay(), exactly as the existing 10-minute post-display linger already does.
+
+// US Mountain with DST, in POSIX TZ form (M3.2.0 = 2nd Sunday in March,
+// M11.1.0 = 1st Sunday in November). Named so a move to another timezone is a
+// one-line change; the rest of the cadence works in local broken-down time.
+const char* PAR_TZ = "MST7MDT,M3.2.0,M11.1.0";
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
+
+// Sanity floor for "the clock has actually been set". The ESP32 RTC starts at
+// the epoch, and SNTP fills it in asynchronously some seconds after WiFi comes
+// up — so time() is READABLE long before it is TRUE. Every cadence decision is
+// gated on this: with a garbage clock we must not scan, must not sleep, and
+// must not mark a day done. 2025-01-01 UTC is comfortably before this firmware
+// could ever run and comfortably after 1970.
+const time_t TIME_VALID_FLOOR = 1735689600;
+
+// Daily schedule, local time. The lidar scan runs at LIDAR_SCAN_HOUR; night
+// sleep covers [NIGHT_START_HOUR, LIDAR_SCAN_HOUR), so waking always lands on
+// the scan check.
+const int LIDAR_SCAN_HOUR  = 10;   // 10:00 am
+const int NIGHT_START_HOUR = 20;   // 8:00 pm
+
+static bool timeConfigured = false;
+
+// Start SNTP. Idempotent — configTzTime() is cheap but re-running it restarts
+// the sync, so it is guarded. Called once WiFi is up (in setup and at the top
+// of loop); SNTP then re-polls on its own and survives a WiFi bounce.
+void timeBegin() {
+  if (timeConfigured) return;
+  configTzTime(PAR_TZ, NTP_SERVER_1, NTP_SERVER_2);
+  timeConfigured = true;
+  plog::logf("ntp start tz=%s", PAR_TZ);
+}
+
+// Local broken-down time, or false if the clock has not synced yet. EVERY
+// cadence path goes through this — see TIME_VALID_FLOOR.
+bool localNow(struct tm& out) {
+  time_t now = time(nullptr);
+  if (now <= TIME_VALID_FLOOR) return false;
+  localtime_r(&now, &out);
+  return true;
+}
+
+// Bounded wait for the first SNTP fix, used once at boot so the boot-time
+// night check has a clock to look at. Bounded because a failure here must not
+// wedge the rig: if the clock never arrives we simply run the pre-cadence
+// behaviour (poll, draw, linger) until it does.
+bool timeWaitForSync(unsigned long timeout_ms) {
+  unsigned long t0 = millis();
+  struct tm t;
+  while (millis() - t0 < timeout_ms) {
+    if (localNow(t)) {
+      plog::logf("ntp synced %04d-%02d-%02d %02d:%02d:%02d",
+                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                 t.tm_hour, t.tm_min, t.tm_sec);
+      return true;
+    }
+    delay(500);
+  }
+  plog::logf("ntp NOT synced after %lu ms - cadence idle", timeout_ms);
+  return false;
+}
+
+// 20:00 .. 09:59 local. Written as one predicate so the post-print check and
+// the boot-time check can never disagree about where the night boundary is.
+static inline bool isNightHour(int hour) {
+  return hour >= NIGHT_START_HOUR || hour < LIDAR_SCAN_HOUR;
+}
+
+// ---------------------------------------------------------------- lidar scan
+// VL53L4CD ToF ranger on the Nano's fixed I2C pins (A4/A5), ported from
+// ScanColorLidarTest: free-running at a 50 ms timing budget, one 4 s window per
+// cell reduced to a 20%-trimmed mean in tenths of a mm.
+//
+// RAW, exactly like the pass-4 calibration run (that sketch's
+// LIDAR_APPLY_CALIBRATION 0): no back-colour offset is applied here. The
+// colour-dependent offsets are only meaningful against a same-pass colour
+// classification, and this scan does not sweep the colour sensor — so we store
+// what the sensor said and leave the correction to the offline fit that
+// produces LIDAR_FIT_CMM. Storing a half-applied correction would be worse
+// than storing none.
+VL53L4CD lidar;
+static bool lidarReady = false;
+
+const unsigned long LIDAR_WINDOW_MS = 4000;   // ~80 samples at the 50 ms budget
+const int LIDAR_MAX_SAMPLES = 100;            // cap; 4 s / 50 ms ≈ 80 + slack
+const int LIDAR_INIT_ATTEMPTS = 10;
+
+// Head offsets, from ScanColorLidarTest. The lidar sits ~55 mm right of and
+// 6 mm above the colour sensor; LIDAR_OFFSET_X is calibrated so col 36 (cell
+// x = -31.075) targets exactly the X=0 machine limit.
+const float LIDAR_OFFSET_X = 31.075f;
+const float LIDAR_OFFSET_Y = SCAN_OFFSET_Y + 6.0f;   // +14.0
+
+// X clamp, the mirror of clampScanY. A no-op at the current calibration (col 36
+// lands exactly on X=0, which GRBL allows) — it is the safety net for future
+// offset tweaks, same role SCAN_Y_MAX plays on the other axis.
+const float SCAN_X_MAX = 0.0f;
+static inline float clampScanX(float x) { return x > SCAN_X_MAX ? SCAN_X_MAX : x; }
+static inline float lidarTargetX(int y, int x) { return clampScanX(grid[y][x].x + LIDAR_OFFSET_X); }
+static inline float lidarTargetY(int y, int x) { return clampScanY(grid[y][x].y + LIDAR_OFFSET_Y); }
+
+// Bring the ranger up. Boot init is flaky (it failed roughly half of observed
+// power-ons on the bench, then ran a full 71-minute pass flawlessly once up),
+// so the I2C bus is re-inited between attempts.
+//
+// UNLIKE ScanColorLidarTest, a permanent failure does NOT halt: this is the
+// production firmware and a dead ranger must not stop the rig printing. The
+// caller records the failure in the day's record and carries on.
+bool lidarEnsure() {
+  if (lidarReady) return true;
+  Wire.begin();
+  Wire.setClock(400000);  // 400 kHz fast mode
+  lidar.setTimeout(500);
+  for (int attempt = 1; attempt <= LIDAR_INIT_ATTEMPTS; attempt++) {
+    if (lidar.init()) {
+      lidar.setRangeTiming(50, 0);   // 50 ms budget, back-to-back (free-running)
+      lidar.startContinuous();
+      lidarReady = true;
+      plog::logf("lidar ready (attempt %d)", attempt);
+      return true;
+    }
+    plog::logf("lidar init failed (attempt %d)", attempt);
+    Wire.end();
+    delay(1000);
+    Wire.begin();
+    Wire.setClock(400000);
+  }
+  plog::log("lidar init FAILED - scan skipped, rig continues");
+  return false;
+}
+
+// One per-cell distance estimate: collect blocking reads of the free-running
+// ranger for LIDAR_WINDOW_MS, then reduce with ScanColorLidarTest's estimator —
+// sort, drop the top and bottom 20%, average the rest. Result in TENTHS of a mm
+// (per-cell noise is sub-mm, so whole-mm rounding would quantize the fit).
+// Returns the sample count; 0 means every read timed out.
+// Caller must have the head stationary — the window starts fresh here.
+int lidarWindowRead(uint32_t& avg10, uint16_t& mn, uint16_t& mx) {
+  static uint16_t s[LIDAR_MAX_SAMPLES];   // scratch, overwritten every call
+  int n = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < LIDAR_WINDOW_MS) {
+    uint16_t raw = lidar.read();
+    if (lidar.timeoutOccurred()) continue;
+    if (n < LIDAR_MAX_SAMPLES) s[n++] = raw;
+  }
+  if (n == 0) { avg10 = 0; mn = mx = 0; return 0; }
+  for (int i = 1; i < n; i++) {           // insertion sort
+    uint16_t v = s[i];
+    int j = i - 1;
+    while (j >= 0 && s[j] > v) { s[j + 1] = s[j]; j--; }
+    s[j + 1] = v;
+  }
+  int trim = n / 5;                       // 20% off each end
+  int lo = trim, hi = n - trim;
+  if (hi <= lo) { lo = 0; hi = n; }
+  uint32_t sum = 0;
+  for (int i = lo; i < hi; i++) sum += s[i];
+  avg10 = (sum * 10 + (uint32_t)(hi - lo) / 2) / (uint32_t)(hi - lo);
+  mn = s[0];
+  mx = s[n - 1];
+  return n;
+}
+
+// ------------------------------------------------------- cadence flash record
+// (struct LidarScanRecord itself is declared near the top of the file, above
+// the first function — see the note there.)
+#define CADENCE_PATH "/cadence.bin"
+#define CADENCE_TMP  "/cadence.tmp"
+const uint32_t CADENCE_MAGIC   = 0x5041524CUL;  // 'PARL'
+const uint16_t CADENCE_VERSION = 1;
+
+// Module-level (not a stack local): ~1.4 KB, and the loop task's stack is not
+// the place for it. Doubles as the in-RAM cache of what is on flash.
+static LidarScanRecord cadenceRec;
+static bool cadenceRecValid = false;   // cadenceRec mirrors a good on-flash record
+
+static uint32_t cadenceChecksum(const LidarScanRecord& r) {
+  const uint8_t* p = (const uint8_t*)&r;
+  size_t n = sizeof(LidarScanRecord) - sizeof(r.checksum);
+  uint32_t h = 2166136261UL;           // FNV-1a, plenty for a torn-write check
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619UL; }
+  return h;
+}
+
+// LittleFS is already mounted by plog::begin(); this call is the guard for the
+// case where that mount FAILED (plog then silently no-ops, and we would happily
+// write to nothing). LittleFSFS::begin() returns true immediately when the
+// label is already mounted, so re-calling it is free and cannot disturb plog.
+bool cadenceFsReady() {
+  static bool checked = false, ok = false;
+  if (!checked) {
+    checked = true;
+    ok = LittleFS.begin(true, "/littlefs", 10, "ffat");
+    if (!ok) plog::log("cadence: LittleFS mount FAILED - schedule is RAM-only");
+  }
+  return ok;
+}
+
+// Load the record into cadenceRec. Anything unexpected (missing, short, wrong
+// magic/version/geometry, bad checksum) leaves cadenceRecValid false, which
+// simply means "no scan on record" — the scan then runs, which is the safe
+// direction to fail in.
+void cadenceLoadRecord() {
+  cadenceRecValid = false;
+  if (!cadenceFsReady()) return;
+  File f = LittleFS.open(CADENCE_PATH, "r");
+  if (!f) { plog::log("cadence: no scan record on flash"); return; }
+  if (f.size() != sizeof(LidarScanRecord)) {
+    plog::logf("cadence: record size %u != %u, ignoring",
+               (unsigned)f.size(), (unsigned)sizeof(LidarScanRecord));
+    f.close();
+    return;
+  }
+  size_t got = f.read((uint8_t*)&cadenceRec, sizeof(LidarScanRecord));
+  f.close();
+  if (got != sizeof(LidarScanRecord) ||
+      cadenceRec.magic != CADENCE_MAGIC ||
+      cadenceRec.version != CADENCE_VERSION ||
+      cadenceRec.gridW != GRID_W || cadenceRec.gridH != GRID_H ||
+      cadenceRec.checksum != cadenceChecksum(cadenceRec)) {
+    plog::log("cadence: scan record corrupt/foreign, ignoring");
+    return;
+  }
+  cadenceRecValid = true;
+  plog::logf("cadence: record y%d d%d ok%lu sensor%d",
+             (int)(cadenceRec.year + 1900), (int)cadenceRec.yday,
+             (unsigned long)cadenceRec.cellsOk, (int)cadenceRec.sensorOk);
+}
+
+// Write cadenceRec through a temp file, then swap — same crash policy as
+// plog's rotation. A brownout mid-swap can lose the record, and losing it costs
+// exactly one extra scan.
+void cadenceSaveRecord() {
+  if (!cadenceFsReady()) return;
+  cadenceRec.checksum = cadenceChecksum(cadenceRec);
+  File t = LittleFS.open(CADENCE_TMP, "w");
+  if (!t) { plog::log("cadence: record open failed"); return; }
+  size_t wrote = t.write((const uint8_t*)&cadenceRec, sizeof(LidarScanRecord));
+  t.close();
+  if (wrote != sizeof(LidarScanRecord)) {
+    plog::logf("cadence: record short write %u", (unsigned)wrote);
+    LittleFS.remove(CADENCE_TMP);
+    return;
+  }
+  LittleFS.remove(CADENCE_PATH);
+  LittleFS.rename(CADENCE_TMP, CADENCE_PATH);
+  cadenceRecValid = true;
+  plog::logf("cadence: record saved y%d d%d ok%lu",
+             (int)(cadenceRec.year + 1900), (int)cadenceRec.yday,
+             (unsigned long)cadenceRec.cellsOk);
+}
+
+static inline bool lidarScanDoneOn(const struct tm& t) {
+  return cadenceRecValid && cadenceRec.year == t.tm_year && cadenceRec.yday == t.tm_yday;
+}
+
+// One full lidar standoff sweep of all 666 cells, then persist.
+//
+// Motion conventions are the same ones scanGrid() obeys, and for the same
+// reasons: the flip arm is parked at REST for the whole pass (a dropped arm
+// dragged across a populated board is what snapped it before), every cross-row
+// leg goes through moveToYSafe so pure-Y travel only ever happens at an X soft
+// limit, targets are clamped on both axes, and nothing is sensed until
+// waitForMotion() says the carriage has actually stopped. Serpentine order via
+// cellAt(), so end-of-row X equals start-of-next-row X. Mid-scan re-home after
+// row 8, as in both source sweeps, so accumulated step drift can't skew the
+// second half.
+//
+// gridState[] is NOT touched: this sweep never flips a disc, so whatever the
+// colour scan last measured is still true and gridStateFresh stays as it was.
+// It DOES re-home, so needsRehome is cleared by rehome() itself.
+//
+// ~4.3 s/cell ≈ 50 minutes. That is why it is a once-a-day scheduled job and
+// not something the print loop pays for.
+void runDailyLidarScan(const struct tm& day) {
+  plog::logf("cadence: lidar scan begin %04d-%02d-%02d %02d:%02d",
+             day.tm_year + 1900, day.tm_mon + 1, day.tm_mday,
+             day.tm_hour, day.tm_min);
+
+  memset(&cadenceRec, 0, sizeof(cadenceRec));
+  cadenceRec.magic   = CADENCE_MAGIC;
+  cadenceRec.version = CADENCE_VERSION;
+  cadenceRec.gridW   = GRID_W;
+  cadenceRec.gridH   = GRID_H;
+
+  if (lidarEnsure()) {
+    cadenceRec.sensorOk = 1;
+    rehome();
+    // Explicit park even though every path into here leaves it parked — the
+    // arm's position is the one thing a 50-minute sweep must not get wrong.
+    writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
+
+    const int N = GRID_W * GRID_H;
+    int y0, x0;
+    cellAt(0, y0, x0);
+    moveToYSafe(lidarTargetX(y0, x0), lidarTargetY(y0, x0));
+    waitForMotion();
+
+    for (int i = 0; i < N; i++) {
+      int y, x;
+      cellAt(i, y, x);
+
+      // 1. Sense (stationary). Discard one read first: the free-running
+      //    measurement in flight may straddle the tail of the move.
+      lidar.read();
+      uint32_t avg10;
+      uint16_t mn, mx;
+      int n = lidarWindowRead(avg10, mn, mx);
+      if (avg10 > 0xFFFF) avg10 = 0xFFFF;
+      cadenceRec.dist10[y * GRID_W + x] = (uint16_t)avg10;
+      if (n > 0) cadenceRec.cellsOk++;
+      bool last = (i == N - 1);
+
+      // 2. Start the move to the next cell (non-blocking — GRBL begins moving).
+      if (!last) {
+        int ny, nx;
+        cellAt(i + 1, ny, nx);
+        if (ny == y) {
+          moveTo(lidarTargetX(ny, nx), lidarTargetY(ny, nx));      // intra-row (pure X)
+        } else {
+          if (y == 8) rehome();                                    // arm is already at REST
+          moveToYSafe(lidarTargetX(ny, nx), lidarTargetY(ny, nx)); // inter-row edge legs
+        }
+      }
+
+      // 3. Log this cell to flash WHILE GRBL travels — the same pipelining
+      //    scanGrid uses. Tenths printed as int.int so no %f is needed.
+      plog::logf("ld y%dc%d %lu.%lu n%d mn%u mx%u", y, x,
+                 (unsigned long)(avg10 / 10), (unsigned long)(avg10 % 10),
+                 n, (unsigned)mn, (unsigned)mx);
+
+      // 4. Ensure the move finished before sensing the next cell.
+      if (!last) waitForMotion();
+    }
+  } else {
+    plog::log("cadence: lidar unavailable - recording an empty scan for today");
+    // The date is still stamped. A dead ranger must not put the rig into a
+    // retry loop that spends the whole day re-attempting a 50-minute sweep;
+    // sensorOk=0 says plainly that this day has no data.
+  }
+
+  // Stamp with the time the scan FINISHED, re-read rather than reusing `day`:
+  // the sweep takes ~50 minutes and could cross midnight if it ever started
+  // late, and the day we mark done must be the day the record describes.
+  struct tm done;
+  if (localNow(done)) {
+    cadenceRec.year = done.tm_year;
+    cadenceRec.yday = done.tm_yday;
+    cadenceRec.epoch = (uint32_t)time(nullptr);
+  } else {
+    // Clock died mid-scan (shouldn't happen — the RTC free-runs). Fall back to
+    // the day we started, so we at least don't immediately re-scan.
+    cadenceRec.year = day.tm_year;
+    cadenceRec.yday = day.tm_yday;
+  }
+  cadenceSaveRecord();
+  plog::logf("cadence: lidar scan end cells=%lu", (unsigned long)cadenceRec.cellsOk);
+}
+
+// ----------------------------------------------------------------- night sleep
+// Release the steppers for a long idle. $1=0 only takes effect on the next idle
+// transition, so a tiny jog (X-0.1, away from the X=0 soft limit) triggers the
+// disable. Factored out of loop()'s end-of-job path so the night sleep releases
+// them exactly the same way — including the waitForIdle AFTER $1=0, which is
+// mandatory: $1=0 changes the value, so grbl commits the settings block to the
+// Mega's EEPROM under cli() with the Serial1 RX ISR dead, and anything
+// pipelined behind it arrives garbled (error:2 -> desynced ok accounting -> the
+// 60 s waitForIdle watchdog -> MCU reset). G21/G90 are reasserted first because
+// error:2 often traces back to mm/inch or abs/rel mode drifting in a recovery
+// path.
+void releaseSteppers() {
+  sendGcode("G21");
+  sendGcode("G90");
+  sendGcode("$1=0");
+  needsRehome = true;   // steppers are about to go limp: home before any motion
+  waitForIdle();
+  sendGcode("G91");
+  sendGcode("G0 X-0.1");
+  sendGcode("G90");
+  waitForIdle();
+}
+
+// Idle until LIDAR_SCAN_HOUR local. No polling, no server ingestion, carriage
+// stationary with the steppers released and the servo at REST.
+//
+// Deliberately a plain delay() loop rather than esp_light_sleep/deep sleep:
+// delay() yields to FreeRTOS (so the idle task feeds the watchdogs), the
+// millis()-based GRBL/WiFi stall watchdogs stay coherent, and no reset-cause
+// breadcrumb is fabricated. WiFi is left to its own devices — it may well drop
+// over 14 hours — and is re-established on wake before anything needs it. The
+// RTC free-runs without the network, so the wake decision does not depend on
+// NTP staying reachable.
+void sleepUntilMorning() {
+  struct tm t;
+  if (!localNow(t)) return;                 // no clock: never sleep blind
+  plog::logf("cadence: night sleep at %02d:%02d until %02d:00",
+             t.tm_hour, t.tm_min, LIDAR_SCAN_HOUR);
+
+  writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
+  if (!needsRehome) releaseSteppers();      // needsRehome set <=> already limp
+
+  // Backstop against a wedged/garbage clock: at most 15 h, which is longer than
+  // the longest legitimate night (20:00 -> 10:00 = 14 h) and short enough that
+  // a stuck clock costs at most one day rather than forever.
+  const unsigned long MAX_SLEEP_MS = 15UL * 60UL * 60UL * 1000UL;
+  const unsigned long TICK_MS = 30000;
+  unsigned long t0 = millis();
+  unsigned long ticks = 0;
+  while (millis() - t0 < MAX_SLEEP_MS) {
+    delay(TICK_MS);
+    ticks++;
+    if (!localNow(t)) continue;             // clock lost — hold under the backstop
+    if (!isNightHour(t.tm_hour)) break;
+    if ((ticks % 120) == 0)                 // ~hourly heartbeat so the log shows life
+      plog::logf("cadence: sleeping %02d:%02d", t.tm_hour, t.tm_min);
+  }
+
+  plog::log("cadence: wake");
+  ensureWiFi();
+  timeBegin();
+}
+
+// The gate every loop iteration passes through before it is allowed to poll.
+// Order matters: sleep first, then scan — so the morning wake always lands on
+// the scan check and the day starts with fresh standoff data.
+void cadenceGate() {
+  struct tm t;
+  if (!localNow(t)) {
+    // No wall clock (NTP not synced yet, or the network never came up). Fall
+    // back to the pre-cadence behaviour rather than acting on a garbage time:
+    // running the schedule off an unset RTC would sleep at the wrong hour and
+    // stamp a scan against 1970.
+    static unsigned long lastWarn = 0;
+    if (lastWarn == 0 || millis() - lastWarn > 300000UL) {
+      lastWarn = millis();
+      plog::log("cadence: no valid clock - running uncadenced");
+    }
+    return;
+  }
+
+  if (isNightHour(t.tm_hour)) {
+    sleepUntilMorning();
+    if (!localNow(t)) return;               // woke on the backstop with no clock
+  }
+
+  // At or past LIDAR_SCAN_HOUR and today's scan hasn't run — which covers both
+  // "it just turned 10:00" and "we booted at 14:00 and owe today's scan".
+  if (!lidarScanDoneOn(t)) runDailyLidarScan(t);
+}
+
 void setup() {
   // Servo is driven by a dedicated 5V Arduino Nano over Serial2, TX-only on D9
   // → Nano D0 RX, shared GND. RX pin is -1 (nothing comes back on this link).
@@ -1599,6 +2096,17 @@ restart_grbl:
   // each do their own parSecure().
   parSecure(wifi);
   client.setHttpResponseTimeout(15000);
+
+  // Daily cadence bring-up. WiFi has to be up first because the wall clock
+  // comes from NTP; the wait is bounded so a dead network delays the schedule
+  // instead of blocking the rig (loop()'s gate re-checks every iteration and
+  // starts the cadence as soon as a clock appears).
+  ensureWiFi();
+  timeBegin();
+  timeWaitForSync(30000);
+  cadenceLoadRecord();
+  // Nothing is scheduled from here — loop()'s cadenceGate() owns the boot-time
+  // night sleep and the "we owe today's scan" case, so both live in one place.
 }
 
 // Try /complete.php with exponential backoff for up to 5 minutes. If the
@@ -1718,6 +2226,11 @@ void sendSnapshotRequest(const char* galleryId) {
 
 void loop() {
   ensureWiFi();
+  timeBegin();
+  // Night sleep and the daily lidar scan happen here, BEFORE any server
+  // ingestion — so a rig that boots at 2 am sleeps instead of printing, and the
+  // first poll of the day happens on freshly-scanned standoff data.
+  cadenceGate();
   plog::log("poll start");
   int status = 0;
   String galleryId = "";
@@ -1827,34 +2340,24 @@ void loop() {
       // costs ~70 min to learn what we just measured. If anything flipped after
       // the last scan, the state is only inferred and the next job re-scans.
       gridStateFresh = gridStateFromScan;
-      // Release steppers for the long idle. $1=0 only takes effect on the
-      // next idle transition, so kick a tiny jog (X-0.1, away from the X=0
-      // soft limit) to trigger the disable. Reassert G21/G90 first — error:2
-      // (unsupported word) often traces back to inches/mm or relative/absolute
-      // mode being out of sync after a recovery path.
-      sendGcode("G21");
-      sendGcode("G90");
-      sendGcode("$1=0");
-      // Steppers are about to go limp — whatever happens next must home first.
-      needsRehome = true;
-      // $1=0 actually changes the value (255->0), so grbl commits the settings
-      // block to the Mega's EEPROM — and each changed byte runs under cli() with
-      // a busy-wait on EEPE (a few ms with the Serial1 RX ISR dead). Anything
-      // pipelined right behind it gets dropped/garbled: that's what turned the
-      // jog below into a malformed line GRBL rejected with error:2, then mangled
-      // the rest of the burst so the ok accounting never drained -> 60s
-      // waitForIdle watchdog -> MCU reset. Wait for $1=0's ok (which lands only
-      // after the EEPROM write finishes) before sending the motion lines.
-      waitForIdle();
-      sendGcode("G91");
-      sendGcode("G0 X-0.1");
-      sendGcode("G90");
-      waitForIdle();
-      // Post-display linger: paces polling and lets the board settle before the
-      // next job. The recording is already stopped by now — the Mac Mini ends it
-      // when it captures this print's snapshot (the snapshot request above is the
-      // single "print done" signal), so no stream-end is sent from here.
-      delay(10UL * 60UL * 1000UL);
+      // Release steppers for the long idle (the $1=0 + jog dance, with its
+      // mandatory post-$1=0 sync — see releaseSteppers()).
+      releaseSteppers();
+      // The print is finished, so this is the cadence's decision point: if the
+      // day is over, sleep through the night instead of lingering 10 minutes and
+      // polling again. Checked HERE rather than only at the top of loop() so the
+      // rig never starts a ~1 h job it would finish deep into the evening and
+      // then immediately start another.
+      struct tm nowT;
+      if (localNow(nowT) && isNightHour(nowT.tm_hour)) {
+        sleepUntilMorning();
+      } else {
+        // Post-display linger: paces polling and lets the board settle before the
+        // next job. The recording is already stopped by now — the Mac Mini ends it
+        // when it captures this print's snapshot (the snapshot request above is the
+        // single "print done" signal), so no stream-end is sent from here.
+        delay(10UL * 60UL * 1000UL);
+      }
     } else {
       plog::logf("bad decode length: %d", decoded);
     }
