@@ -89,7 +89,7 @@ const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 // arm to a random angle — that already snapped the arm once.
 const int SERVO_TX_PIN = D9;
 
-const int SERVO_US_REST   = 544;
+const int SERVO_US_REST   = 565;
 
 // PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
 // with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The

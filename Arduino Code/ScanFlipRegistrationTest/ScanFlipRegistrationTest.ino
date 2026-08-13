@@ -35,7 +35,7 @@ const int TCS_LED = D10;
 enum TcsFilter { TCS_RED = 0, TCS_BLUE = 1, TCS_CLEAR = 2, TCS_GREEN = 3 };
 
 // Servo (Servo-lib µs mapping).
-const int SERVO_US_REST    = 544;
+const int SERVO_US_REST    = 565;
 const int SERVO_US_RELEASE = 1018;
 const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;

@@ -59,7 +59,7 @@ const int SERVO_TX_PIN = D9;
 
 // The flip arm is parked at REST for the entire collection sweep (this sketch
 // only scans; it never flips a disc).
-const int SERVO_US_REST = 544;  // ≈0°, arm parked
+const int SERVO_US_REST = 565;  // ≈2°, arm parked
 const int SERVO_90_DEG_SETTLE_MS = 300;
 
 // PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9

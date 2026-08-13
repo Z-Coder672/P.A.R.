@@ -93,7 +93,7 @@ enum TcsFilter {
 
 const int SERVO_PIN = D9;
 // Pulse widths match the standard Servo lib mapping
-// (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈0° (parked),
+// (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈2° (parked),
 // RELEASE≈25.5° (pushes the half-rotated squisk during the X slide-back),
 // ENGAGE=75° (initial 90° squisk rotation).
 //
@@ -106,7 +106,7 @@ const int SERVO_PIN = D9;
 // !! FLIP_CATCH_EXTRA_X, the unload). Porting the base angles without the trims,
 // !! or the trims without the base angles, leaves the flip wrong by tens of
 // !! degrees — which is exactly how the arm gets driven into the board.
-const int SERVO_US_REST = 544;
+const int SERVO_US_REST = 565;
 // RELEASE is a BASE angle that lidar compensation then shifts per cell; it is
 // never commanded raw. Uncompensated it is 25.51°. Through compensatedUs() the
 // board spans 793..921µs (24.15°..36.56°), mean 853µs — so nothing clamps at
@@ -149,7 +149,7 @@ const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
 //     why — restore a value above REST rather than re-deriving from RELEASE.
 // Kept as its own constant (rather than replacing the call sites) so the BOOT
 // line still reports the scan angle a run actually used.
-const int SERVO_US_SCAN = SERVO_US_REST;   // 544µs, arm parked
+const int SERVO_US_SCAN = SERVO_US_REST;   // 565µs, arm parked
 const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 // Extra travel on the CATCH stroke — the one that runs with the arm down at

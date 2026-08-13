@@ -95,9 +95,12 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
   pinMode(ACK_PIN, OUTPUT);
   digitalWrite(ACK_PIN, HIGH); // idle high
+  // 544/2400 is the LIBRARY pulse range (0-180 deg); the boot park is REST,
+  // which is 2 deg = 565us. Don't collapse the two -- the range must stay at
+  // the library floor or every commanded angle shifts.
   s.attach(SERVO_PIN, 544, 2400);
-  s.writeMicroseconds(544);
-  lastAppliedUs = 544;
+  s.writeMicroseconds(565);
+  lastAppliedUs = 565;
   Serial.println("ServoNano ready");
 }
 

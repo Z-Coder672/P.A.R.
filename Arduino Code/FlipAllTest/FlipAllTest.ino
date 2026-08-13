@@ -18,9 +18,9 @@ const float X_TRAVEL = 777.695f;
 const float Y_TRAVEL = 412.0f;  // MUST equal GRBL $131 — homing pins the -Y switch at -$131, so this anchors the grid
 
 // Pulse widths match the standard Servo lib mapping
-// (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈0°,
+// (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈2°,
 // RELEASE≈25.5°, ENGAGE=75°.
-const int SERVO_US_REST    = 544;
+const int SERVO_US_REST    = 565;
 // RELEASE is a BASE angle that lidar compensation then shifts per cell. It is
 // chosen so the bottom-left cell (0,17) — standoff 40.31 mm, i.e. -0.19 mm from
 // LIDAR_REF_MM — comes out of compensatedUs() at 802µs = 25.02°, the commanded

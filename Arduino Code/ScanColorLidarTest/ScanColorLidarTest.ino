@@ -174,7 +174,7 @@ enum TcsFilter {
 // PARMain.ino / ServoNano.ino for the full rationale.
 const int SERVO_TX_PIN = D9;
 
-const int SERVO_US_REST = 544;  // ≈0°, arm parked (the ONLY angle this test uses)
+const int SERVO_US_REST = 565;  // ≈2°, arm parked (the ONLY angle this test uses)
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 

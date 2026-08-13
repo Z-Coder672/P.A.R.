@@ -36,7 +36,7 @@ enum TcsFilter {
 };
 
 // Servo pulse widths (Servo-lib mapping: 544–2400µs over 0–180°).
-const int SERVO_US_REST    = 544;
+const int SERVO_US_REST    = 565;
 const int SERVO_US_RELEASE = 1018;  // ≈46°
 const int SERVO_US_ENGAGE  = 1471;  // ≈90°
 const int SERVO_90_DEG_SETTLE_MS = 300;

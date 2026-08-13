@@ -11,7 +11,7 @@
 // to time (thermal) and cycle number.
 
 const int SERVO_TX_PIN = D9;
-const int SERVO_US_REST    = 544;
+const int SERVO_US_REST    = 565;
 const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/≈38°)
 const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;

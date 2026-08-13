@@ -193,7 +193,7 @@ enum TcsFilter {
 // Servo link: hardware Serial2 TX on D9 → 5V ServoNano RX, 9600 8N1, one-way.
 // The ONLY pulse width this sketch ever sends is SERVO_US_REST.
 const int SERVO_TX_PIN = D9;
-const int SERVO_US_REST = 544;  // ≈0°, arm parked — the only angle used here
+const int SERVO_US_REST = 565;  // ≈2°, arm parked — the only angle used here
 const int SERVO_90_DEG_SETTLE_MS = 300;
 
 // The link is one-way with no ack, so a dropped byte silently LOSES a command.

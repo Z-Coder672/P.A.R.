@@ -17,7 +17,7 @@ const int SERVO_TX_PIN = D9;
 
 const int TRIGGER_PIN = D10;  // wire this to a digital pin on the logger Uno
 
-const int SERVO_US_REST    = 544;
+const int SERVO_US_REST    = 565;
 const int SERVO_US_RELEASE = 1142;  // ≈58° (raised 8° from the prior 1060/≈50°)
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;

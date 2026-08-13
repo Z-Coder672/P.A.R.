@@ -50,7 +50,7 @@ poll server  → got bitmap? → re-scan board (skipped if last action was a cle
 
 **4. `scanGrid()` (conditional)** — re-home and re-read every cell with the TCS3200. **Skipped when `gridStateFresh` is set**, i.e. when `gridState[]` is already a *measured* picture of the board: on the first job after boot (reusing `setup()`'s scan), and after any job whose last board-touching action was a scan with no fixing after it — the check pass re-scanned and found ≤`CHECK_FIX_MAX_SKIP` wrong, or the draw flipped nothing at all (`gridStateFromScan`, carried across the idle at the end of the job). That scan already describes the final board, so repeating it costs ~70 min to learn what was just measured. Any flip after a scan makes the state *inferred* rather than measured (`displayBitmap` clears `gridStateFromScan` before its first flip), and the next job re-scans. When the scan is skipped, `rehome()` still runs if `needsRehome` is set — the end-of-job `$1=0` releases the steppers, so the gantry may have been nudged.
 
-Otherwise the full sweep runs. It reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ. The reading sweep runs with the **flip arm parked at REST** (`SERVO_US_SCAN` = `SERVO_US_REST` = 544 µs, changed 2026-08-10). It used to be dropped to ~33.5° so that — since the sensor trails the flip head by `SCAN_OFFSET_X` (−24.005 mm ≈ one cell pitch) — the lowered arm brushed the board and pushed through any squisk left at stage 1 (90°, half-rotated). That secondary settling job is abandoned: the arm now stays up for the whole scan, so the "carriage moves only with the servo at REST" invariant holds trivially (a dropped arm dragged across a populated board is what snapped the flip arm before), and half-rotated discs are no longer nudged during scanning — one left mid-rotation stays mid-rotation until the check pass re-flips it. Each cell is read with **LED ambient-subtraction** and classified by a simple clear-channel threshold (see Color Classification below); ambient subtraction removed the old room-light "blown regime", so the former `SCAN_C_CEILING` guard / sensor re-init recovery is gone.
+Otherwise the full sweep runs. It reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ. The reading sweep runs with the **flip arm parked at REST** (`SERVO_US_SCAN` = `SERVO_US_REST` = 565 µs, changed 2026-08-10). It used to be dropped to ~33.5° so that — since the sensor trails the flip head by `SCAN_OFFSET_X` (−24.005 mm ≈ one cell pitch) — the lowered arm brushed the board and pushed through any squisk left at stage 1 (90°, half-rotated). That secondary settling job is abandoned: the arm now stays up for the whole scan, so the "carriage moves only with the servo at REST" invariant holds trivially (a dropped arm dragged across a populated board is what snapped the flip arm before), and half-rotated discs are no longer nudged during scanning — one left mid-rotation stays mid-rotation until the check pass re-flips it. Each cell is read with **LED ambient-subtraction** and classified by a simple clear-channel threshold (see Color Classification below); ambient subtraction removed the old room-light "blown regime", so the former `SCAN_C_CEILING` guard / sensor re-init recovery is gone.
 
 **5. `displayBitmap()`** — over the band of rows that contain at least one differing cell, flip cells where `desired bit ≠ gridState`. Rows with no differing cells are **skipped entirely** (no move to them — the next flipping row is still entered via `moveToYSafe`, so Y travel stays at an X soft-limit). Returns the number of cells flipped (= cells that were wrong vs the target), used to gate the check pass.
 
@@ -76,7 +76,7 @@ The absolute flip X is
 move gantry to disc (fx = cell X + 2.0 + skew + (inverted ? +11.0 : -0.5))
 servo → ENGAGE (75°)   → settle 300ms  # rotates squisk 90°; NOT compensated
 G91; X -unload; G90                    # arm unload, still at ENGAGE (1.5 mm, 4.0 mm on the off-board edge cell)
-servo → REST (0°)      → settle 300ms
+servo → REST (2°)      → settle 300ms
 G91; X (dx + unload); G90              # clearing slide — lands at cell + dx regardless of the unload
 servo → RELEASE (compensatedUs, ~793..921µs) → settle 100ms
 G91; X (-dx ∓ FLIP_CATCH_EXTRA_X); G90 # catch stroke — sweeps 3.5 mm PAST the cell origin
@@ -84,9 +84,9 @@ G91; X (-dx ∓ FLIP_CATCH_EXTRA_X); G90 # catch stroke — sweeps 3.5 mm PAST t
   servo → RELEASE2 (compensated)→ settle 100ms  # second catch: arm a further ~10° lower
   if !catchByNextMove:                  # only when the next move won't already do it
     G91; X +dx2; G90                    # explicit +X sweep (opposite the return)
-    servo → REST (0°)    → settle 100ms
+    servo → REST (2°)    → settle 100ms
 #else                                   # second catch disabled
-  servo → REST (0°)      → settle 100ms # park; catchByNextMove ignored
+  servo → REST (2°)      → settle 100ms # park; catchByNextMove ignored
 #endif
 ```
 

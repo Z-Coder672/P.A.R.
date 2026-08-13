@@ -11,7 +11,7 @@
 // 50Hz servo PWM decodes as garbage UART frames and throws the arm to random
 // angles (this snapped the flip arm once).
 const int SERVO_TX_PIN     = D9;
-const int SERVO_US_REST    = 544;   // 0°
+const int SERVO_US_REST    = 565;   // 2°
 const int SERVO_US_RELEASE = 935;   // ~38° (raised 8° from the prior 853/~30°)
 const int SETTLE_MS        = 200;
 
