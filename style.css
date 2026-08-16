@@ -42,6 +42,18 @@ body {
     font-size: 1.8rem;
     font-weight: bold;
     color: #02b2d9;
+    text-decoration: none;
+    cursor: pointer;
+    /* Logo is a link now — keep it from being drag-selected as text. */
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.navbar-brand:hover,
+.navbar-brand.active {
+    text-decoration: none;
+    border-bottom: none;
 }
 
 .navbar-menu {
@@ -594,6 +606,26 @@ body {
     flex-wrap: wrap;
     justify-content: center;
     gap: 1rem;
+}
+
+.upload-photo-link {
+    display: block;
+    margin: 0 auto;
+    background: none;
+    border: none;
+    padding: 0;
+    color: #02b2d9;
+    font-family: inherit;
+    font-size: 1rem;
+    text-align: center;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+    transition: color 0.3s ease;
+}
+
+.upload-photo-link:hover {
+    color: #00a0c4;
 }
 
 .upload-rotate-prompt {

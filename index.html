@@ -12,10 +12,10 @@
     <!-- Navbar -->
     <nav class="navbar">
         <div class="navbar-container">
-            <div class="navbar-brand">P.A.R.</div>
+            <a href="/latest" class="navbar-brand nav-link" data-tab="latest">P.A.R.</a>
             <ul class="navbar-menu">
                 <li><a href="/latest" class="nav-link" data-tab="latest">Latest</a></li>
-                <li><a href="/upload" class="nav-link" data-tab="upload">Upload</a></li>
+                <li><a href="/upload" class="nav-link" data-tab="upload">Submit Art</a></li>
                 <li><a href="/gallery" class="nav-link" data-tab="gallery">Gallery</a></li>
                 <li><a href="/about" class="nav-link" data-tab="about">About</a></li>
             </ul>
@@ -162,8 +162,8 @@
                         </div>
                     </div>
                 </div>
+                <button id="uploadBtn" type="button" class="upload-photo-link">Want to upload a photo instead? We'll turn it into pixel art!</button>
                 <div class="upload-actions">
-                    <button id="uploadBtn" class="upload-button">Upload Image</button>
                     <button id="sendQueueBtn" class="upload-button queue-button">Send to P.A.R. Queue</button>
                 </div>
                 <p id="queueStatus" class="queue-status" aria-live="polite"></p>

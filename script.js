@@ -36,7 +36,10 @@ function showTab(tabName) {
 
     document.body.classList.toggle('upload-tab-active', tabName === 'upload');
 
-    const activeLink = document.querySelector(`[data-tab="${tabName}"]`);
+    // Scoped to the menu: the brand is also a [data-tab="latest"] link, and an
+    // unscoped querySelector would hand it the active state (and its underline)
+    // instead of the Latest menu item.
+    const activeLink = document.querySelector(`.navbar-menu [data-tab="${tabName}"]`);
     if (activeLink) {
         activeLink.classList.add('active');
     }
@@ -780,22 +783,22 @@ function setQueueStatus(message, isError = false) {
 
 function getQueueErrorMessage(errorCode, statusCode) {
     if (statusCode === 409 && errorCode === 'duplicate_queue_item') {
-        return 'That picture is already in the P.A.R. queue.';
+        return 'That picture has already been submitted.';
     }
 
     if (statusCode === 409 && errorCode === 'queue_full') {
-        return 'The P.A.R. queue is full. Try again later.';
+        return 'Too many pictures are waiting for review. Try again later.';
     }
 
     if (statusCode === 400 && errorCode === 'Invalid bitmap payload') {
-        return 'This picture could not be prepared for the queue.';
+        return 'This picture could not be prepared for submission.';
     }
 
     if (statusCode === 429 || errorCode === 'rate_limited') {
         return 'You\'re sending pictures too quickly. Please wait a moment and try again.';
     }
 
-    return 'Could not add picture to the P.A.R. queue.';
+    return 'Could not submit picture for review.';
 }
 
 function persistGridState(state = captureGridState()) {
@@ -1753,7 +1756,7 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
         payload.email = email;
     }
 
-    setQueueStatus('Sending to queue...');
+    setQueueStatus('Submitting for review...');
 
     try {
         const response = await fetch('/enqueue.php', {
@@ -1774,14 +1777,14 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
         }
 
         setQueueStatus(email
-            ? 'Picture added to the P.A.R. queue. We\'ll email you when it prints.'
-            : 'Picture added to the P.A.R. queue.');
+            ? 'Picture submitted for review. Once approved it joins the P.A.R. queue, and we\'ll email you when it prints.'
+            : 'Picture submitted for review. Once approved it joins the P.A.R. queue to be printed.');
         emailInput.value = '';
     } catch (error) {
         console.error('Error sending picture to queue:', error);
         const message = error instanceof Error
             ? error.message
-            : 'Could not add picture to the P.A.R. queue.';
+            : 'Could not submit picture for review.';
         setQueueStatus(message, true);
     } finally {
         nameModal.classList.add('hidden');
