@@ -4,7 +4,7 @@
 // 0° -> 544us, 30° -> 853us (so ~10.3 us/deg).
 //
 // Servo control is offloaded to a dedicated 5V Arduino Nano over a one-way TX
-// line on Arduino D9 → 5V Nano D0 RX, shared GND. On the Nano ESP32 the GPIO
+// line on Arduino D9 → 5V Nano D2 RX (SoftwareSerial; D0 is its USB debug echo), shared GND. On the Nano ESP32 the GPIO
 // matrix routes hardware UART2 (Serial2) TX to D9, so no software UART is
 // needed. The companion sketch (ServoNano.ino) listens on its hardware UART
 // at 9600.

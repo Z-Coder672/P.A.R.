@@ -28,11 +28,23 @@ const int TCS_S3  = D7;
 const int TCS_OUT = D8;
 const int TCS_LED = D10;
 
+// S2/S3 select the photodiode filter bank.
+//
+// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
+// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
+// for values 1 and 2 -- the value assignments below already account for that.
+// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
+// and classifyDisc thresholds `b`.
+//
+// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
+// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
+// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
+// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
 enum TcsFilter {
-  TCS_RED   = 0,
-  TCS_BLUE  = 1,
-  TCS_CLEAR = 2,
-  TCS_GREEN = 3
+  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
+  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
+  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
+  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
 struct Coord { float x; float y; };
@@ -193,8 +205,8 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
   for (int i = 0; i < 5; i++) {
     tcsSelect(TCS_RED);   delay(2); sr += tcsReadFrequencyHz();
     tcsSelect(TCS_GREEN); delay(2); sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR); delay(2); sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
   }
   r = sr / 5; g = sg / 5; b = sb / 5; c = sc / 5;
 }
@@ -271,7 +283,7 @@ void setup() {
   // 20% output frequency scaling (S0=H, S1=L) — keeps pulseIn within range.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
 
   delay(2000); // GRBL boot
   while (Serial1.available()) Serial1.read();

@@ -414,10 +414,34 @@ void servoTxLine(int us) {
 // ServoNano.ino. The other direction (D9 -> ServoNano) needs nothing, since
 // 3.3 V clears the AVR's V_IH of 0.6*Vcc = 3.0 V.
 //
-// The line is a LEVEL, not a UART: idle HIGH, held LOW for ~40 ms on every
+// The line is a LEVEL, not a UART: idle LOW, driven HIGH for ~40 ms on every
 // command the ServoNano accepts. We already know what we sent, so all we need
-// is "it landed". INPUT_PULLUP so a broken or unfitted wire reads HIGH, i.e.
-// "no ack" -- it fails loud rather than silently reporting success.
+// is "it landed".
+//
+// !! POLARITY IS ACTIVE-HIGH (inverted 2026-08-17). It used to be idle-HIGH /
+// !! pulse-LOW with INPUT_PULLUP, on the theory that a broken wire would read
+// !! HIGH = "no ack" = fail loud. That is only true if the break is at THIS
+// !! pin. The divider's bottom-leg resistor sits between this node and GND, so
+// !! a break ANYWHERE UPSTREAM -- the ack wire, an unplugged or unpowered
+// !! ServoNano -- pinned the node LOW through it, which the old code read as
+// !! "acked". Every command then reported success and SERVO_ACK_MODE 2's
+// !! retry-until-confirmed guarantee became vacuous. No divider ratio fixes
+// !! that; the polarity has to be the other way round.
+// !!
+// !! Now the bottom-leg resistor IS the fail-safe: any upstream break parks the
+// !! node LOW = "no ack" = the enforced retry actually fires. INPUT_PULLDOWN
+// !! covers the remaining case where the divider itself is absent.
+// !!
+// !! REQUIRES A 3.3k BOTTOM LEG. INPUT_PULLDOWN (~45k) sits in parallel with
+// !! it, so with 1.8k/3.3k the HIGH level is 5*(3.3||45)/(1.8+(3.3||45)) =
+// !! 3.15 V, comfortably over the ESP32-S3's V_IH of 0.75*VDD = 2.475 V. With a
+// !! 2k bottom leg it collapses to 2.45 V and the ack stops working. Do NOT
+// !! flash this onto a rig whose divider is 2k/2k.
+// !!
+// !! BOTH SIDES MUST BE FLASHED TOGETHER. A ServoNano running the old
+// !! active-LOW build idles HIGH, which this code would read as a permanent
+// !! ack -- the exact failure the change removes. servoAckProbeIdle() below
+// !! detects that at boot and says so loudly.
 //
 // SERVO_ACK_MODE  0 = off      (no wire fitted; original open-loop behaviour)
 //                 1 = observe  (log every missing ack, keep running)
@@ -432,11 +456,22 @@ unsigned long servoAckMisses = 0;
 // Let the previous command's 40 ms hold expire so it cannot be mistaken for ours.
 static void servoAckWaitIdle() {
   unsigned long t0 = millis();
-  while (digitalRead(SERVO_ACK_PIN) == LOW && millis() - t0 < 100) {}
+  while (digitalRead(SERVO_ACK_PIN) == HIGH && millis() - t0 < 100) {}
 }
 static bool servoAckSeen() {
   unsigned long t0 = millis();
   while (millis() - t0 < SERVO_ACK_TIMEOUT_MS)
+    if (digitalRead(SERVO_ACK_PIN) == HIGH) return true;
+  return false;
+}
+
+// Boot-time firmware-match check. Under the active-HIGH protocol the line must
+// IDLE LOW; a ServoNano still running the old active-LOW build idles HIGH, and
+// this code would then read every command as instantly acked. Returns false if
+// the line never goes LOW -- stale ServoNano firmware, or a short to 5 V.
+static bool servoAckProbeIdle() {
+  unsigned long t0 = millis();
+  while (millis() - t0 < 250)
     if (digitalRead(SERVO_ACK_PIN) == LOW) return true;
   return false;
 }
@@ -747,7 +782,13 @@ void setup() {
   // the ServoNano must see a clean line and a valid REST frame before the
   // gantry is allowed to move.
   Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
-  pinMode(SERVO_ACK_PIN, INPUT_PULLUP);
+  pinMode(SERVO_ACK_PIN, INPUT_PULLDOWN);
+#if SERVO_ACK_MODE > 0
+  // Active-HIGH ack: the line must idle LOW. Idling HIGH means the
+  // ServoNano still has the old active-LOW firmware.
+  if (!servoAckProbeIdle())
+    Serial.println(F("ACK LINE IDLES HIGH - ServoNano is probably still running the OLD active-LOW build. The ack is NOT protecting you: flash ServoNano.ino before running any job."));
+#endif
   delay(100);
   servoTxLine(SERVO_US_REST);
 

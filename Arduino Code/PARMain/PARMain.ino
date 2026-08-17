@@ -84,11 +84,22 @@ const int TCS_OUT = D8;
 const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 
 // S2/S3 select the photodiode filter bank.
+//
+// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
+// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
+// for values 1 and 2 -- the value assignments below already account for that.
+// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
+// and classifyDisc thresholds `b`.
+//
+// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
+// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
+// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
+// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
 enum TcsFilter {
-  TCS_RED = 0,    // S2=L, S3=L
-  TCS_BLUE = 1,   // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
+  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
+  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
+  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
 const int SERVO_PIN = D9;
@@ -418,7 +429,7 @@ int compensatedUs(int baseUs, int gx, int gy) {
 
 // Servo control offloaded to a dedicated 5V Arduino Nano over a one-way 9600
 // baud serial line on Arduino D9 (the old SERVO_PIN, freed once the SG90 moved
-// to the 5V Nano) → 5V Nano D0 RX, shared GND. The companion sketch
+// to the 5V Nano) → 5V Nano D2 RX (SoftwareSerial; D0 is its USB debug echo), shared GND. The companion sketch
 // (ServoNano.ino) listens on its hardware UART at the same baud and parses an
 // integer µs value per line.
 //
@@ -487,10 +498,34 @@ void servoTxLine(int us) {
 // (D9 -> ServoNano) needs nothing, since 3.3 V clears the AVR's V_IH of
 // 0.6*Vcc = 3.0 V.
 //
-// The line is a LEVEL, not a UART: idle HIGH, held LOW for ~40 ms on every
+// The line is a LEVEL, not a UART: idle LOW, driven HIGH for ~40 ms on every
 // command the ServoNano accepts. We already know what we sent, so all we need
-// is "it landed". INPUT_PULLUP so a broken or unfitted wire reads HIGH, i.e.
-// "no ack" -- it fails loud rather than silently reporting success.
+// is "it landed".
+//
+// !! POLARITY IS ACTIVE-HIGH (inverted 2026-08-17). It used to be idle-HIGH /
+// !! pulse-LOW with INPUT_PULLUP, on the theory that a broken wire would read
+// !! HIGH = "no ack" = fail loud. That is only true if the break is at THIS
+// !! pin. The divider's bottom-leg resistor sits between this node and GND, so
+// !! a break ANYWHERE UPSTREAM -- the ack wire, an unplugged or unpowered
+// !! ServoNano -- pinned the node LOW through it, which the old code read as
+// !! "acked". Every command then reported success and SERVO_ACK_MODE 2's
+// !! retry-until-confirmed guarantee became vacuous. No divider ratio fixes
+// !! that; the polarity has to be the other way round.
+// !!
+// !! Now the bottom-leg resistor IS the fail-safe: any upstream break parks the
+// !! node LOW = "no ack" = the enforced retry actually fires. INPUT_PULLDOWN
+// !! covers the remaining case where the divider itself is absent.
+// !!
+// !! REQUIRES A 3.3k BOTTOM LEG. INPUT_PULLDOWN (~45k) sits in parallel with
+// !! it, so with 1.8k/3.3k the HIGH level is 5*(3.3||45)/(1.8+(3.3||45)) =
+// !! 3.15 V, comfortably over the ESP32-S3's V_IH of 0.75*VDD = 2.475 V. With a
+// !! 2k bottom leg it collapses to 2.45 V and the ack stops working. Do NOT
+// !! flash this onto a rig whose divider is 2k/2k.
+// !!
+// !! BOTH SIDES MUST BE FLASHED TOGETHER. A ServoNano running the old
+// !! active-LOW build idles HIGH, which this code would read as a permanent
+// !! ack -- the exact failure the change removes. servoAckProbeIdle() below
+// !! detects that at boot and says so loudly.
 //
 // SERVO_ACK_MODE  0 = off      (no wire fitted; original open-loop behaviour)
 //                 1 = observe  (log every missing ack, keep running)
@@ -505,11 +540,22 @@ unsigned long servoAckMisses = 0;
 // Let the previous command's 40 ms hold expire so it cannot be mistaken for ours.
 static void servoAckWaitIdle() {
   unsigned long t0 = millis();
-  while (digitalRead(SERVO_ACK_PIN) == LOW && millis() - t0 < 100) {}
+  while (digitalRead(SERVO_ACK_PIN) == HIGH && millis() - t0 < 100) {}
 }
 static bool servoAckSeen() {
   unsigned long t0 = millis();
   while (millis() - t0 < SERVO_ACK_TIMEOUT_MS)
+    if (digitalRead(SERVO_ACK_PIN) == HIGH) return true;
+  return false;
+}
+
+// Boot-time firmware-match check. Under the active-HIGH protocol the line must
+// IDLE LOW; a ServoNano still running the old active-LOW build idles HIGH, and
+// this code would then read every command as instantly acked. Returns false if
+// the line never goes LOW -- stale ServoNano firmware, or a short to 5 V.
+static bool servoAckProbeIdle() {
+  unsigned long t0 = millis();
+  while (millis() - t0 < 250)
     if (digitalRead(SERVO_ACK_PIN) == LOW) return true;
   return false;
 }
@@ -996,7 +1042,7 @@ void initColorSensor() {
   digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
 }
 
 // OUT is a 50%-duty square wave whose frequency tracks light intensity for
@@ -1021,12 +1067,12 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
     tcsSelect(TCS_GREEN);
     delay(2);
     sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);
-    delay(2);
-    sb += tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR);
     delay(2);
     sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);
+    delay(2);
+    sb += tcsReadFrequencyHz();
   }
   r = sr / 5;
   g = sg / 5;
@@ -1089,34 +1135,28 @@ const float SCAN_OFFSET_Y = 8.0f;
 const float SCAN_Y_MAX = -0.05f;
 static inline float clampScanY(float y) { return y > SCAN_Y_MAX ? SCAN_Y_MAX : y; }
 
-// Disc classification by a SIMPLE THRESHOLD on the ambient-subtracted clear
+// Disc classification by a SIMPLE THRESHOLD on the ambient-subtracted BLUE
 // channel — the two faces separate by ~10x, so no model is needed. gridState
 // holds the FRONT/displayed state (1 = cyan/on, 0 = black/off). The sensor views
 // the BACK of each disc: an ON disc (cyan front) shows its BLACK back and reads
 // LOW; an OFF disc (black front) shows its cyan back and reads HIGH. So on =
-// clear below the threshold. Value sits in the wide gap between the on-cluster
+// BLUE below the threshold. Value sits in the wide gap between the on-cluster
 // (~1.8k) and off-cluster (~16k); a fixed cut is robust to that much margin.
-// Classification threshold. Named for the channel it ACTUALLY reads: physically
-// BLUE, not clear.
+// Classification threshold, on the BLUE channel. The output slots match their
+// names: `b` holds BLUE, `c` holds CLEAR (the TcsFilter enum encodes this rig's
+// crossed S2/S3 lines -- see the enum for the wiring detail).
 //
-// !! THE TCS3200 S2/S3 SELECT LINES ARE PHYSICALLY CROSSED ON THIS RIG
-// !! (measured 2026-08-09, 6-pass two-class run). The TcsFilter enum labels are
-// !! the datasheet mapping and are therefore WRONG for what each value selects
-// !! here. An unfiltered channel must be ~ the sum of the filtered ones:
-// !!     true R+G+B = 13276  vs  the value-2 channel = 1753   ratio 0.07  absurd
-// !!     true R+G+B = 13276  vs  the value-1 channel = 13888  ratio 1.05  correct
-// !! So: value 0 -> RED, value 1 -> CLEAR (labelled TCS_BLUE), value 2 -> BLUE
-// !! (labelled TCS_CLEAR), value 3 -> GREEN. tcsReadRGBC's `b` output physically
-// !! holds CLEAR and its `c` output physically holds BLUE, so classifyDisc()
-// !! thresholds BLUE.
-// !!
-// !! DO NOT "FIX" THE WIRING. Blue discriminates the cyan disc face from the
-// !! black one far better than clear, measured on the same run:
-// !!     blue  (value 2): black-back  828..1628, cyan-back 7677..14695 -> 10.21x
-// !!     clear (value 1): black-back 2075..2903, cyan-back 4462..7046  ->  2.22x
+// !! THE INVARIANT: classifyDisc THRESHOLDS BLUE. Blue discriminates the cyan
+// !! disc face from the black one far better than clear, measured 2026-08-09 on
+// !! a 6-pass two-class run:
+// !!     blue : black-back  828..1628, cyan-back 7677..14695 -> 10.22x
+// !!     clear: black-back 2075..2903, cyan-back 4462..7046  ->  2.22x
 // !! Clear collects broadband return from both faces and dilutes the colour
-// !! difference. Making the labels honest would cut usable margin from 2.17x
-// !! each way to 1.24x. The names are wrong; the behaviour is correct.
+// !! difference; re-pointing this at CLEAR would cut usable margin from 2.17x
+// !! each way to 1.24x. (How the crossing was proven: an unfiltered channel must
+// !! be ~ the sum of the filtered ones, and true R+G+B = 13276 matches the
+// !! value-1 channel at 13888 (ratio 1.05), not the value-2 channel at 1753
+// !! (ratio 0.07) -- so value 1 is the unfiltered/CLEAR one, not value 2.)
 //
 // 3535 replaces the historical 6000: the GEOMETRIC MEAN of the two measured
 // populations (black-back ceiling 1628, cyan-back floor 7677), so margin is
@@ -1125,7 +1165,7 @@ static inline float clampScanY(float y) { return y > SCAN_Y_MAX ? SCAN_Y_MAX : y
 // full-board false positives (3291..5955) came from. 3535 gives 2.17x both ways;
 // 0/444 misclassified at either value on the validation run.
 const long SCAN_ON_BLUE_MAX = 3535;   // ambient-sub BLUE < this => cyan/on (front)
-static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+static inline uint8_t classifyDisc(long b) { return (b < SCAN_ON_BLUE_MAX) ? 1 : 0; }
 
 // Re-home + reassert mm/absolute modes. $1=255 lives in EEPROM so it would
 // survive on its own, but matching the boot sequence keeps state predictable.
@@ -1143,7 +1183,7 @@ void rehome() {
 }
 
 // One full scan sweep: re-home, drop the flip arm to SCAN, sweep the sensor over
-// every cell, read the ambient-subtracted clear channel and threshold it into
+// every cell, read the ambient-subtracted BLUE channel and threshold it into
 // gridState. (The old blown-regime ceiling / re-init recovery is gone — ambient
 // subtraction removes the room-light sensitivity that caused that failure.)
 // Serpentine scan order as a flat index 0..GRID_W*GRID_H-1: even rows L→R, odd
@@ -1188,7 +1228,7 @@ void scanGrid() {
     // 1. Sense this cell (stationary).
     long r, g, b, c;
     readAmbientSubtracted(r, g, b, c);
-    uint8_t on = classifyDisc(c);
+    uint8_t on = classifyDisc(b);
     gridState[y][x] = on;
     rowOn += on;
     bool last = (i == N - 1);
@@ -2094,13 +2134,13 @@ restart_grbl:
 
 void setup() {
   // Servo is driven by a dedicated 5V Arduino Nano over Serial2, TX-only on D9
-  // → Nano D0 RX, shared GND. RX pin is -1 (nothing comes back on this link).
+  // → Nano D2 RX (SoftwareSerial), shared GND. RX pin is -1 (nothing comes back on this link).
   // One-way; the companion sketch parses integer µs values per line. Bring the
   // UART up first so the very first park command below is actually received.
   // The ESP32-S3 GPIO matrix routes UART2's TX to D9, so the WIRING IS
   // UNCHANGED from the RP2040 bit-bang that used to drive the same pin.
   Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);
-  pinMode(SERVO_ACK_PIN, INPUT_PULLUP);
+  pinMode(SERVO_ACK_PIN, INPUT_PULLDOWN);
   delay(100);
   servoTxLine(SERVO_US_REST);
 
@@ -2120,6 +2160,14 @@ void setup() {
   // The log persists across resets.
   plog::begin();
   plog::log("boot");
+#if SERVO_ACK_MODE > 0
+  // Active-HIGH ack: the line must idle LOW. Idling HIGH means the
+  // ServoNano still has the old active-LOW firmware, under which every
+  // command would read as acked and SERVO_ACK_MODE 2 would enforce
+  // nothing. By here the boot REST command's 40 ms pulse is long gone.
+  if (!servoAckProbeIdle())
+    plog::log("ACK LINE IDLES HIGH - ServoNano is probably still running the OLD active-LOW build. The ack is NOT protecting you: flash ServoNano.ino before running any job.");
+#endif
   // Flip/servo build variables. A boot line is the only record of which firmware
   // a run actually used, and the flip regime (engage/release base angles, comp
   // mode, unload) is exactly what a bad print has to be read against. Mirrors

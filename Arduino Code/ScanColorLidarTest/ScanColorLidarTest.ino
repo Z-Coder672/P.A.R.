@@ -19,7 +19,7 @@
 //     The calibration offset is COLOR-DEPENDENT — that's one reason the color
 //     scan runs at all: both sensors view the disc's BACK, and the ToF reading
 //     lands differently on the two back colors. The same-row color read
-//     classifies each cell's back (clear < SCAN_ON_BLUE_MAX → black back).
+//     classifies each cell's back (BLUE < SCAN_ON_BLUE_MAX → black back).
 //     The class is logged on every lidar cell marker.
 //
 // RAW MODE (LIDAR_APPLY_CALIBRATION 0, the current setting): the firmware
@@ -161,15 +161,26 @@ const int LIDAR_MAX_SAMPLES = 100;  // cap; 4 s / 50 ms ≈ 80 + slack
 VL53L4CD lidar;
 
 // S2/S3 select the photodiode filter bank.
+//
+// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
+// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
+// for values 1 and 2 -- the value assignments below already account for that.
+// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
+// and classifyDisc thresholds `b`.
+//
+// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
+// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
+// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
+// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
 enum TcsFilter {
-  TCS_RED = 0,    // S2=L, S3=L
-  TCS_BLUE = 1,   // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
+  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
+  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
+  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
 // Servo control offloaded to a dedicated 5V Arduino Nano over a bit-banged TX
-// line on Arduino D9 → 5V Nano D0 RX, shared GND, one-way. 9600-baud software
+// line on Arduino D9 → 5V Nano D2 RX (SoftwareSerial; D0 is its USB debug echo), shared GND, one-way. 9600-baud software
 // UART (mbed's UART class on an arbitrary PinName crashed the chip). See
 // PARMain.ino / ServoNano.ino for the full rationale.
 const int SERVO_TX_PIN = D9;
@@ -551,7 +562,7 @@ void initColorSensor() {
   digitalWrite(LED_PIN, LOW);  // LEDs off when idle
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
 }
 
 // OUT is a 50%-duty square wave whose frequency tracks light intensity for the
@@ -577,12 +588,12 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
     tcsSelect(TCS_GREEN);
     delay(2);
     sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);
-    delay(2);
-    sb += tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR);
     delay(2);
     sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);
+    delay(2);
+    sb += tcsReadFrequencyHz();
   }
   r = sr / 5;
   g = sg / 5;
@@ -613,12 +624,13 @@ void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
   b = sb / AMBIENT_FLASHES; c = sc / AMBIENT_FLASHES;
 }
 
-// Back-color classification cut on the ambient-subtracted clear channel
+// Back-color classification cut on the ambient-subtracted BLUE channel
 // (PARMain's production threshold). POLARITY: the sensor views the disc's
 // BACK — clear BELOW the cut means it's looking at a black back (displayed
 // front = cyan/on); clear above means a cyan back (displayed front = off).
 // Classification threshold. Physically the BLUE channel, not clear — the S2/S3
-// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// select lines are crossed on this rig; the enum labels name the PHYSICAL
+// filter, so tcsReadRGBC's `b` output holds true BLUE and `c` holds true CLEAR.
 // That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
 // Full explanation and the measurements are in PARMain.ino at this constant.
 // 3535 = geometric mean of the measured populations; was 6000, which was
@@ -847,7 +859,7 @@ void doScan() {
     for (int x = 0; x < GRID_W; x++) {
       long r, g, b, c;
       readAmbientSubtracted(r, g, b, c);
-      rowBackBlack[x] = (c < SCAN_ON_BLUE_MAX);
+      rowBackBlack[x] = (b < SCAN_ON_BLUE_MAX);
 
       if (x < GRID_W - 1) {
         moveTo(colorX(y, x + 1), colorY(y, x + 1));  // intra-row (pure X)

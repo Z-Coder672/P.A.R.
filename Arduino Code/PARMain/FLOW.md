@@ -5,17 +5,20 @@
 | Thing | What it does |
 |---|---|
 | Arduino Nano ESP32 | Main brain — WiFi, HTTP, NTP clock, servo, color sensor |
-| Arduino Mega + GRBL | Motion controller — moves the gantry via Serial1 |
-| Servo (D9) | Flips individual discs (black ↔ blue) |
+| Arduino Mega + GRBL | Motion controller — moves the gantry via `Serial1` (D0/D1) |
+| ServoNano link (D9 TX, D2 ack) | `Serial2` TX-only to a dedicated 5 V Nano, which drives the flip servo (black ↔ blue). D2 reads its ack level |
 | TCS3200 (D4–D8) | Color sensor — reads which side of a disc is showing |
+| LED bank (D10) | Illumination for the ambient-subtracted read; HIGH = on |
 | VL53L4CD (A4/A5, I²C) | ToF ranger — per-cell standoff, daily 10:00 scan only |
+
+Full wiring — every pin, both boards, the GRBL/CNC-shield map and the ack divider — is in **`Arduino Code/PINOUT.md`**.
 
 ---
 
 ## Boot (`setup`)
 
 1. **Init grid coords** — 37×18 = 666 cells, each mapped to a physical (X, Y) in mm (negative coords because GRBL homes to full-negative). Starting X offset = 25 mm.
-2. **Attach servo**, set to 0°
+2. **Bring up the servo link** (`Serial2`, TX-only on D9) and park the arm at `SERVO_US_REST` = 565 µs ≈ **2°** — not 0°. 544 µs is the Servo-library 0° floor and still appears as that floor in `SERVO_US_0DEG`/`SERVO_US_MIN`, in `compensatedUs()`'s degree mapping and in ServoNano's parse guard; it is **not** the rest angle.
 3. **Configure TCS3200** — S0/S1 = HIGH/LOW → 20% freq scaling (full speed is too fast to measure)
 4. **Connect WiFi** → `timeBegin()` starts NTP → `timeWaitForSync(30 s)` (bounded only so a dead network can't wedge `setup()` — failure unlocks nothing) → `cadenceLoadRecord()` reads the last lidar scan's date off flash → `lidarEnsure()` brings the VL53L4CD up so a wiring fault surfaces in the log at boot, not at 10:00. The boot `scanGrid()` is commented out — the first color scan happens lazily in `loop()` (first job, `gridStateFresh` false).
 
@@ -50,7 +53,7 @@ poll server  → got bitmap? → re-scan board (skipped if last action was a cle
 
 **4. `scanGrid()` (conditional)** — re-home and re-read every cell with the TCS3200. **Skipped when `gridStateFresh` is set**, i.e. when `gridState[]` is already a *measured* picture of the board: on the first job after boot (reusing `setup()`'s scan), and after any job whose last board-touching action was a scan with no fixing after it — the check pass re-scanned and found ≤`CHECK_FIX_MAX_SKIP` wrong, or the draw flipped nothing at all (`gridStateFromScan`, carried across the idle at the end of the job). That scan already describes the final board, so repeating it costs ~70 min to learn what was just measured. Any flip after a scan makes the state *inferred* rather than measured (`displayBitmap` clears `gridStateFromScan` before its first flip), and the next job re-scans. When the scan is skipped, `rehome()` still runs if `needsRehome` is set — the end-of-job `$1=0` releases the steppers, so the gantry may have been nudged.
 
-Otherwise the full sweep runs. It reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ. The reading sweep runs with the **flip arm parked at REST** (`SERVO_US_SCAN` = `SERVO_US_REST` = 565 µs, changed 2026-08-10). It used to be dropped to ~33.5° so that — since the sensor trails the flip head by `SCAN_OFFSET_X` (−24.005 mm ≈ one cell pitch) — the lowered arm brushed the board and pushed through any squisk left at stage 1 (90°, half-rotated). That secondary settling job is abandoned: the arm now stays up for the whole scan, so the "carriage moves only with the servo at REST" invariant holds trivially (a dropped arm dragged across a populated board is what snapped the flip arm before), and half-rotated discs are no longer nudged during scanning — one left mid-rotation stays mid-rotation until the check pass re-flips it. Each cell is read with **LED ambient-subtraction** and classified by a simple clear-channel threshold (see Color Classification below); ambient subtraction removed the old room-light "blown regime", so the former `SCAN_C_CEILING` guard / sensor re-init recovery is gone.
+Otherwise the full sweep runs. It reseeds `gridState[]` so `displayBitmap` only flips cells that actually differ. The reading sweep runs with the **flip arm parked at REST** (`SERVO_US_SCAN` = `SERVO_US_REST` = 565 µs, changed 2026-08-10). It used to be dropped to ~33.5° so that — since the sensor trails the flip head by `SCAN_OFFSET_X` (−24.005 mm ≈ one cell pitch) — the lowered arm brushed the board and pushed through any squisk left at stage 1 (90°, half-rotated). That secondary settling job is abandoned: the arm now stays up for the whole scan, so the "carriage moves only with the servo at REST" invariant holds trivially (a dropped arm dragged across a populated board is what snapped the flip arm before), and half-rotated discs are no longer nudged during scanning — one left mid-rotation stays mid-rotation until the check pass re-flips it. Each cell is read with **LED ambient-subtraction** and classified by a simple blue-channel threshold (see Color Classification below); ambient subtraction removed the old room-light "blown regime", so the former `SCAN_C_CEILING` guard / sensor re-init recovery is gone.
 
 **5. `displayBitmap()`** — over the band of rows that contain at least one differing cell, flip cells where `desired bit ≠ gridState`. Rows with no differing cells are **skipped entirely** (no move to them — the next flipping row is still entered via `moveToYSafe`, so Y travel stays at an X soft-limit). Returns the number of cells flipped (= cells that were wrong vs the target), used to gate the check pass.
 
@@ -143,11 +146,17 @@ Log lines: `ntp start`/`ntp synced`/`ntp NOT synced`, `cadence: record …`, `ca
 TCS3200 measures R/G/B/Clear light frequencies, read with **LED ambient-subtraction**: `readAmbientSubtracted()` averages `AMBIENT_FLASHES` (3) off/on flashes, each subtracting a 5-frame LEDs-off (ambient) read from a 5-frame LEDs-on (lit) read. This cancels room light so the value depends only on the disc + our own LEDs.
 
 ```
-if channel <  SCAN_ON_BLUE_MAX (3535)  →  cyan/on (1)
-else                                   →  black/off (0)
+if blue <  SCAN_ON_BLUE_MAX (3535)  →  cyan/on (1)
+else                                →  black/off (0)
 ```
 
-Single threshold on the ambient-subtracted channel that `tcsReadRGBC` returns as `c` — the two faces separate by ~10×, so no model is needed (the ternary classifier was retired). **That channel is physically BLUE, not clear:** the TCS3200 S2/S3 select lines are crossed on this rig, so the `TcsFilter` enum labels are wrong. Do **not** "fix" the wiring — blue discriminates the two disc faces 10.21× where true clear manages only 2.22×. 3535 is the geometric mean of the measured populations (black-back ceiling 1628, cyan-back floor 7677), replacing a historical 6000 that was lopsided toward the failing side. Full measurements are in `PARMain.ino` at `SCAN_ON_BLUE_MAX`. **The sensor views the disc BACK**: a displayed-on (cyan-front) disc shows its black back → reads LOW clear; displayed-off shows its cyan back → reads HIGH. `classifyDisc` returns the FRONT/displayed color (`on = clear below threshold`), matching `gridState`'s convention. Ambient subtraction removed the old "blown regime" (bright ambient made every cell read the same → garbled draw), so the former `SCAN_C_CEILING` guard / re-init recovery is gone.
+Single threshold on the ambient-subtracted **BLUE** channel — the slot `tcsReadRGBC` returns as `b`, and the argument `classifyDisc(long b)` takes. The two faces separate by ~10×, so no model is needed (the ternary classifier was retired).
+
+**The TCS3200 S2/S3 select lines are crossed on this rig**, so a commanded (S2,S3) pair selects the filter the datasheet assigns to the *swapped* pair: values 0/3 land on RED/GREEN as printed, but value 1 is CLEAR (datasheet says BLUE) and value 2 is BLUE (datasheet says CLEAR). The `TcsFilter` labels name the **physical** filter — `TCS_CLEAR = 1`, `TCS_BLUE = 2` — so `b` really does hold blue and `c` really does hold clear. (They carried the datasheet names until Aug 2026 and were wrong on those two values; the relabel changed no commanded pin sequence and no verdict.) The invariant is that **`classifyDisc` thresholds BLUE** — it discriminates the two disc faces 10.22× where true clear manages only 2.22×. The enum's two value assignments are the only place the wiring is encoded, so if S2/S3 are ever rewired straight they must move with it.
+
+3535 is the geometric mean of the measured populations (black-back ceiling 1628, cyan-back floor 7677), replacing a historical 6000 that was lopsided toward the failing side. Full measurements are in `PARMain.ino` at `SCAN_ON_BLUE_MAX`; the wiring itself is documented in `Arduino Code/PINOUT.md`.
+
+**The sensor views the disc BACK**: a displayed-on (cyan-front) disc shows its black back → reads LOW blue; displayed-off shows its cyan back → reads HIGH. `classifyDisc` returns the FRONT/displayed color (`on = blue below threshold`), matching `gridState`'s convention. Ambient subtraction removed the old "blown regime" (bright ambient made every cell read the same → garbled draw), so the former `SCAN_C_CEILING` guard / re-init recovery is gone.
 
 ---
 

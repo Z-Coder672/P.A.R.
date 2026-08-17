@@ -62,11 +62,23 @@ const int  AVG_CYCLES  = 5;    // cycles averaged per reported sample
 const int  LED_SETTLE_MS = 20; // settle after toggling the LEDs before reading
 
 // S2/S3 select the photodiode filter bank (MSB=S2, LSB=S3).
+// S2/S3 select the photodiode filter bank.
+//
+// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
+// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
+// for values 1 and 2 -- the value assignments below already account for that.
+// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
+// and classifyDisc thresholds `b`.
+//
+// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
+// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
+// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
+// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
 enum TcsFilter {
-  TCS_RED   = 0,  // S2=L, S3=L
-  TCS_BLUE  = 1,  // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
+  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
+  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
+  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
 // ---- Recording state --------------------------------------------------------
@@ -94,8 +106,8 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
                  unsigned long& b, unsigned long& c) {
   tcsSelect(TCS_RED);   delay(2); r = tcsReadFrequencyHz();
   tcsSelect(TCS_GREEN); delay(2); g = tcsReadFrequencyHz();
-  tcsSelect(TCS_BLUE);  delay(2); b = tcsReadFrequencyHz();
   tcsSelect(TCS_CLEAR); delay(2); c = tcsReadFrequencyHz();
+  tcsSelect(TCS_BLUE);  delay(2); b = tcsReadFrequencyHz();
 }
 
 // Take one ambient-subtracted sample: AVG_CYCLES cycles of (lit - ambient),
@@ -188,7 +200,7 @@ void setup() {
   // S0=HIGH, S1=LOW → 20% output frequency scaling.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
 
   Serial.println(F("# CollectColorAmbient ready — send 'b' (blue) or 'k' (black) to start, 's' to stop."));
 }

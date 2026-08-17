@@ -1,5 +1,5 @@
 // TCS3200 sanity check: LED ambient-subtracted RGBC read + a simple
-// clear-channel threshold (no ML model). Prints the ambient-subtracted RGBC and
+// BLUE-channel threshold (no ML model). Prints the ambient-subtracted RGBC and
 // the resulting front-face guess (cyan/black) roughly twice a second.
 //
 // Read model (matches PARMain): a 5-frame averaged RGBC with the illumination
@@ -7,7 +7,7 @@
 // Room light cancels, so the result depends only on the disc + our own LEDs.
 //
 // Polarity: the sensor views the BACK of each disc. An ON disc (cyan on the
-// FRONT) shows its BLACK back to the sensor -> LOW clear channel; an OFF disc
+// FRONT) shows its BLACK back to the sensor -> LOW BLUE channel; an OFF disc
 // (black front) shows its cyan back -> HIGH clear. So front cyan/on = clear
 // below the threshold. gridState/the "on" result is the FRONT/displayed color.
 
@@ -18,11 +18,23 @@ const int TCS_S3  = D7;
 const int TCS_OUT = D8;
 const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 
+// S2/S3 select the photodiode filter bank.
+//
+// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
+// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
+// for values 1 and 2 -- the value assignments below already account for that.
+// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
+// and classifyDisc thresholds `b`.
+//
+// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
+// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
+// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
+// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
 enum TcsFilter {
-  TCS_RED   = 0,
-  TCS_BLUE  = 1,
-  TCS_CLEAR = 2,
-  TCS_GREEN = 3
+  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
+  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
+  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
+  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
 void tcsSelect(TcsFilter f) {
@@ -44,8 +56,8 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
   for (int i = 0; i < 5; i++) {
     tcsSelect(TCS_RED);   delay(2); sr += tcsReadFrequencyHz();
     tcsSelect(TCS_GREEN); delay(2); sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR); delay(2); sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
   }
   r = sr / 5; g = sg / 5; b = sb / 5; c = sc / 5;
 }
@@ -66,16 +78,17 @@ void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
   c = (long)lc - (long)ac; if (c < 0) c = 0;
 }
 
-// Simple threshold on the ambient-subtracted clear channel. 1 = cyan/on
+// Simple threshold on the ambient-subtracted BLUE channel. 1 = cyan/on
 // (front), 0 = black/off. See polarity note at the top.
 // Classification threshold. Physically the BLUE channel, not clear — the S2/S3
-// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// select lines are crossed on this rig; the enum labels name the PHYSICAL
+// filter, so tcsReadRGBC's `b` output holds true BLUE and `c` holds true CLEAR.
 // That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
 // Full explanation and the measurements are in PARMain.ino at this constant.
 // 3535 = geometric mean of the measured populations; was 6000, which was
 // lopsided (3.69x / 1.28x) toward the failure side.
 const long SCAN_ON_BLUE_MAX = 3535;
-static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+static inline uint8_t classifyDisc(long b) { return (b < SCAN_ON_BLUE_MAX) ? 1 : 0; }
 
 void setup() {
   Serial.begin(115200);
@@ -92,7 +105,7 @@ void setup() {
   // 20% output frequency scaling.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
 
   Serial.println("TCS3200 ambient-subtracted test ready.");
   Serial.println("R\tG\tB\tC\tguess");
@@ -101,7 +114,7 @@ void setup() {
 void loop() {
   long r, g, b, c;
   readAmbientSubtracted(r, g, b, c);
-  const char* guess = classifyDisc(c) ? "cyan" : "black";
+  const char* guess = classifyDisc(b) ? "cyan" : "black";
 
   Serial.print(r); Serial.print('\t');
   Serial.print(g); Serial.print('\t');
