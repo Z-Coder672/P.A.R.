@@ -102,6 +102,36 @@ enum TcsFilter {
   TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
+// ---- Shield peripheral power (D11 -> TPS22919 ON) --------------------------
+// The shield PCB gates a switched 5V rail (5VSWED) behind a load switch whose
+// ON pin is this GPIO. That rail feeds the Mega/GRBL, the ServoNano, the lidar
+// and the TCS3200 -- everything except this MCU and the servo motor itself
+// (which sits on unswitched +5V, deliberately: see PCBnSCHs/REVIEW.md C1).
+//
+// The part has an internal 530k pull-down, so the rail is OFF until this pin is
+// driven HIGH. That is the intended behaviour, not a defect: it gives a
+// deterministic power-on order -- this MCU boots first, then brings everything
+// else up -- rather than every board racing at power-on.
+//
+// !! CONSEQUENCES, all of which are load-bearing:
+// !! 1. This must be driven HIGH before ANY peripheral is addressed. The boot
+// !!    servo-park below is sent over a UART to a board that is unpowered until
+// !!    this happens, so the park would be silently lost.
+// !! 2. SHIELD_PWR_SETTLE_MS must cover the ServoNano's bootloader (~2 s on a
+// !!    CH340 Nano) before the park command is sent, not just the rail's rise.
+// !! 3. Every sketch run ON THE SHIELD needs these two lines. A sketch without
+// !!    them presents as a completely dead board -- no GRBL, no sensors, no
+// !!    servo response -- which looks like a wiring fault. See PINOUT.md S10.
+// !! 4. The rail is all-or-nothing. It cannot power-cycle the lidar for
+// !!    recovery without also resetting GRBL and the ServoNano.
+// !! 5. On esp_restart() (the 60 s stall watchdog, grblAlarmRecover's fallback)
+// !!    this pin tri-states and the whole rail drops -- so a watchdog reset now
+// !!    power-cycles GRBL too. That is a STRONGER recovery than the soft reset
+// !!    it replaces, and PARMain re-homes on boot anyway.
+// !! On a hand-wired rig with no shield, D11 is unconnected and this is a no-op.
+const int SHIELD_PWR_PIN = D11;
+const unsigned long SHIELD_PWR_SETTLE_MS = 2500;
+
 const int SERVO_PIN = D9;
 // Pulse widths match the standard Servo lib mapping
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈2° (parked),
@@ -2162,9 +2192,16 @@ void setup() {
   // UART up first so the very first park command below is actually received.
   // The ESP32-S3 GPIO matrix routes UART2's TX to D9, so the WIRING IS
   // UNCHANGED from the RP2040 bit-bang that used to drive the same pin.
+  // Shield peripheral rail FIRST -- the ServoNano this park command is aimed at
+  // is powered from it, and so is GRBL. No-op on a hand-wired rig.
+  pinMode(SHIELD_PWR_PIN, OUTPUT);
+  digitalWrite(SHIELD_PWR_PIN, HIGH);
+
   Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);
   pinMode(SERVO_ACK_PIN, INPUT);  // divider's bottom leg is the pulldown
-  delay(100);
+  // Long enough for the ServoNano's bootloader to hand over, or the park is
+  // sent into a board that is not listening yet and the arm stays put.
+  delay(SHIELD_PWR_SETTLE_MS);
   servoTxLine(SERVO_US_REST);
 
   delay(10000);

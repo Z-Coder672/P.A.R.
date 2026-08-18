@@ -491,3 +491,27 @@ the divider ratio. Works unchanged on 2 k/2 k, 2 k/3.3 k and 1.8 k/3.3 k. `SERVO
 D2 = GPIO5 = **ADC1**_CH4 — ADC1 is mandatory, ADC2 is unusable while WiFi is up.
 
 Do not revert to `digitalRead`, and do not fit `INPUT_PULLDOWN`, while the rig is 2 k/2 k.
+
+---
+
+## B1 resolved by design decision, not by a pull-up (2026-08-17)
+
+The earlier recommendation — a 100 kΩ pull-up on `ON` so the rail is on by default — is
+**withdrawn**. It was driven by the brownout-cuts-servo-power argument, and V3 made that
+obsolete by moving `J7.1` to unswitched `+5V`. With the servo off the switched rail, a
+pull-up would only have inverted the default while giving up the one thing the switch is
+good for.
+
+**Adopted instead: `PARMain` drives D11 HIGH as the first statement in `setup()`.** The rail
+stays fail-off, and the board gets a deterministic power-on order — ESP32 first, then Mega,
+ServoNano, lidar and colour sensor. No component change.
+
+Implementation notes that are easy to get wrong:
+- D11 must go HIGH **before** the boot servo-park, which is a UART write to a board on the
+  switched rail. `SHIELD_PWR_SETTLE_MS` = 2500 ms covers the ServoNano's CH340 bootloader.
+- Every sketch used on the shield needs the same two lines; one that lacks them looks like a
+  dead board rather than a firmware omission.
+- The rail is all-or-nothing — it cannot power-cycle the lidar (REVIEW.md C5's flaky init)
+  without also resetting GRBL and the ServoNano, because J11 put the Mega on it.
+- On `esp_restart()` the pin tri-states, so the stall watchdog now power-cycles GRBL too.
+  That is a stronger recovery than the soft reset it replaces.

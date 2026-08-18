@@ -432,12 +432,26 @@ screw terminals for servo/sensor/I²C/limit. Source files and a full design revi
 
 Two things from it that change how the pin map above should be read:
 
-- **D11 becomes the load-switch enable** (`5VSW` → TPS22919 `ON`), gating a switched 5 V rail
-  (`5VSWED`) that feeds the servo, ServoNano, lidar and colour sensor. **No sketch drives
-  D11**, and the part has an internal 530 kΩ pull-down, so as drawn the rail is off and none
-  of those peripherals power up. The recommended fix is a 100 kΩ pull-up from `ON` to 3V3
-  (→ 2.78 V, rail on by default) rather than firmware, so every existing sketch keeps working
-  — and so a brownout can't cut servo power mid-flip.
+- **D11 is the load-switch enable** (`SHIELD_PWR_PIN` → `5VSW` → TPS22919 `ON`), gating a
+  switched 5 V rail (`5VSWED`) that feeds the **Mega/GRBL**, ServoNano, lidar and colour
+  sensor. The servo motor is NOT on it — it sits on unswitched `+5V` (REVIEW.md C1).
+
+  The part's internal 530 kΩ pull-down keeps the rail **off until D11 is driven HIGH**, and
+  that is deliberate: it gives a deterministic power-on order, this MCU first and everything
+  else after. `PARMain` drives it HIGH as the first statement in `setup()`.
+
+  ⚠ **Every sketch run on the shield needs those two lines.** One that lacks them presents
+  as a completely dead board — no GRBL, no sensors, no servo response — which reads like a
+  wiring fault. If a shield-mounted rig looks dead, check D11 before reaching for a meter.
+
+  ⚠ **`SHIELD_PWR_SETTLE_MS` (2500 ms) must cover the ServoNano's bootloader**, not just the
+  rail's rise time. The boot servo-park is a UART write to a board on that rail; send it too
+  early and it is silently lost and the arm stays wherever it was.
+
+  Two consequences worth knowing: the rail is **all-or-nothing**, so it cannot power-cycle
+  the lidar for recovery without also resetting GRBL and the ServoNano; and on `esp_restart()`
+  the pin tri-states, so a watchdog reset now power-cycles GRBL as well — a stronger recovery
+  than the soft reset it replaces, and PARMain re-homes on boot regardless.
 - **The level-shift dividers are 2 kΩ/2 kΩ** on both the GRBL RX and ack lines, which is out
   of spec (see §2 and §3b). Both need a 3.3 kΩ bottom leg.
 
