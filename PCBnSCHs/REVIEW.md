@@ -376,3 +376,118 @@ Two review passes disagreed; these are the resolutions.
    `servoAckWaitIdle()`'s stuck-low timeout to a hard fault (C4).
 6. **Docs:** add D11 to `PINOUT.md §2` and close the level-shifting audit item; correct the
    "fails loud" claim in `PINOUT.md §3b` and `CLAUDE.md` (C4).
+
+---
+
+## Revision status — V3 gerbers + V2 netlist (2026-08-17)
+
+Measured from `Gerber_PCB3_Shield_2026-08-17_V3.zip` and
+`Netlist_Schematic3_Shield_2026-08-17_V2.tel`. Path resistances are Dijkstra over a
+two-layer segment graph stitched at the vias, with true arc lengths from the I/J offsets
+(V3's top layer has 5 arcs contributing +1.73 mm over their chords — no longer negligible).
+
+### Fixed
+
+| Was | Now |
+|---|---|
+| **C1** servo droop: 198–230 mΩ, 300–345 mV @1.5 A | **~46.7 mΩ, ~70 mV** — J1.3 → J7.1 is 68.0 mm entirely at 30 mil = 44.4 mΩ, plus ~2.3 mΩ of plane return. **Inside the ≤0.2–0.3 V budget with 130–230 mV of headroom for the harness.** |
+| **C2** daisy chain, servo last | Resolved. `J7.1` moved from `5VSWED` to **`+5V`**, so the servo no longer passes through U4 or through the sensors' supply traces. `5VSWED` now carries only ServoNano logic + lidar + colour sensor (tens of mA), so the chain ordering stops mattering. |
+| **C11** two 5 V sources shorted | Resolved. `+5V` = {`C2.1`, `J1.3`, `J7.1`, `U4.1`} — `J1.3` is now the sole source. |
+| U4 → J8.6 sensor rail | 62.6 → 53.8 mΩ (73.4 mm now at 30 mil). Irrelevant at sensor currents, but free. |
+
+Taking the servo off the load switch was the decisive change — it removed the 88–120 mΩ
+R_on term that widening alone could never touch, and it also defuses **B1**'s worst
+consequence (a brownout can no longer cut servo power mid-flip, because the servo is no
+longer behind an MCU-gated switch).
+
+### ⚠ New, and now blocking: the dividers are still 2 kΩ/2 kΩ
+
+`$PACKAGES` is **byte-identical** between netlist V1 and V2 — no component value changed and
+no part was added. R1–R5 are all still 2 kΩ.
+
+This was "out of spec" before. **With the active-HIGH ack firmware (committed 2026-08-17) it
+is now a hard failure**, because `INPUT_PULLDOWN` (~45 kΩ) sits in parallel with the bottom leg:
+
+| Divider | bottom ‖ 45 kΩ | asserted level | vs V_IH 2.475 V |
+|---|---|---|---|
+| 1.8 k / 3.3 k (breadboard rig) | 3.075 kΩ | **3.154 V** | OK |
+| 2 k / 3.3 k | 3.075 kΩ | **3.029 V** | OK |
+| **2 k / 2 k (this PCB)** | 1.915 kΩ | **2.446 V** | **FAILS** |
+
+On this board the ack would never assert, `SERVO_ACK_MODE 2` would retry forever, and
+**PARMain would block on the first servo command of the first job.** The current hand-wired
+rig is 1.8 k/3.3 k and is unaffected — this bites only if the PCB is fabbed as drawn.
+
+**R3 and R5 must go to 3.3 kΩ before fab.** Same for R2/R4's partner legs on the GRBL link.
+
+### Also new: J11 moved onto the switched rail
+
+`J11.1`/`J11.2` moved from `+5V` to `5VSWED`. If J11 is an **output** (the shield powering
+something on the Mega header) that is fine. If it is an **input** — 5 V arriving from the
+Mega — it now back-feeds U4's VOUT, defeating the load switch and holding `5VSWED` live
+whenever the Mega is powered, regardless of D11. **Confirm the direction before fab.**
+
+### Still outstanding — unchanged in V2/V3
+
+Netlist connectivity is otherwise identical, and no components were added, so every finding
+below still stands exactly as written above:
+
+- **B1** `5VSW`/D11 — no `ON` pull-up, no firmware drives D11. The rail is still off, so the
+  sensors, lidar and ServoNano still get no power. (The servo now does, via `+5V`.)
+- **B3** `LIMSW-` is still a single-pin net; `LIMSW+` still reaches only C1. Still no `LED+`.
+- **B4** 3V3 still unrouted.
+- **C3** still zero decoupling; `5VSWED` still has no capacitor. Note the inrush ceiling no
+  longer applies to the servo, so bulk at J7 can now be sized freely.
+- **C5** no I²C pull-ups. **C7** no gate pull-down on Q1, still 2N7002. **C8** R1 still 2 kΩ.
+- **C9** J12 still has no ground pin. **C6** sensor rail still 5 V into D8.
+- All DFM items (m1–m9) unchanged.
+
+---
+
+## Revision status — netlist V3 + BOM V2 (2026-08-17)
+
+### Fixed
+- **B2 dividers** — `R3`, `R5` → **3.3 kΩ** (R1/R2/R4 stay 2 kΩ). Asserted level 3.03–3.11 V
+  against V_IH 2.475 V. Connectivity is otherwise byte-identical to netlist V2.
+
+### J11 confirmed — and it makes B1 worse
+`J11.1`/`J11.2` on `5VSWED` are an **output**: the shield powers the Mega. That is
+intentional and correct as a topology, and it resolves the dual-source question.
+
+But it means **the Mega — and therefore GRBL — is now downstream of the load switch**, which
+nothing turns on (B1: `ON` ← D11, undriven, internal 530 kΩ pull-down). As drawn, powering
+the board leaves the motion controller dead as well as the sensors. This raises B1 from
+"peripherals don't come up" to "nothing except the ESP32 comes up", and makes the
+**100 kΩ `ON` pull-up to 3V3 the single most important remaining change**.
+
+Two follow-ons worth checking:
+- Load on the switch is now Mega + CNC-shield logic (~300 mA est.) plus ServoNano and
+  sensors. Comfortably inside 1.5 A, ~27 mV across R_on — fine.
+- Feeding the Mega's **5 V pin** bypasses its USB/barrel power-select. If the Mega's USB is
+  also connected (for flashing GRBL), that is two sources on one rail. Normal practice is to
+  power the Mega *or* plug its USB, not both — worth a silkscreen note near J11.
+
+### The hand-wired rig is 2 kΩ/2 kΩ — not 1.8 kΩ/3.3 kΩ
+Physically confirmed 2026-08-17. `PINOUT.md` and `CLAUDE.md` both claimed 1.8 k/3.3 k; both
+have been corrected. This matters more than a documentation slip:
+
+| Divider | Asserted level | vs V_IH 2.475 V |
+|---|---|---|
+| 2 k/2 k, ideal 5.00 V | 2.500 V | +25 mV |
+| 2 k/2 k, real V_OH 4.90 V | 2.450 V | **−25 mV** |
+| 2 k/2 k **+ INPUT_PULLDOWN** | **2.446 V** | **−29 mV — hard fail** |
+
+The old active-LOW protocol survived on this ratio because the *idle* level with
+`INPUT_PULLUP` was 2.517 V — 42 mV of margin, which is why the 2026-07-27 validation run
+(750 commands, 0 misses) passed. The active-HIGH change plus `INPUT_PULLDOWN` would have
+inverted that into a permanent fail: the ack never asserts, `SERVO_ACK_MODE 2` retries
+forever, and PARMain blocks on the first servo command of the first job.
+
+**Fix applied in firmware, not hardware** (no 3.3 kΩ/1.8 kΩ parts on hand, and the rig and
+the PCB must run one build): the ack is now read as an **analog level**, `servoAckHigh()`,
+threshold **1.20 V**. Idle is 0 V (the divider's bottom leg is the pulldown), asserted is
+≥2.45 V, so the decision sits >1.2 V from either state and no longer depends on V_IH or on
+the divider ratio. Works unchanged on 2 k/2 k, 2 k/3.3 k and 1.8 k/3.3 k. `SERVO_ACK_PIN` =
+D2 = GPIO5 = **ADC1**_CH4 — ADC1 is mandatory, ADC2 is unusable while WiFi is up.
+
+Do not revert to `digitalRead`, and do not fit `INPUT_PULLDOWN`, while the rig is 2 k/2 k.

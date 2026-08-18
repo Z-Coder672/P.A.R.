@@ -123,20 +123,35 @@ Two wires, opposite directions. Source: `ServoNano/ServoNano.ino`.
 ServoNano is a **5 V** AVR; the ESP32-S3 is **not 5 V tolerant**. The ack line is divided:
 
 ```
-ServoNano D3 ──[ 1.8 kΩ ]──┬── Main MCU D2
-                           │
-                        [ 3.3 kΩ ]
-                           │
-                          GND
+ServoNano D3 ──[ R_top ]──┬── Main MCU D2  (read as an ANALOG level)
+                          │
+                       [ R_bot ]
+                          │
+                         GND
 ```
 
-5.0 × 3.3 / (1.8 + 3.3) = **3.24 V**; with the main MCU's `INPUT_PULLDOWN` (~45 kΩ) in
-parallel with the 3.3 kΩ leg it lands at **3.15 V**, still well over the ESP32-S3's V_IH of
-0.75 × VDD = 2.475 V.
+| Where | R_top / R_bot | Asserted level |
+|---|---|---|
+| **Hand-wired rig (physically confirmed 2026-08-17)** | **2 kΩ / 2 kΩ** | **2.45–2.50 V** |
+| Shield PCB (netlist V3 / BOM V2) | 2 kΩ / 3.3 kΩ | 3.03–3.11 V |
+| Historical / as this file used to claim | 1.8 kΩ / 3.3 kΩ | 3.24 V |
 
-**The 3.3 kΩ bottom leg is load-bearing twice over: it sets the level AND it is what parks
-the line LOW if ServoNano goes away.** A **2 kΩ** bottom leg gives 2.45 V with the pulldown
-fitted and the ack stops working — do not use one.
+⚠ **This file previously stated the rig was 1.8 kΩ/3.3 kΩ. It is not — it is 2 kΩ/2 kΩ,**
+physically confirmed 2026-08-17. That matters, because 2 k/2 k puts the asserted level at
+2.45–2.50 V, straddling the ESP32-S3's V_IH of 0.75 × VDD = **2.475 V**. It happened to work
+under the old active-LOW protocol because the *idle* level with `INPUT_PULLUP` was 2.52 V —
+45 mV of margin, which is why the 2026-07-27 validation run passed.
+
+**The main MCU therefore reads this pin as an ANALOG level, not a digital one** — see
+`servoAckHigh()`. Threshold is **1.20 V**, which sits more than 1.2 V from either state
+(idle 0 V, asserted ≥ 2.45 V) and is independent of V_IH and of the divider ratio. It works
+unchanged on 2 k/2 k, 2 k/3.3 k and 1.8 k/3.3 k. Do **not** revert it to `digitalRead` while
+the rig is 2 k/2 k, and do **not** fit `INPUT_PULLDOWN` — a 45 kΩ internal pulldown drags
+2 k/2 k down to 2.446 V and would hang `SERVO_ACK_MODE 2` forever on the first command.
+
+**The bottom-leg resistor is what parks the line LOW if ServoNano goes away**, which is the
+fail-safe the active-HIGH polarity depends on. `SERVO_ACK_PIN` = D2 = GPIO5 = **ADC1**_CH4;
+ADC1 is mandatory since ADC2 is unusable while WiFi is up.
 
 `ACK_HOLD_MS = 40` must outlast a repeat burst but stay under the 100 ms minimum settle,
 so one command's ack can't be misread as the next one's.

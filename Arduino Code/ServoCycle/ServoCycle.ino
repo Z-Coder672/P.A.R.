@@ -111,15 +111,38 @@ const unsigned long SERVO_ACK_TIMEOUT_MS = 80;   // must exceed the ~6 ms frame
 unsigned long servoAckMisses = 0;
 
 #if SERVO_ACK_MODE > 0
+// Read the ack as an ANALOG level, not a digital one.
+//
+// !! WHY: the divider feeds a 5 V swing into a 3.3 V pin, so the asserted level
+// !! depends entirely on the divider ratio, and digitalRead compares it against
+// !! the ESP32-S3's V_IH of 0.75*VDD = 2.475 V. The rig is physically wired
+// !! 2k/2k, which puts the asserted level at 2.45-2.50 V -- straddling V_IH, so
+// !! digitalRead is a coin flip (and with INPUT_PULLDOWN it reads LOW outright,
+// !! which would hang SERVO_ACK_MODE 2 forever on the first command). The shield
+// !! PCB uses 2k/3.3k and would be fine, but the two must run one firmware.
+// !!
+// !! Comparing against a threshold far below BOTH divider ratios' asserted level
+// !! removes the dependency on V_IH entirely: idle is 0 V (the divider's bottom
+// !! leg IS the pulldown), asserted is 2.45 V at worst. 1.20 V sits >1.2 V from
+// !! either state. This is strictly more robust than digitalRead ever was here,
+// !! and it works unchanged on 2k/2k, 2k/3.3k and 1.8k/3.3k.
+// !!
+// !! SERVO_ACK_PIN = D2 = GPIO5 = ADC1_CH4. ADC1 is mandatory: ADC2 is unusable
+// !! while WiFi is running, and PARMain always has WiFi up.
+const int SERVO_ACK_THRESHOLD_MV = 1200;
+static inline bool servoAckHigh() {
+  return analogReadMilliVolts(SERVO_ACK_PIN) > SERVO_ACK_THRESHOLD_MV;
+}
+
 // Let the previous command's 40 ms hold expire so it cannot be mistaken for ours.
 static void servoAckWaitIdle() {
   unsigned long t0 = millis();
-  while (digitalRead(SERVO_ACK_PIN) == HIGH && millis() - t0 < 100) {}
+  while (servoAckHigh() && millis() - t0 < 100) {}
 }
 static bool servoAckSeen() {
   unsigned long t0 = millis();
   while (millis() - t0 < SERVO_ACK_TIMEOUT_MS)
-    if (digitalRead(SERVO_ACK_PIN) == HIGH) return true;
+    if (servoAckHigh()) return true;
   return false;
 }
 
@@ -130,7 +153,7 @@ static bool servoAckSeen() {
 static bool servoAckProbeIdle() {
   unsigned long t0 = millis();
   while (millis() - t0 < 250)
-    if (digitalRead(SERVO_ACK_PIN) == LOW) return true;
+    if (!servoAckHigh()) return true;
   return false;
 }
 // Mode 2 RETRIES FOREVER rather than giving up. Blocking here is the safe
@@ -178,7 +201,7 @@ unsigned long cycle = 0, startMs = 0;
 void setup() {
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);  // TX-only servo link on D9
-  pinMode(SERVO_ACK_PIN, INPUT_PULLDOWN);
+  pinMode(SERVO_ACK_PIN, INPUT);  // divider's bottom leg is the pulldown
 #if SERVO_ACK_MODE > 0
   // Active-HIGH ack: the line must idle LOW. Idling HIGH means the
   // ServoNano still has the old active-LOW firmware.
