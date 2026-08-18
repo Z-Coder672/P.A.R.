@@ -515,3 +515,144 @@ Implementation notes that are easy to get wrong:
   without also resetting GRBL and the ServoNano, because J11 put the Mega on it.
 - On `esp_restart()` the pin tri-states, so the stall watchdog now power-cycles GRBL too.
   That is a stronger recovery than the soft reset it replaces.
+
+---
+
+# Blind re-audit (2026-08-17) — two independent passes, adjudicated
+
+Two auditors reviewed netlist V3 + BOM V2 + V3 Gerbers **with no access to this document,
+to any earlier revision, or to the firmware**, to test whether the findings above were
+anchored. Both worked only from the design files plus a neutral description of the machine.
+
+**Independently reproduced by both:** TCS3200 `OUT` into D8, the dead `LIMSW` nets,
+unbuffered 3.3 V→5 V in both directions, the 2N7002, no gate pull-down, no I²C pull-ups,
+no decoupling, no 5 V protection, `LED-`‖`SCL` coupling, J12 without a ground pin, the
+0.312 mm hole-to-edge, silk on pads, J10 unconnected, 3V3 unrouted. Both also independently
+cleared R6 as a sanctioned QOD configuration and rated the ground pour excellent.
+
+**Measurement cross-check.** Three methods — a 1.4 M-node sparse resistive solve, a
+finite-element mesh, and Dijkstra over the vector segments — on `J1.3 → J7.1`:
+**43.86 / 44.3 / 44.4 mΩ**. On the `LED-` return: 137.73 / 136.7 mΩ. Both auditors also
+flood-filled copper against the netlist: **zero opens, zero shorts**.
+
+## Adjudicated disagreements
+
+Each resolved against the primary source, not by preferring an auditor.
+
+### 1. TCS3200 V_IH — auditor A correct, B wrong
+B could not extract the datasheet and speculated V_IH might be 0.7 × VDD = 3.5 V, which
+would put 3.3 V drive on S0–S3 out of spec. A found the real figure.
+
+**ams TCS3200 DS000107 v1-01, p.6, Recommended Operating Conditions:**
+`VIH High-level input voltage, VDD = 2.7 V to 5.5 V: min 2, max VDD` — an **absolute 2.0 V**,
+not a fraction of VDD. `VIL: 0 to 0.8 V`.
+
+**3.3 V drive on S0–S3 is fully in spec even at VDD = 5 V.** B's HIGH-6 is withdrawn.
+(Corroborated independently by the rig having run this way for months.)
+
+### 2. TCS3200 V_OH — auditor A correct, B overstated
+B assumed a rail-to-rail ~4.9 V output. **Datasheet p.6: `VOH, IOH = -2 mA: min 4, typ 4.5 V`.**
+
+The overstress on D8 is therefore **0.4–0.9 V above the 3.6 V absolute maximum**, not 1.3 V.
+Still a clear absolute-maximum violation and still critical — but quote the right number.
+
+### 3. TPS22919 ON pin floating — auditor B correct, A wrong
+A argued the internal Smart Pull-Down holds the rail off during an ESP32 reset and called
+this good design. B said the pull-down disconnects once ON has been driven high.
+
+**TI TPS22919 SLVSEN5B §8.3:** *"When power is first applied to VIN, a Smart Pull Down is
+used to keep the ON pin from floating until the system sequencing is complete. **Once the ON
+pin is deliberately driven high (≥VIH), the Smart Pull Down is disconnected** to prevent
+unnecessary power loss."* Pin table, pin 3: *"Active high switch control input. **Do not
+leave floating.**"*
+
+So A is right about first power-on and wrong about everything after it. Since `PARMain` now
+drives D11 high on every boot, the 530 kΩ is disconnected from that moment on, and **every
+subsequent ESP32 reset leaves ON genuinely floating.** Fit the **100 kΩ pull-down on `5VSW`**.
+Also confirmed from the same table: `VIH ON Pin High Voltage Range 1 – 5.5 V`, so 3.3 V drive
+is fine.
+
+### 4. R6 / QOD + USB back-feed — auditor A correct, and confirmed
+Everyone (including this document) cleared R6 as datasheet-sanctioned and stopped there. A
+accepted that and asked what it *does*. Confirmed from **SLVSEN5B Table 2**: with ON low and
+QOD tied to VOUT, VOUT is pulled to GND through `RPD,QOD` = **24 Ω** (p.5).
+
+`5VSWED` also reaches the Mega's 5 V pins (J11.1/2) and the ServoNano's 5 V pin (J5.12), both
+of which back-feed their USB 5 V onto that rail. With the switch off and either USB plugged:
+
+> 5 V / 24 Ω = **208 mA continuous, 1.04 W in an SC-70-6**.
+> RθJA = **210.7 °C/W** (p.4) → a **219 °C rise**, far past the 180 °C thermal shutdown.
+
+This is live in an ordinary scenario — flashing GRBL over the Mega's USB with the shield
+unpowered. **Fix: R6 → ~1 kΩ** (caps the sink at ~5 mA; the datasheet's own worked example
+uses R_QOD = 1 kΩ), or depopulate it — leaving QOD floating is the documented third option.
+
+A correct configuration made destructive by an interaction with a second finding. Neither the
+four-pass review nor auditor B caught it.
+
+### 5. J1 silkscreen glyphs — auditor A correct, B wrong (and this document was wrong)
+B reported "two custom silk arrows... each pointing into a gap" and rated it a mis-wire
+hazard. Extracted from `Gerber_TopSilkscreenLayer.GTO`, both glyphs are **closed rectangles**:
+four 0.254 mm strokes bounding 27.23–28.23 × −1.20…−2.70 mm and 32.23–33.23 × −1.20…−2.70 mm.
+They are **1.0 × 1.5 mm boxes, not arrows**, and almost certainly J1's body outline (the
+KF301 has divider ribs between poles). The three text labels are correctly aligned over their
+pads (25.23 / 30.23 / 35.23), which both auditors independently verified.
+
+**No mis-wire hazard from the legend.** The real J1 risk is the absence of reverse-polarity
+and overvoltage protection on `+5V`, which both auditors flagged and which stands.
+
+### 6. Drill and via counts — auditor B correct, A double-counted
+Measured: `Drill_PTH_Through.DRL` holds **158** holes (24 of them Ø0.305 mm vias);
+`Drill_PTH_Through_Via.DRL` holds **24**, and **all 24 coordinates are identical** to ones
+already in the PTH file. `Drill_NPTH_Through.DRL` holds 8.
+
+**166 unique holes: 158 plated (24 vias) + 8 non-plated.** A's "182 PTH / 48 vias" summed the
+two files without deduplicating; B spotted the standard EasyEDA duplication.
+
+### 7. Minimum clearance — B's figure preferred
+A measured 0.141 mm, B 0.152 mm. A stated its own raster quantisation as ±0.025 mm, and
+0.152 mm (6 mil) is the EasyEDA default rule. Take **0.152 mm**; either way it passes.
+
+### 8. Ground return resistance — unresolved, immaterial
+A's sparse solve gives J7.2→J1.2 = 3.375 mΩ; B's mesh gives 2.47 mΩ; the earlier FD solve
+gave 2.34 mΩ. The spread is meshing/boundary-condition choice. All three agree the pour is
+excellent and contributes ≤5 mV at 1.5 A. No action.
+
+### 9. Board dimensions — not a real conflict
+Outline measured from `Gerber_BoardOutlineLayer.GKO`: **90.68 × 51.82 mm** overall. A quoted
+the total; B quoted the 90.68 × 46.87 mm main body plus the 3.30 × 5.08 mm J12 tab separately.
+
+## New findings from the blind pass, not in the review above
+
+| # | Finding | Severity |
+|---|---|---|
+| N1 | **R6/QOD + USB back-feed burns ~1 W in U4** (adjudication 4) | **Critical** |
+| N2 | **Split rails have no supervisor.** The ESP32 runs from 12 V behind its own buck, everything else from 5 V. A 5 V brownout — a servo stall — resets the ServoNano and the Mega **while the ESP32 keeps running**, streaming G-code and servo commands into peripherals that are mid-reset. No reset distribution, no brownout signal between domains. | Major |
+| N3 | **Servo is energised before its controller.** J7.1 is on unswitched `+5V`; the ServoNano generating `SIG` is on switched `5VSWED`. Between power-on and D11 asserting, the servo has power and an 82 mm floating signal line. Fix: 10 kΩ pull-down on `SIG`. | Minor |
+| N4 | **J8 does not bring out the TCS3200's `/OE`.** If the breakout does not tie it low, `OUT` is high-Z and the sensor reads nothing. | Medium |
+| N5 | **Near-zero solder-mask expansion** on the 15-pin header pads: copper Ø1.7 mm, mask Ø1.7016 mm — 0.8 µm/side. With ±0.05 mm registration the mask encroaches. Set 0.05 mm expansion or confirm the fab overrides it. | Minor |
+| N6 | **`LED-` return is 137.7 mΩ** — Q1 sits 34.9 mm from J9 on 10-mil trace. At 500 mA that is 69 mV in series with the FET's ill-defined R_DS(on), directly modulating LED brightness. Widen and move Q1 to J9. | Minor |
+| N7 | **`LED-`‖`SCL` is 53 mm, not 27 mm**, at a 6 mil gap — with an estimated ~0.92 V injected glitch against an I²C V_IL max of 0.99 V. **Second-order and important: today's weakly-driven 2N7002 has slow edges, which is the only thing keeping this benign. Upgrading Q1 without also rerouting `LED-` trades an LED-repeatability problem for I²C corruption.** Add a 100–470 Ω gate resistor to keep the edge deliberately slow. | Major |
+| N8 | **J12's mapping to a Mega hardware UART is unproven** from the files. If pins 3/4 do not land on a Mega serial port, the ESP32↔GRBL link does not exist. Highest-priority bench check. | Verify |
+| N9 | `J2.12` on a Nano ESP32 is **VBUS**, not 5 V — an output live only under USB power. It is unconnected here, which is correct; never feed 5 V into it. | Nit |
+
+## Consolidated must-fix before fabrication
+
+Confirmed by two or three independent passes:
+
+1. **TCS3200 → 3.3 V** (`J8.6` to the unused `J2.2`), or divide `OUT` 2 k/3.3 k. Re-derive
+   `SCAN_ON_BLUE_MAX`, since output frequency scales with VDD.
+2. **`R6` → 1 kΩ** — prevents 1 W in an SC-70 whenever a debug USB is plugged in.
+3. **100 kΩ pull-down on `5VSW`** — the Smart Pull-Down is gone after the first assertion.
+4. **Route or delete the limit-switch nets**; add `LED+`.
+5. **100 kΩ gate pull-down + 100–470 Ω gate resistor on Q1**, and swap to AO3400A — but
+   reroute `LED-` away from `SCL` in the same spin (N7).
+6. **I²C pull-ups, 2.2 kΩ to 3V3** — requires routing 3V3.
+7. **Decoupling**: 100 nF at U4 in/out, 10 µF on `5VSWED`, 100 nF at J6/J8, and bulk at J7.
+8. **Protection on `+5V`**: polyfuse + P-FET or TVS.
+
+Deferred by decision, not oversight: the 3.3 V→5 V links (M2) remain unbuffered. They are
+inherited from the working hand-wired rig, not introduced by this board — but both auditors
+rate them higher than this document originally did, and they sit on the servo-command path
+with a documented dropped-command failure history. A 74LVC2T45 or 74AHCT1G125 is the fix if
+that failure recurs.
