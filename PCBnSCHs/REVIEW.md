@@ -648,7 +648,8 @@ Confirmed by two or three independent passes:
 5. **100 kΩ gate pull-down + 100–470 Ω gate resistor on Q1**, and swap to AO3400A — but
    reroute `LED-` away from `SCL` in the same spin (N7).
 6. **I²C pull-ups, 2.2 kΩ to 3V3** — requires routing 3V3.
-7. **Decoupling**: 100 nF at U4 in/out, 10 µF on `5VSWED`, 100 nF at J6/J8, and bulk at J7.
+7. **Decoupling** — see the dedicated section below. Short version: **C_bulk at J7** and
+   **ceramics at U4**. Do *not* add caps at J11/J5/J2.
 8. **Protection on `+5V`**: polyfuse + P-FET or TVS.
 
 Deferred by decision, not oversight: the 3.3 V→5 V links (M2) remain unbuffered. They are
@@ -656,3 +657,59 @@ inherited from the working hand-wired rig, not introduced by this board — but 
 rate them higher than this document originally did, and they sit on the servo-command path
 with a documented dropped-command failure history. A 74LVC2T45 or 74AHCT1G125 is the fix if
 that failure recurs.
+
+
+---
+
+# Decoupling — what is actually missing (revised 2026-08-17)
+
+The earlier "zero decoupling on the entire board" framing is accurate about the **shield**
+but misleading about the **system**. All three Arduino modules carry their own decoupling and
+bulk at their own supply pins, and they seat directly in the headers with essentially no
+trace between the shield's copper and their onboard caps. **Adding capacitors at J11 (Mega
+5 V), J5.12 (ServoNano 5 V) or J2/J3 (ESP32) duplicates what is already there and buys
+nothing.** Skip them.
+
+There is also a constraint that makes "more capacitance" actively wrong in one place. The
+TPS22919's slew rate is fixed at **3.2 mV/µs**, so turn-on inrush = C × 3.2 mA/µF, against a
+**1.5 A** device limit:
+
+| C on `5VSWED` | Inrush |
+|---|---|
+| 10 µF | 0.03 A |
+| 100 µF | 0.32 A |
+| 220 µF | 0.70 A |
+| 470 µF | **1.50 A — at the limit** |
+
+That budget is **already partly spent by the modules' own bulk**, which the switch must
+charge on every turn-on. At an estimated 200–300 µF across the Mega, the ServoNano and the
+two sensor breakouts, inrush is already 0.6–1.0 A before anything is added. So the switched
+rail can take a small ceramic and nothing more.
+
+The good news is that the load which actually needs bulk — the servo — **is no longer on the
+switched rail** (netlist V3 moved `J7.1` to unswitched `+5V`), so its capacitor sits outside
+the inrush constraint entirely and can be sized freely.
+
+## Fit these
+
+| Where | Part | Why |
+|---|---|---|
+| **J7 (servo), on `+5V`** | **470 µF low-ESR polymer/electrolytic + 10 µF X7R + 100 nF**, at the connector | **The single highest-value cap on the board.** The servo is the only real transient load (1.5 A steps) and currently has *no* local reservoir — C2 is 30.3 mm and ~41.5 mΩ away, so every current step is pulled through that impedance. Unswitched rail ⇒ no inrush limit. |
+| **U4 VIN (pin 1)** | **10 µF X7R + 100 nF**, within 2 mm | TI's datasheet **requires** C_IN ≥ 1 µF close to the device. U4 is a shield-mounted IC with no local capacitance of its own — this is not duplicated by any module. |
+| **U4 VOUT (pin 6)** | **10 µF X7R + 100 nF only** | Stabilises the switch output. **Deliberately small** — this rail's inrush budget is already consumed by the modules (table above). Do not fit 100 µF+ here. |
+
+## Worth having
+
+| Where | Part | Why |
+|---|---|---|
+| J6 (lidar), J8 (sensor) | 100 nF each, shield side | These run cables to a moving carriage. The breakouts usually carry their own caps, but a shield-side 100 nF terminates the cable inductance. Cheap; low risk either way. |
+| 12 V input / D1 cathode | 100 µF + 100 nF | The Nano ESP32's buck has only a small input cap. **Only worth it if the 12 V rail is shared with the stepper supply** — if it is, commutation transients land straight on the buck input. Confirm before fitting. |
+
+## Do not fit
+
+`J11.1/2` (Mega 5 V), `J5.12` (ServoNano 5 V), `J2/J3` (ESP32 rails). Each module already
+decouples its own pins, the header seating is direct, and on `5VSWED` any added capacitance
+eats the inrush budget for no benefit.
+
+**Net effect:** two capacitor groups that genuinely matter (J7 bulk, U4 ceramics), two
+optional, and five previously-recommended locations dropped as redundant.
