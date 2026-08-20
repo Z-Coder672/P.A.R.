@@ -1,715 +1,384 @@
-# P.A.R. Shield — design review (Board3 / PCB3, 2026-08-16)
+# P.A.R. Shield — design review
 
-2-layer, 90.68 × 51.82 mm. Reviewed from the netlist, schematic SVG, per-layer renders,
-Gerbers + drill files, and the BOM, cross-checked against the firmware and this project's
-documented failure history.
+**Current revision reviewed: Gerber V5 / Netlist V5 / BOM V4 (2026-08-19).**
+2-layer, 90.68 × 51.82 mm. Hosts an Arduino Nano ESP32 and a 5 V Arduino Nano, powers and
+talks to an Arduino Mega running GRBL, and carries the servo, colour sensor, lidar and LED
+bank connectors.
 
-Four independent review passes (power, signal levels, layout/EMI, BOM + failure-history
-regression) plus reconciliation. Findings labelled **MEASURED** come from parsing Gerber
-apertures / the netlist directly; **INFERRED** comes from renders or datasheets; anything
-unresolved is listed in [Needs a bench measurement](#needs-a-bench-measurement).
+Findings carry their status **inline at the claim**. Open items are first; resolved and
+withdrawn items follow with the revision that closed them. Old IDs (B*, C*, L*, m*, N*, F*)
+are kept in parentheses so earlier discussion stays traceable.
 
----
-
-## Verdict
-
-The board is **close**, and several things in it are genuinely good — the ground pour is
-excellent, the connector silkscreen is better than most hobby boards, the main MCU gets its
-own 12 V→VIN rail (a real structural fix for the brownout history), and the Mega→ESP32
-level-shift audit item that `PINOUT.md §2` has been carrying open is finally addressed.
-
-But **it will not power up as designed**, and the servo supply path — the single most
-expensive failure in this project's history — is worse on this board than on the harness it
-replaces. Three netlist-level defects must be fixed before fab; one layout pass fixes most
-of the rest.
-
----
-
-## Blocking — the board cannot work as drawn
-
-### B1. The switched rail is never enabled — MEASURED
-`U4.3` (TPS22919 `ON`) ← net `5VSW` ← `U1.20` = **D11**. No sketch in the repo drives D11;
-`PINOUT.md §2` lists D11–D13 as unused. The part has an internal **530 kΩ smart pull-down**,
-so `ON` is held low and `5VSWED` stays **off** — and `5VSWED` powers the servo (J7), the
-ServoNano (U2.27), the lidar (J6) and the colour sensor (J8). Everything downstream is dark.
-
-**Fix (hardware, preferred): 100 kΩ from `U4.3` to 3V3.** Against the 530 kΩ pull-down that
-gives 3.3 × 530/630 = **2.78 V**, far above the 1.0 V `ON` V_IH → rail on by default, and all
-~22 existing sketches work unmodified while D11 remains an optional software kill.
-**Pull it to 5 V and you put 5 V on D11 — don't.** Requires B4 (route 3V3).
-
-Firmware alternative — `pinMode(D11, OUTPUT); digitalWrite(D11, HIGH);` first thing in
-`setup()` — works but must be replicated in every sketch that uses the shield, and leaves a
-window during reset/boot where the ESP32 tri-states D11 and the rail drops.
-
-> **Why the firmware-only route is not enough.** The ESP32 tri-states its GPIOs on reset,
-> brownout and boot, and this rig has *confirmed* brownout resets. Gating the servo rail on
-> an MCU pin means a brownout now cuts servo power mid-flip: the arm goes limp wherever it
-> is, `PARMain` reboots and runs `$H`, and homing drags the carriage with the arm possibly
-> still at ENGAGE. That is precisely the sequence that snapped the flip arm, and precisely
-> what `SERVO_ACK_MODE 2` was designed to prevent by never resetting on an unconfirmed arm
-> position. **The servo should not be behind an MCU-gated switch at all** (see C1).
-
-### B2. Both level-shift dividers are out of spec — MEASURED
-R2/R3 (Mega TX1 → `U1.32` = D0) and R4/R5 (ServoNano D3 ack → `U1.29` = D2) are both
-**2 k / 2 k**. ESP32-S3 V_IH = 0.75 × VDD = **2.475 V** (datasheet Table 5-4).
-
-| Source condition | Divider out | Margin |
-|---|---|---|
-| Ideal 5.000 V | 2.500 V | +25 mV |
-| Realistic V_OH ≈ 4.90 V | 2.450 V | **−25 mV — fails** |
-| Mega on USB, rail 4.75 V | 2.375 V | **−100 mV — fails** |
-| VDD +2 % → V_IH 2.525 V | 2.500 V | **−25 mV — fails** |
-
-This works only when the source is exactly 5.00 V *and* VDD is exactly 3.30 V. Symptoms:
-framing garbage on the 115200 GRBL link (surfacing as `error:N` retries → 60 s watchdog
-`esp_restart()`), and missed acks → infinite retry stall.
-
-**Fix: R3 and R5 → 3.3 kΩ.** Keeping 2 k on top gives 3.11 V; going to the documented
-1.8 k/3.3 k gives 3.24 V. Either is fine and both stay under the 3.6 V abs max. Four
-resistors, no layout change.
-
-RC is a non-issue at both baud rates (τ ≈ 10 ns against an 8.68 µs bit at 115200) — **do not
-attribute any GRBL link problem to divider bandwidth. It is entirely the DC level.**
-
-### B3. The limit-switch half of J9 is electrically dead — MEASURED
-`LIMSW-` is a **single-node net** (`J9.3` only — the only one on the board). `LIMSW+`
-reaches `C1.2` and `J9.2` and nothing else. Neither touches an MCU pin, and C1 (1 nF) is
-debouncing a net connected to nothing.
-
-Note the main MCU has no limit-switch role in firmware — homing limits live on the
-Mega/CNC Shield V3. So either route these to a free GPIO (D3, D12, D13) with a pull-up, or
-delete the switch pins and C1 and mark them NC.
-
-Related: **there is no `LED+` net anywhere on the board.** Only `LED-` (Q1 drain) exists, so
-the LED bank's anode feed and any current limit stay off-board and undocumented. A tidy fix
-for both: repurpose J9 as the LED connector — `J9.2` → LED+, `J9.1` → LED−, drop `J9.3`/C1.
-
-### B4. 3V3 is not routed anywhere — MEASURED
-Net `$1N5429` = `J2.2` ↔ `U1.3` only: the 3.3 V rail exists on the socket and goes nowhere.
-It is the enabler for B1's `ON` pull-up, the I²C pull-ups (C5), and moving the lidar off 5 V
-(C6). **Routing 3V3 as a board net is the single highest-leverage change available.**
-
----
-
-## Critical — electrical
-
-### C1. The servo droop budget is spent on the board, before any wire — MEASURED
-`PINOUT.md §7` sets the target at **≤ 0.2–0.3 V total drop at stall, measured at the servo
-connector**. Measured path from J1 to the servo and back:
-
-| Segment | R | Drop @ 1.5 A |
-|---|---|---|
-| J1.3 → U4.1 (`+5V` in, 80 mil) | 14.1 mΩ | 21 mV |
-| **U4 TPS22919 R_on** (88 mΩ typ / ~120 mΩ hot) | 88–120 mΩ | **132–180 mV** |
-| **U4.6 → J7.1 (`5VSWED`): 82.5 mm of 17-mil** | **93.6 mΩ** | **140 mV** |
-| GND plane J7.2 → J1.2 (FD solve) | 2.3 mΩ | 3.5 mV |
-| **Board total** | **198–230 mΩ** | **300–345 mV** |
-
-The rail travels **82.5 mm** for a ~35 mm straight-line distance — west, down the left edge,
-32 mm east along the bottom, then north-east to J7. Thermally the 17-mil is fine (ΔT ≈ 14 °C
-at 1.5 A); **resistively it is the whole problem.** Every millivolt the harness rework bought
-is handed straight back.
-
-**Fix, in order of value:**
-1. **Take the servo off the load switch.** Feed `J7.1` from `+5V` directly. Removes
-   88–120 mΩ and the 1.5 A ceiling at a stroke, and fixes B1's brownout interaction.
-2. Move U4 and C2 beside J7; route VOUT→J7 as a short 80-mil trace or a top-layer pour —
-   30 mm at 80 mil is **7 mΩ**, a 13× improvement.
-3. At minimum widen `5VSWED` to ≥ 60 mil (→ 26.5 mΩ) and pour it on the empty top layer.
-
-### C2. The switched rail is a daisy chain with the servo *last* — MEASURED
-Chain order from U4: ServoNano 5 V (`J5.12`, 36.5 mΩ) → lidar (`J6.1`, 44.5 mΩ) → TCS3200
-(`J8.6`, 90.4 mΩ) → **servo (`J7.1`, 93.6 mΩ)**. Because the largest load is at the far end,
-the full 1.5 A flows through every sensor's supply trace. Node sag at stall, relative to
-U4 VOUT: ServoNano **−55 mV**, lidar −67 mV, TCS3200 **−136 mV**.
-
-So a flip stall pulls down the supply of the microcontroller generating the servo pulse, and
-the colour sensor's supply, simultaneously and by construction. Your brownout note
-prescribes *"separate the logic supply from the servo/stepper supply with a common ground"* —
-this does the opposite.
-
-**Fix:** star the rail from a single node, highest current first; better, give the servo its
-own feed from J1 and leave only sensors behind U4.
-
-### C3. Zero decoupling on the entire board — MEASURED
-The complete capacitor census is **C2 (1500 µF, on the *input* side of the switch, 27.7 mm
-away) and C1 (1 nF, on the dead LIMSW+ net)**. There is not one 100 nF anywhere, and
-**`5VSWED` — feeding servo, ServoNano, lidar and colour sensor — has no capacitor at all.**
-TI's datasheet *requires* a local input cap on U4; none exists.
-
-**Fix:** 10 µF X7R + 100 nF within 2 mm of `U4.1`; bulk + 10 µF + 100 nF **at J7**; 100 nF at
-J6 and J8; 100 nF at each module's 5 V/GND pins.
-
-⚠ **Inrush ceiling if you keep the switch:** the TPS22919's slew is fixed at 3.2 mV/µs, so
-turn-on inrush = C_out × 3.2 mA/µF. 220 µF → 0.70 A; **470 µF → 1.50 A, at the device limit.**
-Cap C_out at ~220 µF behind U4. If the servo moves to unswitched `+5V` (C1), this constraint
-disappears and you can fit 470–1000 µF at J7.
-
-### C4. R5 destroys the ack line's fail-loud property — MEASURED topology
-With R5 (2 kΩ) permanently soldered from the ack node to GND, a broken ack wire, an unplugged
-ServoNano, or an **unpowered** ServoNano leaves D2 held at
-
-> 3.3 × 2k/(2k + 45k) = **0.14 V** — a hard LOW, far below V_IL = 0.825 V
-
-The ack is **active-LOW**, so a dead ack source reads as **permanently acknowledged**.
-`servoAckSeen()` returns true immediately and `SERVO_ACK_MODE 2`'s retry-until-confirmed
-enforcement — the thing credited with preventing the arm break — passes vacuously.
-
-**This is a topology problem, not a ratio problem.** The proven 1.8 k/3.3 k gives 0.23 V and
-fails identically. No resistor value fixes it while the bottom leg is populated.
-
-**Fix — cheapest is firmware, today:** `servoAckWaitIdle()` already detects this (the line
-never returns HIGH, so every command carries an extra ~100 ms). Promote that timeout from a
-silent diagnostic to a **hard fault**. Three lines, no hardware change.
-Proper respin: open-drain + pull-up, or a buffer whose absence reads HIGH.
-
-> **`PINOUT.md §3b` is wrong and should be corrected.** It claims *"an unfitted or broken wire
-> reads HIGH = 'no ack' = fails loud."* That holds only when the connection to D2 itself is
-> absent. A break **upstream** of the divider reads LOW and fails **silent**. The doc is also
-> internally inconsistent — its own validation section describes the stuck-low vacuous pass
-> and its +100 ms signature. On the breadboard the divider lived on the removable harness, so
-> "unfitted" was the likely failure; soldering it down makes the silent case the likely one.
-
-### C5. No I²C pull-ups — MEASURED
-`SDA` = {`J2.8`, `J6.3`, `U1.9`} and `SCL` = {`J2.9`, `J6.4`, `U1.10`} — three pins each, no
-resistor, no footprint. Firmware runs `Wire.setClock(400000)`, which needs t_r ≤ 300 ns:
-
-| Pull-up | Max bus C at 400 kHz |
+| Status | Meaning |
 |---|---|
-| 45 kΩ (ESP32 internal) | **7.9 pF — impossible** |
-| 10 kΩ (typical breakout) | 35 pF — marginal |
-| 2.2 kΩ | 161 pF ✓ |
+| 🔴 **OPEN — BLOCKER** | Board does not work, or destroys itself, until fixed |
+| 🟠 **OPEN** | Real defect, should be fixed this spin |
+| 🟡 **OPEN — minor** | Worth fixing while the files are open |
+| ✅ **RESOLVED** | Fixed, with the revision noted |
+| ⚪ **WITHDRAWN** | Retracted — my error, or the designer's rebuttal was correct |
 
-`PINOUT.md §5` records the lidar's boot init failing *"roughly half of observed power-ons"*,
-then running a 71-minute pass flawlessly once up — a signature that fits init-sequence timing
-sensitivity. **Slow rise time is a credible root cause.**
-
-**Fix:** 2.2 kΩ (or 4.7 kΩ) from SDA and SCL to **3V3**. Free diagnostic before any respin:
-drop `Wire.setClock()` to 100000 and see whether the boot-failure rate changes.
-
-### C6. 5 V into non-5 V-tolerant pins, in two places
-- **TCS3200 `OUT` → D8, bare copper.** `J8.6` = `5VSWED` (5 V), so the sensor runs at 5 V and
-  its push-pull `OUT` (V_OH ≈ 4.6–5.0 V) goes straight to `U1.23` = D8. ESP32-S3 abs max is
-  VDD+0.3 = **3.6 V**. This is the line `pulseIn` hammers for ~70 min per full-board scan.
-  *Caveat: `PINOUT.md` never recorded the sensor's supply voltage on the existing rig, so this
-  may be inherited rather than introduced — check with a meter before judging it a regression.*
-  **Fix:** move `J8.6` to 3V3 (TCS3200 runs 2.7–5.5 V; its V_IH is 2.0 V so 3.3 V drive on
-  S0–S3 is legal) — but note output frequency scales with VDD, so `SCAN_ON_BLUE_MAX = 3535`
-  must be re-derived. Calibration-preserving alternative: 1 k series + 2 k to GND on `OUT`.
-- **Lidar I²C.** `J6.1` feeds the VL53L4CD breakout from 5 V while SDA/SCL run straight to
-  A4/A5. Safe *only* if that specific carrier level-shifts and doesn't reference its pull-ups
-  to VIN. **Measure SDA idle voltage at `J6.3` before powering the board.** Feeding `J6.1`
-  from 3V3 removes the question entirely.
-
-### C7. Q1 (2N7002) — under-driven, undersized, no gate pull-down — MEASURED + datasheet
-`GATE` = {`J3.13`, `Q1.1`, `U1.21`} — no pull-down, no series resistor. The 2N7002's
-R_DS(on) is characterised at V_GS = 10 V and 4.5 V, **never at the 3.3 V the ESP32 drives**,
-and V_GS(th) runs to 2.5 V (3.0 V on some vendors' parts) — so a worst-case device has under
-1 V of overdrive. Continuous I_D is only ~115 mA (Vishay) / 300 mA (Diodes).
-
-Two consequences worth taking seriously:
-- **No gate pull-down** ⇒ the LED bank's state is undefined through reset, boot and brownout.
-  `readAmbientSubtracted()` is only valid if the bank is definitively **off** during the OFF
-  flash — this is a correctness risk, not cosmetic.
-- Operating near threshold, channel resistance drifts with die temperature, so **LED
-  brightness drifts over a long scan**. That is a *candidate* mechanism for the unresolved
-  "12 false positives on a 70-min full-board pass, 0/888 on the 13-min bottom-rows test"
-  asymmetry — both predict long-run-only failure. **Hypothesis, not a diagnosis.**
-
-**Fix:** 100 kΩ gate→GND (mandatory, cheap), ~100 Ω gate series, and swap to a logic-level
-part specified at V_GS = 2.5 V — **AO3400A** or DMG3414U.
-
-### C8. R1 (2 kΩ) on the servo command line raises noise gain ~50×
-DC-harmless (AVR input leakage ≤ 1 µA → 2 mV drop), but it lifts the ServoNano RX node from
-~40 Ω to 2 kΩ — on the exact net `CLAUDE.md` nominates as the untested stepper-EMI coupling
-path, and the one the bench rig (steppers unpowered, 91 kB, zero dropouts) could not
-reproduce. **Fix: 100–330 Ω.**
-
-Optional, if servo-link reliability stays open: R1 = 1 kΩ plus a 10 kΩ pull-up from the
-ServoNano-side node to 5VSWED gives V_high = 3.455 V, a solid +455 mV over the AVR's 3.00 V
-V_IH. Only adopt once rail sequencing (B1) is deliberate, or 0.45 mA flows into the ESP32
-clamp when 5VSWED is live and the ESP32 isn't.
-
-### C9. J12 has no ground pin — MEASURED
-`J12` uses only pins 3 (`ESP32TX`) and 4 (`ESP32RX`). The only GND pins on any header are
-`J11.35/36`. A 115200 UART with its return several inches away through a different connector
-is exactly how you get the coupling the EMI hypothesis describes. **Fix: assign J12.1 and/or
-J12.2 to GND** (both free) and route them flanking TX/RX.
-
-### C10. No decoupling on the ESP32 VIN node — MEASURED
-`+12V` → 15-mil trace → D1 → `U1.16`. **No capacitor on either the +12 V net or the D1
-cathode.** If 12 V is shared with the stepper supply, every commutation transient lands on
-the Nano's regulator input unbuffered — on a board with a confirmed brownout history.
-**Fix:** 100 µF/25 V + 100 nF at the D1 cathode, 100 nF at the anode. Widen +12 V to 25 mil.
-
-### C11. Two 5 V sources shorted together — MEASURED
-`+5V` is driven from **both** `J1.3` (screw terminal) and `J11.1`/`J11.2`, with no ORing, no
-fuse, and no reverse protection (D1 guards only +12 V). If J11 mates to the Mega's 5 V, the
-servo's 1.5 A stall shares the Mega's 5 V node — the coupling `PINOUT.md §7` already flags.
-**Fix:** pick one source; mark the other NC.
-
-### C12. ServoNano USB back-feeds the switched rail — INFERRED
-`U2.27` (ServoNano 5 V) sits on `5VSWED`, and ServoNano's USB is in active use as a
-signal-integrity probe. On CH340 Nano clones USB V_BUS reaches the 5 V rail through a
-diode/fuse, so with USB plugged the rail is powered even when U4 is off — silently powering
-the servo, lidar and sensor from the Mac's USB port, and putting a 1.5 A stall load on a
-500 mA budget. The TPS22919's QOD FET would also be trying to sink that rail through 24 Ω.
-**Measure `5VSWED` with U4 off and ServoNano USB attached before leaving the board powered.**
+**MEASURED** = parsed from Gerbers/netlist directly. **INFERRED** = from renders or datasheets.
 
 ---
 
-## Layout
+# 🔴 OPEN — BLOCKERS
 
-**The ground is genuinely good — every problem is on the high side.** MEASURED: the bottom
-pour is a single connected region of 3426 mm² containing every GND pad; it survives 0.6 mm/side
-erosion without splitting. No plane split, no starved region, no forced detour.
-J7.2 → J1.2 = **2.34 mΩ** (3.5 mV at 1.5 A). Useful diagnostically: if you measure droop at
-the servo, it is almost entirely on the +5 V wire, not the return.
+## O1. The TVS is wired in series with the +5 V rail 🔴 **OPEN in V5** — MEASURED
 
-**The top layer has no copper pour at all** (zero regions in the GTL) and only 1.12 m of
-trace — so there is abundant free area for every widening/pour fix above.
+**Verified in V5:** `$1N7100` = {J1.3, U3.1}; `$1N7101` = {D2.2, U3.2}; `+5V` = {…, D2.1, …}.
+**Neither D2 pin is on GND.**
 
-| # | Finding | Detail |
+```
+J1.3 ─► U3 (polyfuse) ─► $1N7101 ─► D2.2 ─[SMBJ5.0A]─ D2.1 ─► +5V rail
+```
+
+A TVS is a shunt device. As drawn it is in the supply path and protects nothing:
+
+- **Reverse-biased** (normal orientation): blocks below its ~6.4 V breakdown ⇒ **the +5 V rail
+  is dead** and only the ESP32 (on 12 V) comes up.
+- **Forward-biased**: behaves as a plain diode — ~1.0 V at 1.5 A, **~1.5 W in an SMB**
+  (θJA ≈ 60 °C/W ⇒ ~90 °C rise), and the rail sags with servo current. That is precisely the
+  current-dependent series drop this project has already spent a day misdiagnosing.
+
+Confirmed independently by three passes. D2's silkscreen has no polarity bar, so which case
+applies is undetermined — it does not change the fix.
+
+**Fix:** `J1.3 → U3 → +5V` directly (bridge `$1N7101` into `+5V`; the pads are 5.18 mm apart
+with clear space), and move **D2.2 to GND** with D2.1 on `+5V`.
+
+**Also:** SMBJ5.0A has a **5.0 V stand-off**, which a 5.25 V rail exceeds ⇒ leakage.
+Use **SMBJ6.0A or SMBJ6.5A**.
+
+## O2. C11 is a 6.3 V part on an 11.3 V rail 🔴 **OPEN in V5** — MEASURED
+
+**Verified in V5:** `$1N1028` = {C10.1, **C11.2**, D1.1, J2.15} — the post-D1 VIN node, ~11.3 V.
+BOM V4 still lists C11 = **CL31A107MQHNNNE (LCSC C15008) = 100 µF 6.3 V X5R 1206**.
+
+**1.8× over rated voltage.** MLCCs fail **short**, so this takes the 12 V rail with it.
+
+**Fix:** 100 µF at 25 V does not exist in 1206. Use **C14860 (10 µF 25 V X7R 1206)** — already
+in your BOM for C4/C7/C9, so no new line item. 10 µF is a proper buck-input cap; at 11.3 V
+bias it derates to roughly 5–6 µF, which is fine.
+
+Every other capacitor's rating checks out: C2/C5 16 V on 5 V, C3/C6/C8/C10/C12 50 V,
+C4/C7/C9 25 V on ≤5 V. C11 is the only one wrong.
+
+---
+
+# 🟠 OPEN
+
+## O3. The polyfuse will nuisance-trip on a jammed arm 🟠 **OPEN in V5** — MEASURED copper / INFERRED fuse data
+
+`U3` (MF-NSMF200-2, **2.0 A hold**) is the sole element between J1.3 and everything on `+5V`
+*and* `5VSWED` — servo included.
+
+Load at stall ≈ 1.5 A servo + 0.2 A Mega + 0.03 A ServoNano + 0.05 A sensors ≈ **1.78 A**,
+i.e. **89 % of hold at 23 °C**, derating to ~1.4–1.6 A hold at 50 °C in an enclosure.
+
+A momentary stall will not trip it; a **jammed arm will** — and this rig has snapped its flip
+arm once. A tripped PPTC goes to hundreds of ohms, collapsing the rail, which at firmware
+level is indistinguishable from the failure modes already chased at length.
+
+It also costs droop budget: **30–70 mΩ** of fuse resistance on top of **48.2 mΩ** measured
+copper round-trip, roughly doubling the board's contribution to **117–177 mV at 1.5 A**.
+
+**Fix:** fuse only the logic / `5VSWED` branch and leave the servo unfused, or move to a
+≥3 A-hold, lower-resistance device. Re-verify Vmax ≥ 6 V either way.
+
+## O4. Q2 switches the sensors' ground, which cannot turn them off 🟠 **OPEN in V5** — MEASURED topology / INFERRED behaviour
+
+`CLRNLDRSRC` = {J6.2, J8.7, Q2.3}. `3V3` = {J2.2, J6.1, J8.6, R9.2, R10.1, R11.1} — always live.
+
+Only the **ground** is switched; VDD stays at 3.3 V. With Q2 off, both sensors' local ground
+floats, while the MCU still drives S0–S3 and the I²C pull-ups (**now fitted — R10/R11**) hold
+SDA/SCL. Current flows through the sensors' ESD structures into the floating ground, pulling
+it to ~0.7 V and **partially powering both parts through their I/O pins**. The "off" state is
+an undefined bias condition, not off — so the power-cycling Q2 exists to provide is not
+achieved, and the VL53L4CD has no guaranteed clean POR when Q2 re-closes.
+
+Note the interaction: **adding the I²C pull-ups in V5 made this worse**, since they now feed
+the floating ground.
+
+**Fix (recommended):** delete Q2 + R8, bond J6.2/J8.7 to the pour, and make **J6 5-pin with
+`XSHUT` on D3** — the VL53L4CD's purpose-built reset pin. The TCS3200 is stateless and never
+needs power-cycling. Alternative: switch the **high side** (P-FET in the 3V3 feed).
+
+## O5. `CLRNLDRSRC` is routed as a signal, not a return 🟠 **OPEN in V5** — MEASURED
+
+38.3 mm, **entirely 0.254 mm (10 mil)**: Q2.3→J6.2 = 47.4 mΩ, Q2.3→J8.7 = 22.0 mΩ.
+
+Resistively harmless (~1 mV at 25 mA). The cost is **return-path geometry**: every sensor
+signal — SDA, SCL, S0–S3 and `OUT` — returns through this thin trace to Q2 before entering
+the pour, instead of returning in the plane under its own signal. For `OUT` (the frequency
+output timed with `pulseIn`, and the channel the unresolved full-board false positives live
+on) the signal runs 24 mm on top while its return runs 9–23 mm on the bottom to a different
+point — a loop of order **100–200 mm²**.
+
+**Fix:** subsumed by O4 — deleting Q2 lets the pour be the return. If Q2 stays, widen to
+≥0.6 mm and route it directly beneath the J6/J8 signal groups.
+
+## O6. `LED-` runs beside SCL and beside the servo-ack analog node 🟠 **OPEN in V5** — MEASURED geometry / INFERRED crosstalk
+
+| Victim | Coupled length | Min gap |
 |---|---|---|
-| L1 | **11 cm² high-current loop** | J1 → C2 → U4 → 82.5 mm → J7, closed by the plane return, encloses ≈1115 mm². A 1.5 A pulsed loop that size is both radiator and receiver. The C3 fix (bulk + ceramic *at J7*) collapses it to a few mm². |
-| L2 | **`LED−` ‖ `SCL`: 150 µm gap, 27 mm** | The one coupling to fix. LED− is Q1's switched drain running beside the I²C clock. Guard trace stitched every ~5 mm, or move LED− to the empty top layer. |
-| L3 | `SIG` ‖ servo-command (`$1N827`): **152 µm, 47.8 mm** | Both slow (50 Hz PWM, 9600 baud) so consequence is low — but these are the two most failure-prone nets in the system at minimum pitch with no guard. A guard is free here. |
-| L4 | U4 has no heatsinking copper | 0.198 W in SC70-6, θ_JA ≈ 200–250 °C/W → 40–50 °C rise. Only 2 stitching vias. Pour top-layer 5VSWED and GND regions around it with 4+ vias. |
-| L5 | 108 mm of bottom trace slots the plane | SDA/SCL/LED− cross slots 17/14/17×. Second-order, but it clusters under the I²C pair. Move those short hops to the empty top layer. |
-| L6 | `+5V` to J11 is 15-mil for 30 mm (45.4 mΩ) | Fine as a low-current tap; widen to 40 mil if J11 feeds a real load. |
+| `SCL` | **45.7 mm** (6.6 mm under 200 µm) | **152 µm** |
+| `LEDGT` ‖ `SCL` | 8.2 mm | **152 µm** |
+| **`$1N7075`** (servo-ack analog node) | 5.7 mm | **184 µm** |
+| `S0` | 6.2 mm | 152 µm |
 
-### DFM
-- **m1.** Four corner NPTH holes sit **0.31 mm** from the routed edge (1.153 mm hole, 0.89 mm
-  to edge). Most fabs want ≥0.4–0.5 mm or the tab breaks out. Move 0.3 mm inboard or shrink.
-- **m2.** Silkscreen printed over exposed pads — 20 instances, significantly on **`J7_1`**
-  (the servo +5 V terminal) and R6/R4/C2/R2/R1. Most fabs auto-clip, but clip it yourself
-  with ≥0.15 mm clearance before ordering.
-- **m3.** `J7_2` (servo GND return) has only **2** thermal spokes where every other GND pad
-  has 4. Not resistively significant (~0.34 mΩ) but a needless constriction on the highest-
-  current return. Use 4 spokes or direct-connect.
-- **m4.** No fuse, no reverse protection and no TVS on either J1 input. Terminal ordering is
-  good (+5V, GND, +12V — GND between), but a mis-wire puts 12 V on the 5 V rail and destroys
-  U4 (5.5 V abs max), both Nanos and every sensor. ~$0.30: 2 A polyfuse + SMBJ5.0A.
-- **m5.** No board name, revision or date on the silk. With divider values changing between
-  revisions, an unmarked board is a real hazard.
-- **m6.** J6/J7/J8 are silked `+5V` but the net is `5VSWED` (switched, currently always off).
-  Someone probing for 5 V will read 0 V and suspect the supply. Label `+5VSW`.
-- **m7.** No test points anywhere — not on `+5V`, `5VSWED`, GND, the servo feed, or either
-  divider node. `PINOUT.md §9` is built around exactly these measurements.
-- **m8.** C2 (10 mm can) to J1 clearance is ~1.5 mm nominal — clear but tight for a ±0.5 mm
-  can tolerance and a hand-placed terminal block. Verify before fab. C2 does not foul either
-  Nano module or D1. Both USB connectors face the board edge unobstructed.
-- **m9.** No header for the **witness servo**, which `PINOUT.md §3a` documents as teed on the
-  same signal and credits with localising the moving-carriage intermittent open. Adding a
-  second 3-pin header in parallel with J7 is free and preserves the rig's best diagnostic.
+Estimated C_m(LED−, SCL) ≈ **1.6 pF** against ~30 pF of bus ⇒ a ~5 % step: 250 mV for a 5 V
+swing. With the pull-ups now fitted (R10/R11 at 3.3 kΩ) recovery is ~100 ns rather than
+1.35 µs, so this is **less severe than before V5** — but `LED-` is toggled ~3× per cell ×
+666 cells per pass, so exposure is high.
+
+`$1N7075` matters independently: that is the ack divider node, now read as a **1.20 V analog
+threshold** from a 1.25 kΩ source. A switching LED return 184 µm away for 5.7 mm should move
+regardless of the threshold's margin.
+
+⚠ **This is the interaction to respect: Q1 is now an AO3400A with fast edges.** Upgrading the
+FET without addressing the routing trades an LED-repeatability problem for an I²C/analog
+corruption problem.
+
+**Fix:** reroute `LED-`/`LEDGT` away from the SDA/SCL/S0 bundle or interpose a grounded
+guard; **and** add a **100–470 Ω series gate resistor** at Q1 to slow the edge deliberately
+(the bank switches at a few kHz and needs no speed). Minimum viable: open the two sub-200 µm
+runs at x ≈ 63.7–64.2 to ≥0.5 mm.
+
+## O7. The limit-switch pins do not implement the intended function 🟠 **OPEN in V5** — MEASURED
+
+**Verified in V5:** `LIMSW-` = **{J9.3}** — still the only genuine single-pin net on the board.
+`LIMSW+` = {J9.2, C1.2} — reaches a 1 nF cap and nothing else.
+
+*Designer's intent (stated): take the Y limit-switch wire in, filter it, and export the
+filtered version to the CNC shield on the Mega.* As drawn that is not implementable, for
+three separate reasons:
+
+1. **J9.3 connects to nothing at all** — not GND, not J9.2, not the cap. Nothing can leave it.
+2. **There is no series resistor**, so there is no RC filter — C1 is only a shunt cap.
+3. **C1 is 1 nF**, and this project's own Y-limit investigation concluded 1 nF (~50 µs) is too
+   small and recommended **1 kΩ + 100 nF**.
+
+**Fix:** `J9.2 → R (1 kΩ) → J9.3`, with C1 raised to **100 nF** from J9.3 to GND. Switch in on
+J9.2, filtered signal out on J9.3, then the flying wire to the CNC shield. Three changes, and
+it matches both the stated intent and the documented fix.
+
+## O8. R6 (0 Ω) makes a plugged-in USB burn ~1 W in U4 🟠 **OPEN in V5** — MEASURED + datasheet
+
+R6 ties QOD to VOUT, which is **correct per TI SLVSEN5B** (one of three sanctioned options —
+see [Adjudicated facts](#adjudicated-datasheet-facts)). The problem is the interaction.
+
+Table 2: with ON low and QOD tied to VOUT, VOUT is pulled to GND through **RPD,QOD = 24 Ω**.
+`5VSWED` reaches the Mega's 5 V pins (J11.1/2) and the ServoNano's (J5.12), and the Mega's
+`T1` FDN340P **hard-connects its +5 V to USBVCC when no VIN is present** — so the Mega's 5 V
+pin is a genuine *source*, not a passive load.
+
+⇒ switch off + either USB plugged: **~196–208 mA, ~0.92–1.04 W in an SC-70-6**, and with
+**RθJA = 210.7 °C/W** that is a **194–219 °C rise** — past the 180 °C thermal shutdown.
+
+Live during any bring-up session (flashing GRBL over the Mega's USB with the shield
+unpowered). *Accepted as low-risk in production, where no USB is attached.*
+
+**Fix:** **R6 → 1 kΩ** caps the sink at ~5 mA. TI's own worked example uses 1 kΩ. Free.
+
+## O9. The 3V3 sensor rail has no decoupling 🟠 **OPEN in V5** — MEASURED
+
+Every capacitor sits on `+5V`, `5VSWED`, `$1N1028`, `+12V` or `LIMSW+`. **`3V3` has none.**
+
+Measured: J2.2 → J6.1 = **42.9 mΩ over ~40 mm**; J2.2 → J8.6 = 22.6 mΩ. The trace is 0.762 mm
+(generous) — the gap is the missing local reservoir at the far end of a 40 mm feed to a
+VL53L4CD whose VCSEL draws tens of mA in bursts.
+
+**Fix:** 100 nF + 4.7 µF at J6, 100 nF at J8. Both connector areas have room.
+
+## O10. C3 and C4 are on stubs at J7; only C5 is in the current path 🟠 **OPEN in V5** — MEASURED
+
+| Cap | Value | Distance to J7.1 | R | In path? |
+|---|---|---|---|---|
+| **C5** | 470 µF | 9.72 mm | 4.85 mΩ | **YES** — both trunk legs terminate in its pad. Correct. |
+| C4 | 10 µF | 8.26 mm | 9.63 mΩ | **STUB** — 1.73 mm of 10 mil + one via |
+| C3 | 100 nF | 4.60 mm | 5.20 mΩ | **STUB** — 1.33 mm of 10 mil + one via |
+
+The bulk cap is placed well; the two **high-frequency** parts are the ones hung off 10-mil
+stubs. C3's HF loop is ≈22 mm of conductor ⇒ ~12 nH ⇒ **SRF ≈ 4.6 MHz** — worth perhaps a
+third of a properly in-path 100 nF.
+
+**Fix:** widen the C3/C4 taps to 0.6 mm, double the vias, and place C3 so the trunk passes
+*through* its pads — exactly as was done correctly for C6–C9 at U4 (see R11).
+
+## O11. There is still no `LED+` on the board 🟠 **OPEN in V5** — MEASURED
+
+`LED-` = {J9.1, Q1.3} is the only LED connection. The anode feed and any current-limiting
+element remain off-board and undocumented, so the bank's current is unknown — which is what
+prevents sizing `LED-` (O12) and confirming Q1.
+
+If the anode is tapped from a sensor supply, the LED current flows through that sensor's own
+supply pin, producing a droop that appears **only when the LEDs are on** — i.e. exactly in
+phase with the (on − off) subtraction, and therefore not cancelled by it.
+
+**Fix:** make J9 4-pin with a dedicated `LED+` from unswitched `+5V`, with its own local bulk,
+star-separated from the sensor feed.
+
+## O12. `LED-` carries the bank current over 64 mm of 10-mil trace 🟠 **OPEN in V5** — MEASURED / current UNDETERMINED
+
+J9.1 → Q1.3 = **125.5 mΩ** (≈64 mm of 0.254 mm, vs 36 mm straight). At 0.2 A that is 25 mV and
+5 mW — fine. At 1 A it is 125 mV and above the IPC 10 °C-rise limit of ~0.88 A for that width.
+
+Blocked on O11 (bank current unknown). **Fix:** if >0.5 A, widen to ≥0.6 mm — which also
+creates the room to move it away from SCL (O6).
+
+## O13. Feeding the Mega's 5 V pin back-drives its USB port 🟠 **OPEN in V5** — MEASURED / INFERRED (F20)
+
+`5VSWED` drives J11.1/J11.2 = the Mega's +5 V pins. Arduino's own documentation: *"Supplying
+voltage via the 5V or 3.3V pins bypasses the regulator, and can damage your board. We don't
+advise it."* There is no sanctioned voltage or current rating for injecting into that pin.
+
+Via the FDN340P path described in O8, the shield's 5 V propagates onto the Mega's USB VBUS
+through its 500 mA polyfuse and out to any attached host.
+
+**Fix:** a series Schottky or ideal-diode between U4's output and J11.1/2 — **or** accept it
+and document "do not attach USB to the Mega while the shield is powered." The O8 fix handles
+the destructive half regardless.
 
 ---
 
-## Corrected claims
+# 🟡 OPEN — minor
 
-Two review passes disagreed; these are the resolutions.
-
-- **R6 (0 Ω, 2512) is CORRECT — not a defect.** One pass inferred `U4.5` = CT and called R6 a
-  dead-end stub defeating soft-start. The BOM confirms **TPS22919DCKR**, whose pin 5 is
-  **QOD** (quick output discharge); tying QOD to VOUT is one of three configurations TI
-  explicitly sanctions, selecting the internal 24 Ω discharge path. R6 carries no load current
-  and adds **zero** impedance to the servo feed. *The only nit: a 2512 is several sizes larger
-  than the function needs and misleadingly implies a power path — use 0603.*
-- **U4's `ON` pin does not float.** One pass claimed the rail comes up indeterminate. The
-  TPS22919 has an internal 530 kΩ smart pull-down, so it comes up deterministically **off**.
-  The fix is a pull-**up** (B1), not a pull-down. *(One residual unknown: if GPIO38's reset
-  configuration enables a weak internal pull-up, 3.3 V through ~45 kΩ against 530 kΩ would
-  give 3.04 V and the rail would come up on. Unverified — another reason to fit the 100 kΩ.)*
-- **A 100 kΩ `ON` pull-up is sufficient.** One pass claimed ≤50 kΩ was needed to overcome the
-  smart pull-down. 100 kΩ gives 2.78 V against a 1.0 V threshold — ample.
-- **The silkscreen is correct.** It reads "Arduino Nano ESP32" with ESP32-specific labels
-  (VBUS, B0, B1), connector functions are labelled, and J1 has polarity arrows. Only the
-  **symbol / footprint / netlist / BOM** say "Arduino Nano RP2040" — a procurement and
-  future-edit hazard (the RP2040 was retired Aug 2026), not an assembly one. Rename to
-  "Arduino Nano ESP32 (ABX00083)" before the file propagates.
-
----
-
-## Regression scorecard vs. documented history
-
-| Documented failure | Verdict |
-|---|---|
-| Servo feed resistance / droop | **Reintroduced, worse.** 88–120 mΩ switch + 93.6 mΩ trace = the whole budget (C1), servo last on a daisy chain (C2), no output cap (C3). |
-| ESP32-S3 not 5 V tolerant (Mega TX1 → D0) | **Addressed — good catch — but wrong ratio** (B2). Closes the `PINOUT.md §2` audit item. |
-| Servo ack divider | **Regressed** from proven 1.8k/3.3k (B2), and R5 breaks fail-loud entirely (C4). |
-| Brownout resets (`HAD_POR`) | **Partly fixed** — MCU gets its own 12 V→VIN rail. **Partly reintroduced** — ServoNano on the servo rail (C2), no decoupling (C3), no VIN bulk (C10). |
-| RUN-pin glitch (`HAD_RUN`) | **Ignored.** The memory note prescribes ~100 nF RUN→GND; `U1` RESET goes to the socket pin and nothing else. Free fix, not taken. |
-| Stepper EMI on servo command line | **Worsened.** 2 kΩ series raising receiver impedance (C8), no J12 ground (C9), 48 mm parallel run (L3), 11 cm² loop (L1). |
-| One-way link dropped command | **Not addressed**, and its only safety net is compromised (C4). |
-| Y-limit glitch / ground bounce | **Referenced, not fixed.** The known-too-small 1 nF is reproduced verbatim, no series R, signal routed nowhere (B3). |
-| Blown-sensor "added light" regime | **Risk added.** No gate pull-down and an unspecified V_GS region put the LED bank's off-state and repeatability in question (C7). |
-
----
-
-## Needs a bench measurement
-
-1. **SDA idle voltage at `J6.3`** with the lidar attached — is the breakout putting 5 V on A4/A5? (C6)
-2. **TCS3200 supply voltage on the *existing* rig** — is `OUT` at 5 V today, i.e. is C6 inherited or introduced?
-3. **`5VSWED` with U4 off and ServoNano USB plugged** — does USB back-feed the rail? (C12)
-4. **Copper weight ordered.** All resistances assume 1 oz. At 2 oz they halve and C1's total falls to ~0.20 V — still at the ceiling, so C1 stands either way.
-5. **What J11's 32 unrouted pins and J10's 8 pins are for.** J10 has zero nets. If J10 lands on a Uno-style block, it may collide with the CNC Shield V3, which is not stackable.
-6. **Whether +12 V shares a supply with the steppers** — sets C10's severity.
-7. **Actual LED bank current** — decides whether C7's 2N7002 is merely under-driven or outright undersized.
-8. After any fix: **volts at J7.1 under a real stall**, using `ServoLoadTest/`, before touching any firmware constant. That is the documented procedure and it is the acceptance test for C1/C2.
-
----
-
-## Suggested order of work
-
-1. **Netlist-level, must precede fab:** B1 (`ON` pull-up + route 3V3), B2 (R3/R5 → 3.3 k),
-   B3 (J9 — route or delete, and add LED+), B4 (route 3V3), C9 (J12 ground).
-2. **One layout pass fixes four things at once:** re-place U4 and C2 beside J7, star the
-   switched rail, widen `5VSWED` to ≥60 mil or pour it, and add bulk + ceramics at J7 — this
-   resolves C1, C2, C3 and L1 together. Strongly consider taking the servo off the switch
-   entirely, which also defuses B1's brownout interaction.
-3. **Cheap component changes:** C7 (gate pull-down + AO3400A), C8 (R1 → 100–330 Ω),
-   C10 (VIN bulk), C5 (I²C pull-ups to 3V3), m4 (polyfuse + TVS).
-4. **DFM before ordering:** m1 (corner holes), m2 (clip silk off pads), m3 (J7.2 spokes),
-   m5/m6 (board rev, `+5VSW` labels), m7 (test points), m9 (witness-servo header).
-5. **Firmware, independent of the respin and worth doing now:** promote
-   `servoAckWaitIdle()`'s stuck-low timeout to a hard fault (C4).
-6. **Docs:** add D11 to `PINOUT.md §2` and close the level-shifting audit item; correct the
-   "fails loud" claim in `PINOUT.md §3b` and `CLAUDE.md` (C4).
-
----
-
-## Revision status — V3 gerbers + V2 netlist (2026-08-17)
-
-Measured from `Gerber_PCB3_Shield_2026-08-17_V3.zip` and
-`Netlist_Schematic3_Shield_2026-08-17_V2.tel`. Path resistances are Dijkstra over a
-two-layer segment graph stitched at the vias, with true arc lengths from the I/J offsets
-(V3's top layer has 5 arcs contributing +1.73 mm over their chords — no longer negligible).
-
-### Fixed
-
-| Was | Now |
-|---|---|
-| **C1** servo droop: 198–230 mΩ, 300–345 mV @1.5 A | **~46.7 mΩ, ~70 mV** — J1.3 → J7.1 is 68.0 mm entirely at 30 mil = 44.4 mΩ, plus ~2.3 mΩ of plane return. **Inside the ≤0.2–0.3 V budget with 130–230 mV of headroom for the harness.** |
-| **C2** daisy chain, servo last | Resolved. `J7.1` moved from `5VSWED` to **`+5V`**, so the servo no longer passes through U4 or through the sensors' supply traces. `5VSWED` now carries only ServoNano logic + lidar + colour sensor (tens of mA), so the chain ordering stops mattering. |
-| **C11** two 5 V sources shorted | Resolved. `+5V` = {`C2.1`, `J1.3`, `J7.1`, `U4.1`} — `J1.3` is now the sole source. |
-| U4 → J8.6 sensor rail | 62.6 → 53.8 mΩ (73.4 mm now at 30 mil). Irrelevant at sensor currents, but free. |
-
-Taking the servo off the load switch was the decisive change — it removed the 88–120 mΩ
-R_on term that widening alone could never touch, and it also defuses **B1**'s worst
-consequence (a brownout can no longer cut servo power mid-flip, because the servo is no
-longer behind an MCU-gated switch).
-
-### ⚠ New, and now blocking: the dividers are still 2 kΩ/2 kΩ
-
-`$PACKAGES` is **byte-identical** between netlist V1 and V2 — no component value changed and
-no part was added. R1–R5 are all still 2 kΩ.
-
-This was "out of spec" before. **With the active-HIGH ack firmware (committed 2026-08-17) it
-is now a hard failure**, because `INPUT_PULLDOWN` (~45 kΩ) sits in parallel with the bottom leg:
-
-| Divider | bottom ‖ 45 kΩ | asserted level | vs V_IH 2.475 V |
+| # | Finding | Detail | Fix |
 |---|---|---|---|
-| 1.8 k / 3.3 k (breadboard rig) | 3.075 kΩ | **3.154 V** | OK |
-| 2 k / 3.3 k | 3.075 kΩ | **3.029 V** | OK |
-| **2 k / 2 k (this PCB)** | 1.915 kΩ | **2.446 V** | **FAILS** |
-
-On this board the ack would never assert, `SERVO_ACK_MODE 2` would retry forever, and
-**PARMain would block on the first servo command of the first job.** The current hand-wired
-rig is 1.8 k/3.3 k and is unaffected — this bites only if the PCB is fabbed as drawn.
-
-**R3 and R5 must go to 3.3 kΩ before fab.** Same for R2/R4's partner legs on the GRBL link.
-
-### Also new: J11 moved onto the switched rail
-
-`J11.1`/`J11.2` moved from `+5V` to `5VSWED`. If J11 is an **output** (the shield powering
-something on the Mega header) that is fine. If it is an **input** — 5 V arriving from the
-Mega — it now back-feeds U4's VOUT, defeating the load switch and holding `5VSWED` live
-whenever the Mega is powered, regardless of D11. **Confirm the direction before fab.**
-
-### Still outstanding — unchanged in V2/V3
-
-Netlist connectivity is otherwise identical, and no components were added, so every finding
-below still stands exactly as written above:
-
-- **B1** `5VSW`/D11 — no `ON` pull-up, no firmware drives D11. The rail is still off, so the
-  sensors, lidar and ServoNano still get no power. (The servo now does, via `+5V`.)
-- **B3** `LIMSW-` is still a single-pin net; `LIMSW+` still reaches only C1. Still no `LED+`.
-- **B4** 3V3 still unrouted.
-- **C3** still zero decoupling; `5VSWED` still has no capacitor. Note the inrush ceiling no
-  longer applies to the servo, so bulk at J7 can now be sized freely.
-- **C5** no I²C pull-ups. **C7** no gate pull-down on Q1, still 2N7002. **C8** R1 still 2 kΩ.
-- **C9** J12 still has no ground pin. **C6** sensor rail still 5 V into D8.
-- All DFM items (m1–m9) unchanged.
+| **O14** | **Silk on an exposed pad — one genuine case** | **R1 pad 2**, mask opening at (9.570, −44.069): **0.1995 mm² = 8.46 % of the pad**, a 0.152 mm band from U2's body outline at y = −43.752. Bottom side: **0.000 mm²**. | Move U2's courtyard line to y ≈ −43.2, or R1 down 0.6 mm |
+| **O15** | J6/J8 silkscreen still reads `+5V` | The net is now `3V3`. GND labels are also wrong while Q2 is in place. | Relabel; revisit after O4 |
+| **O16** | U4 mask dams are 128 µm | Below most fabs' 0.15–0.20 mm minimum, so pins 1-2-3 and 5-6 will share open windows. Not a defect; raises bridging risk on the one fine-pitch part. | Reduce mask expansion to 0.025 mm on U4, or stencil carefully |
+| **O17** | Two silk segments use a 0.0762 mm (3 mil) aperture | 1.8 mm total; below the ~0.15 mm printable minimum, so they print raggedly or not at all. | Widen to ≥0.15 mm |
+| **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
+| **O19** | No board name, revision or date on the silk | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
+| **O20** | No test points | The documented bring-up procedure is built on probing the servo feed and the divider nodes. | Pads on `+5V`, `5VSWED`, `3V3`, GND, J7.1 and `$1N7075` |
 
 ---
 
-## Revision status — netlist V3 + BOM V2 (2026-08-17)
+# ✅ RESOLVED
 
-### Fixed
-- **B2 dividers** — `R3`, `R5` → **3.3 kΩ** (R1/R2/R4 stay 2 kΩ). Asserted level 3.03–3.11 V
-  against V_IH 2.475 V. Connectivity is otherwise byte-identical to netlist V2.
-
-### J11 confirmed — and it makes B1 worse
-`J11.1`/`J11.2` on `5VSWED` are an **output**: the shield powers the Mega. That is
-intentional and correct as a topology, and it resolves the dual-source question.
-
-But it means **the Mega — and therefore GRBL — is now downstream of the load switch**, which
-nothing turns on (B1: `ON` ← D11, undriven, internal 530 kΩ pull-down). As drawn, powering
-the board leaves the motion controller dead as well as the sensors. This raises B1 from
-"peripherals don't come up" to "nothing except the ESP32 comes up", and makes the
-**100 kΩ `ON` pull-up to 3V3 the single most important remaining change**.
-
-Two follow-ons worth checking:
-- Load on the switch is now Mega + CNC-shield logic (~300 mA est.) plus ServoNano and
-  sensors. Comfortably inside 1.5 A, ~27 mV across R_on — fine.
-- Feeding the Mega's **5 V pin** bypasses its USB/barrel power-select. If the Mega's USB is
-  also connected (for flashing GRBL), that is two sources on one rail. Normal practice is to
-  power the Mega *or* plug its USB, not both — worth a silkscreen note near J11.
-
-### The hand-wired rig is 2 kΩ/2 kΩ — not 1.8 kΩ/3.3 kΩ
-Physically confirmed 2026-08-17. `PINOUT.md` and `CLAUDE.md` both claimed 1.8 k/3.3 k; both
-have been corrected. This matters more than a documentation slip:
-
-| Divider | Asserted level | vs V_IH 2.475 V |
+| # | Was | Status |
 |---|---|---|
-| 2 k/2 k, ideal 5.00 V | 2.500 V | +25 mV |
-| 2 k/2 k, real V_OH 4.90 V | 2.450 V | **−25 mV** |
-| 2 k/2 k **+ INPUT_PULLDOWN** | **2.446 V** | **−29 mV — hard fail** |
-
-The old active-LOW protocol survived on this ratio because the *idle* level with
-`INPUT_PULLUP` was 2.517 V — 42 mV of margin, which is why the 2026-07-27 validation run
-(750 commands, 0 misses) passed. The active-HIGH change plus `INPUT_PULLDOWN` would have
-inverted that into a permanent fail: the ack never asserts, `SERVO_ACK_MODE 2` retries
-forever, and PARMain blocks on the first servo command of the first job.
-
-**Fix applied in firmware, not hardware** (no 3.3 kΩ/1.8 kΩ parts on hand, and the rig and
-the PCB must run one build): the ack is now read as an **analog level**, `servoAckHigh()`,
-threshold **1.20 V**. Idle is 0 V (the divider's bottom leg is the pulldown), asserted is
-≥2.45 V, so the decision sits >1.2 V from either state and no longer depends on V_IH or on
-the divider ratio. Works unchanged on 2 k/2 k, 2 k/3.3 k and 1.8 k/3.3 k. `SERVO_ACK_PIN` =
-D2 = GPIO5 = **ADC1**_CH4 — ADC1 is mandatory, ADC2 is unusable while WiFi is up.
-
-Do not revert to `digitalRead`, and do not fit `INPUT_PULLDOWN`, while the rig is 2 k/2 k.
+| **R1** (B1) | Switched rail never enabled — `U4.3` ← D11, undriven; internal 530 kΩ SPD holds it off | ✅ **V5 + firmware.** `PARMain` drives D11 HIGH as the first statement in `setup()`, **and V5 adds R9 = 100 kΩ from `5VSW` to 3V3**. The pull-up also closes the "ON floats after the SPD disconnects" hole (TI: the Smart Pull-Down is disconnected once ON has been driven high, and the pin table says *do not leave floating*). Referencing it to **3V3 rather than 5 V** is the right call — it gates on the ESP32's own regulator, so the rail still sequences behind the MCU without needing firmware to do it. |
+| **R2** (B2) | Both level-shift dividers 2 k/2 k = 2.50 V against V_IH 2.475 V | ✅ **V3.** R3/R5 → 3.3 kΩ ⇒ 3.11 V. |
+| **R3** (B4) | 3V3 not routed anywhere | ✅ **V4.** `3V3` = {J2.2, U1.3, J6.1, J8.6, …}. Conceded: this was an enabler, not a standalone defect, and should not have been listed as blocking. |
+| **R4** (C1) | Servo droop: 198–230 mΩ / 300–345 mV at stall | ✅ **V3.** `J7.1` moved to unswitched `+5V` and the rail widened to 30 mil. Measured **44.3 / 44.4 / 43.86 mΩ** by three independent methods ⇒ ~70 mV. Inside the ≤0.2–0.3 V budget — *subject to O1 and O3, which put it back*. |
+| **R5** (C2) | Switched rail a daisy chain with the servo last | ✅ **V3/V4.** Servo on `+5V`, sensors on `3V3`; only ServoNano and Mega remain on `5VSWED`. |
+| **R6** (C3) | Zero decoupling on the entire board | ✅ **V4** — ten capacitors added. Placement is good at U4 (R11) and for C5; **C3/C4 stubs remain open (O10)** and **3V3 has none (O9)**. |
+| **R7** (C4) | R5 destroys the ack's fail-loud property | ✅ **Firmware.** Polarity inverted to active-HIGH so the divider's bottom leg *is* the fail-safe, and `servoAckWaitIdle()` now returns a bool — a line stuck asserted is treated as a fault and blocks, instead of timing out silently and letting `servoAckSeen()` pass vacuously. |
+| **R8** (C5) | No I²C pull-ups | ✅ **V5.** R10/R11 = 3.3 kΩ to 3V3. Bus was empirically fine beforehand (~6–7 h of clean lidar scans), so this is margin rather than a repair — but it does interact with O4. |
+| **R9** (C6) | 5 V into non-5 V-tolerant pins (TCS3200 `OUT`→D8; lidar I²C) | ✅ **V4**, and cleanly: both sensors moved to `3V3`, so `OUT` swings 0–3.3 V natively and any breakout pull-ups now reference 3.3 V. **Recalibration is small** — the TCS3200's supply-voltage sensitivity is ±0.5 %/V, so 5 V→3.3 V shifts output frequency <1 %, well inside the 2.17× threshold margin. (That spec is characterised at 5 V ±10 %, so verify empirically.) |
+| **R10** (C7) | Q1 = 2N7002, undriven at 3.3 V, no gate pull-down | ✅ **V4.** AO3400A + R7 100 kΩ pull-down. **But see O6** — the faster edge makes the `LED-`/SCL coupling matter more, and no gate series resistor is fitted. |
+| **R11** (C8) | R1 = 2 kΩ raising noise gain on the servo command line | ✅ **V4.** R1 → 330 Ω. Kept at 330 Ω rather than raised to 2.2 kΩ for injection limiting: instead, **`Serial2.begin()` was moved after the rail-settle delay** in firmware, so D9 stays high-Z until the ServoNano is powered. Injection goes to zero without giving up noise immunity. |
+| **R12** (C10) | No decoupling on the ESP32 VIN node | ✅ **V4.** C10 (100 nF) + C11 on the D1 cathode, C12 on +12 V. **C11's voltage rating is a blocker — see O2.** |
+| **R13** (C11) | Two 5 V sources shorted (J1.3 and J11) | ✅ **V3.** J11 moved to `5VSWED` as an output; `J1.3` is now the sole source. |
+| **R14** (L1) | ~11 cm² high-current loop | ✅ **V4.** C5 placed at J7 collapses it. |
+| **R15** (N8) | J12's mapping to a Mega UART unproven | ✅ **Verified.** Reconstructed against Arduino's official Mega 2560 Rev3 reference design: one self-consistent affine fit lands every pin on the 2.54 mm grid. **J11 = XIO power/ground** (5V/5V and GND/GND pairs, so the column swap is harmless), **J12.3/J12.4 = D19/D18 = RX1/TX1 with correct polarity**, **J10 = A8–A15** (intentionally unused). And the patched grbl-Mega **is** built for USART1 (`SERIAL_RX = USART1_RX_vect`; `serial.c` drives `UCSR1*`/`UBRR1*`), so the link works end to end. |
 
 ---
 
-## B1 resolved by design decision, not by a pull-up (2026-08-17)
+# ⚪ WITHDRAWN / CORRECTED
 
-The earlier recommendation — a 100 kΩ pull-up on `ON` so the rail is on by default — is
-**withdrawn**. It was driven by the brownout-cuts-servo-power argument, and V3 made that
-obsolete by moving `J7.1` to unswitched `+5V`. With the servo off the switched rail, a
-pull-up would only have inverted the default while giving up the one thing the switch is
-good for.
-
-**Adopted instead: `PARMain` drives D11 HIGH as the first statement in `setup()`.** The rail
-stays fail-off, and the board gets a deterministic power-on order — ESP32 first, then Mega,
-ServoNano, lidar and colour sensor. No component change.
-
-Implementation notes that are easy to get wrong:
-- D11 must go HIGH **before** the boot servo-park, which is a UART write to a board on the
-  switched rail. `SHIELD_PWR_SETTLE_MS` = 2500 ms covers the ServoNano's CH340 bootloader.
-- Every sketch used on the shield needs the same two lines; one that lacks them looks like a
-  dead board rather than a firmware omission.
-- The rail is all-or-nothing — it cannot power-cycle the lidar (REVIEW.md C5's flaky init)
-  without also resetting GRBL and the ServoNano, because J11 put the Mega on it.
-- On `esp_restart()` the pin tri-states, so the stall watchdog now power-cycles GRBL too.
-  That is a stronger recovery than the soft reset it replaces.
+| # | Claim | Why withdrawn |
+|---|---|---|
+| **W1** (C9) | "J12 has no ground pin — assign one of the spares" | **Designer correct.** J12 mates to the Mega's COMMUNICATION header (D21–D14), which contains **no GND pin**; tying a spare to GND would short a Mega GPIO. The return via J11's GND is the only option and is adequate. |
+| **W2** (m2) | "Silk over pads — 20 instances including R6" | **Designer correct, and my method was wrong.** That figure came from testing silk against **copper**, which false-positives on every trace. Re-tested against **solder-mask openings**: exactly **one** genuine case board-wide (R1 pad 2 — now O14). R6 is clean, as the designer said. |
+| **W3** (m3) | "J7.2 has only 2 thermal spokes vs 4 elsewhere" | **Immaterial.** Two spokes ≈ 0.34 mΩ ⇒ 0.5 mV at 1.5 A. The designer's explanation (adjacent non-GND pads) also accounts for it. |
+| **W4** (m9) | "No header for the witness servo" | **Designer correct.** A KF128 screw terminal accepts two wires; a second header is unnecessary. |
+| **W5** (L5) | "108 mm of bottom trace slots the ground plane" | **Second-order, and already minimised** — the designer routes on the bottom only where no top path exists. Ground measured excellent regardless (R16). |
+| **W6** (C12) | "ServoNano USB back-feeds the switched rail" | **Accepted as a production non-issue** — no USB attached in production. The bench hazard it creates is tracked under O8 instead. |
+| **W7** | "TCS3200 S0–S3 at 3.3 V may not meet V_IH" | **Wrong.** ams DS000107 v1-01 p.6: `VIH min 2, max VDD` at VDD 2.7–5.5 V — an **absolute 2.0 V**, not a fraction. 3.3 V is in spec at VDD = 5 V. |
+| **W8** | "The J1 silkscreen arrows point into gaps and invite a mis-wire" | **Wrong.** The two glyphs are **closed 1.0 × 1.5 mm rectangles** (four strokes each) — J1's body outline, not arrows. The three text labels are correctly aligned over their pads. |
+| **W9** | "ESP32 D1/TX may be unable to pull the Mega's RX low (16U2 contention)" | **Does not apply.** That mechanism lives on D0/D1; this design uses Serial1 (D18/D19). |
+| **W10** | "R6 / U4 pin 5 may be a CT soft-start pin wired wrongly" | **Wrong.** Pin 5 is **QOD**, and tying it to VOUT is one of three sanctioned configurations. Only the 0 Ω *value* is at issue — see O8. |
+| **W11** | "L6: +5V to J11 at 15 mil may be too thin for the Mega" | **Adequate.** 15 mil on 1 oz external = 1.19 A at 10 °C rise; a Mega plus CNC-shield *logic* is ~300 mA (motor current comes from its own supply). ~4× margin. |
 
 ---
 
-# Blind re-audit (2026-08-17) — two independent passes, adjudicated
+# Reference
 
-Two auditors reviewed netlist V3 + BOM V2 + V3 Gerbers **with no access to this document,
-to any earlier revision, or to the firmware**, to test whether the findings above were
-anchored. Both worked only from the design files plus a neutral description of the machine.
+## Decoupling — what is actually needed
 
-**Independently reproduced by both:** TCS3200 `OUT` into D8, the dead `LIMSW` nets,
-unbuffered 3.3 V→5 V in both directions, the 2N7002, no gate pull-down, no I²C pull-ups,
-no decoupling, no 5 V protection, `LED-`‖`SCL` coupling, J12 without a ground pin, the
-0.312 mm hole-to-edge, silk on pads, J10 unconnected, 3V3 unrouted. Both also independently
-cleared R6 as a sanctioned QOD configuration and rated the ground pour excellent.
+The Arduino modules each carry their own decoupling and bulk at their own pins and seat
+directly in the headers, so **caps at J11, J5.12 or J2/J3 are pure duplication — do not fit
+them.** There is also an inrush constraint: the TPS22919's slew is fixed at 3.2 mV/µs, so
+inrush = C × 3.2 mA/µF against a **1.5 A** limit, and that budget is already partly spent
+charging the modules' own bulk (0.6–1.0 A at an estimated 200–300 µF). `5VSWED` can take a
+10 µF ceramic and no more. The servo's bulk is exempt because it sits on the **unswitched**
+rail.
 
-**Measurement cross-check.** Three methods — a 1.4 M-node sparse resistive solve, a
-finite-element mesh, and Dijkstra over the vector segments — on `J1.3 → J7.1`:
-**43.86 / 44.3 / 44.4 mΩ**. On the `LED-` return: 137.73 / 136.7 mΩ. Both auditors also
-flood-filled copper against the netlist: **zero opens, zero shorts**.
+| Position | Part | LCSC | Verified |
+|---|---|---|---|
+| 100 nF 50 V X7R 0603 | Samsung CL10B104KB8NNNC | **C1591** | ✅ |
+| 10 µF 25 V X7R 1206 | Samsung CL31B106KAHNNNE | **C14860** | ✅ (also the C11 replacement — O2) |
+| 470 µF 16 V bulk at J7 | Lelon RXK471M1CBK-0811, 8 × 11.5 mm, 3.5 mm pitch | **C231191** | ⚠ LCSC publishes no ESR or ripple figure for it — nor for the existing C2. Cannot verify the ≤60 mΩ target from LCSC data. |
 
-## Adjudicated disagreements
+**X7R** = ±15 % over −55…+125 °C. **DC bias derating is the trap**: a 10 µF 6.3 V 0805 at 5 V
+delivers 2–4 µF; the 25 V 1206 delivers ~7–8 µF. Spec 25 V/1206 for 10 µF on a 5 V rail.
+**Layout:** cap in the current path (not on a stub — see O10), smallest value nearest the load,
+ground via immediately adjacent to the pad (0.3–0.5 mm, not in-pad), two vias where there is
+room. Bulk covers only the first tens of µs of a current step; **sustained stall droop is pure
+I×R and is fixed by resistance, not capacitance.**
 
-Each resolved against the primary source, not by preferring an auditor.
+## Ground — measured, and good
 
-### 1. TCS3200 V_IH — auditor A correct, B wrong
-B could not extract the datasheet and speculated V_IH might be 0.7 × VDD = 3.5 V, which
-would put 3.3 V drive on S0–S3 out of spec. A found the real figure.
+Single connected bottom pour, **3406 mm²**, 115 interior voids (all antipads), survives the
+rework unslotted. Returns to J1.2: J7.2 **3.08 mΩ**, J11.35/36 2.64 mΩ, J2.14 2.81 mΩ,
+J5.14 2.02 mΩ, U4.2 1.41 mΩ, Q2.2 3.23 mΩ. **Ground is not a problem on this board — every
+issue is on the high side.** Useful diagnostically: droop measured at the servo will be almost
+entirely on the +5 V wire.
 
-**ams TCS3200 DS000107 v1-01, p.6, Recommended Operating Conditions:**
-`VIH High-level input voltage, VDD = 2.7 V to 5.5 V: min 2, max VDD` — an **absolute 2.0 V**,
-not a fraction of VDD. `VIL: 0 to 0.8 V`.
+Narrowest corridor: **1.80 mm** at y ≈ −33. The dominant discontinuity is J11's 36 through-hole
+pads leaving **0.227 mm** of web between antipads — a comb across mid-board, with only 4 of 36
+pins used.
 
-**3.3 V drive on S0–S3 is fully in spec even at VDD = 5 V.** B's HIGH-6 is withdrawn.
-(Corroborated independently by the rig having run this way for months.)
+## DFM — everything else passes
 
-### 2. TCS3200 V_OH — auditor A correct, B overstated
-B assumed a rail-to-rail ~4.9 V output. **Datasheet p.6: `VOH, IOH = -2 mA: min 4, typ 4.5 V`.**
+Min track 0.254 mm ✅ · min clearance 0.152 mm ✅ · min annular ring 0.152 mm (vias) ✅ ·
+hole-to-hole 413 µm ✅ · hole-to-edge 566 µm ✅ · copper-to-edge 256 µm, none outside the
+outline ✅ · all 49 vias tented ✅ · zero pads without mask openings ✅ ·
+**copper matches the netlist exactly: 114 nets, 114 islands, 0 shorts, 0 opens, 0 floating
+copper** ✅.
 
-The overstress on D8 is therefore **0.4–0.9 V above the 3.6 V absolute maximum**, not 1.3 V.
-Still a clear absolute-maximum violation and still critical — but quote the right number.
+Hole counts differ by revision — V3: 158 PTH (24 vias) + 8 NPTH; **V5: 185 PTH (49 vias) +
+7 NPTH**. The 49 via coordinates appear in **both** drill files; deduplicate by coordinate or
+you will double-count.
 
-### 3. TPS22919 ON pin floating — auditor B correct, A wrong
-A argued the internal Smart Pull-Down holds the rail off during an ESP32 reset and called
-this good design. B said the pull-down disconnects once ON has been driven high.
+Note: netlist V5 is exported from the **PCB** document, so the U1/U2 module symbols are absent
+and ~36 header pins appear as single-pin nets. Those are unpopulated header positions, not
+defects. **`LIMSW-` is the only genuine one (O7).**
 
-**TI TPS22919 SLVSEN5B §8.3:** *"When power is first applied to VIN, a Smart Pull Down is
-used to keep the ON pin from floating until the system sequencing is complete. **Once the ON
-pin is deliberately driven high (≥VIH), the Smart Pull Down is disconnected** to prevent
-unnecessary power loss."* Pin table, pin 3: *"Active high switch control input. **Do not
-leave floating.**"*
+## Adjudicated datasheet facts
 
-So A is right about first power-on and wrong about everything after it. Since `PARMain` now
-drives D11 high on every boot, the 530 kΩ is disconnected from that moment on, and **every
-subsequent ESP32 reset leaves ON genuinely floating.** Fit the **100 kΩ pull-down on `5VSW`**.
-Also confirmed from the same table: `VIH ON Pin High Voltage Range 1 – 5.5 V`, so 3.3 V drive
-is fine.
+Settled against primary sources, not by preferring a reviewer.
 
-### 4. R6 / QOD + USB back-feed — auditor A correct, and confirmed
-Everyone (including this document) cleared R6 as datasheet-sanctioned and stopped there. A
-accepted that and asked what it *does*. Confirmed from **SLVSEN5B Table 2**: with ON low and
-QOD tied to VOUT, VOUT is pulled to GND through `RPD,QOD` = **24 Ω** (p.5).
+- **TCS3200** (ams DS000107 v1-01 p.6): `VIH min 2 V, max VDD` at VDD 2.7–5.5 V — **absolute**.
+  `VIL 0–0.8 V`. `VOH min 4.0 / typ 4.5 V @ IOH = −2 mA` (so the pre-V4 overstress on D8 was
+  0.4–0.9 V over abs max, not 1.3 V). Supply-voltage sensitivity **±0.5 %/V**.
+- **TPS22919** (TI SLVSEN5B): ON pin *"Active high switch control input. Do not leave
+  floating."* §8.3: *"When power is first applied to VIN, a Smart Pull Down is used to keep the
+  ON pin from floating until the system sequencing is complete. **Once the ON pin is
+  deliberately driven high (≥VIH), the Smart Pull Down is disconnected.**"* RPD,ON = 530 kΩ;
+  **RPD,QOD = 24 Ω**; VIH(ON) = 1–5.5 V; **RθJA = 210.7 °C/W**; I_MAX 1.5 A; slew 3.2 mV/µs.
+  Table 2: ON low + QOD tied to VOUT ⇒ VOUT pulled to GND through RPD,QOD.
+- **ESP32-S3**: V_IH = 0.75 × VDD = **2.475 V**; V_OH min = 0.8 × VDD = 2.64 V.
+- **ATmega328P/2560**: V_IH = 0.6 × VCC = **3.00 V** at 5 V; input leakage ≤1 µA.
 
-`5VSWED` also reaches the Mega's 5 V pins (J11.1/2) and the ServoNano's 5 V pin (J5.12), both
-of which back-feed their USB 5 V onto that rail. With the switch off and either USB plugged:
+## Still needs a bench measurement
 
-> 5 V / 24 Ω = **208 mA continuous, 1.04 W in an SC-70-6**.
-> RθJA = **210.7 °C/W** (p.4) → a **219 °C rise**, far past the 180 °C thermal shutdown.
+1. **LED bank current and forward voltage**, and where `LED+` is tapped — gates O11, O12 and Q1 sizing.
+2. **Copper weight ordered.** All resistances assume 1 oz; they halve at 2 oz.
+3. **Actual MG90S stall current** — vendor figures span 0.65–2.5 A, and O3's fuse margin depends on it.
+4. **Total Mega + CNC Shield V3 draw** — no official Arduino figure exists; needed to size O3.
+5. **Which VL53L4CD carrier** is fitted (pull-up rail, regulator) — affects O4.
+6. **Whether the TCS3200 breakout ties `/OE` low** — J8 does not bring it out; if it floats, `OUT` is high-Z.
+7. **D2's cathode orientation** — decides whether O1 gives a ~1 V sag or a dead rail. Does not change the fix.
+8. After any fix: **volts at J7.1 under a real stall** with `ServoLoadTest/`, before touching any firmware constant.
 
-This is live in an ordinary scenario — flashing GRBL over the Mega's USB with the shield
-unpowered. **Fix: R6 → ~1 kΩ** (caps the sink at ~5 mA; the datasheet's own worked example
-uses R_QOD = 1 kΩ), or depopulate it — leaving QOD floating is the documented third option.
+## Open hypothesis for the unresolved scan false positives
 
-A correct configuration made destructive by an interaction with a second finding. Neither the
-four-pass review nor auditor B caught it.
-
-### 5. J1 silkscreen glyphs — auditor A correct, B wrong (and this document was wrong)
-B reported "two custom silk arrows... each pointing into a gap" and rated it a mis-wire
-hazard. Extracted from `Gerber_TopSilkscreenLayer.GTO`, both glyphs are **closed rectangles**:
-four 0.254 mm strokes bounding 27.23–28.23 × −1.20…−2.70 mm and 32.23–33.23 × −1.20…−2.70 mm.
-They are **1.0 × 1.5 mm boxes, not arrows**, and almost certainly J1's body outline (the
-KF301 has divider ribs between poles). The three text labels are correctly aligned over their
-pads (25.23 / 30.23 / 35.23), which both auditors independently verified.
-
-**No mis-wire hazard from the legend.** The real J1 risk is the absence of reverse-polarity
-and overvoltage protection on `+5V`, which both auditors flagged and which stands.
-
-### 6. Drill and via counts — auditor B correct, A double-counted
-Measured: `Drill_PTH_Through.DRL` holds **158** holes (24 of them Ø0.305 mm vias);
-`Drill_PTH_Through_Via.DRL` holds **24**, and **all 24 coordinates are identical** to ones
-already in the PTH file. `Drill_NPTH_Through.DRL` holds 8.
-
-**166 unique holes: 158 plated (24 vias) + 8 non-plated.** A's "182 PTH / 48 vias" summed the
-two files without deduplicating; B spotted the standard EasyEDA duplication.
-
-### 7. Minimum clearance — B's figure preferred
-A measured 0.141 mm, B 0.152 mm. A stated its own raster quantisation as ±0.025 mm, and
-0.152 mm (6 mil) is the EasyEDA default rule. Take **0.152 mm**; either way it passes.
-
-### 8. Ground return resistance — unresolved, immaterial
-A's sparse solve gives J7.2→J1.2 = 3.375 mΩ; B's mesh gives 2.47 mΩ; the earlier FD solve
-gave 2.34 mΩ. The spread is meshing/boundary-condition choice. All three agree the pour is
-excellent and contributes ≤5 mV at 1.5 A. No action.
-
-### 9. Board dimensions — not a real conflict
-Outline measured from `Gerber_BoardOutlineLayer.GKO`: **90.68 × 51.82 mm** overall. A quoted
-the total; B quoted the 90.68 × 46.87 mm main body plus the 3.30 × 5.08 mm J12 tab separately.
-
-## New findings from the blind pass, not in the review above
-
-| # | Finding | Severity |
-|---|---|---|
-| N1 | **R6/QOD + USB back-feed burns ~1 W in U4** (adjudication 4) | **Critical** |
-| N2 | **Split rails have no supervisor.** The ESP32 runs from 12 V behind its own buck, everything else from 5 V. A 5 V brownout — a servo stall — resets the ServoNano and the Mega **while the ESP32 keeps running**, streaming G-code and servo commands into peripherals that are mid-reset. No reset distribution, no brownout signal between domains. | Major |
-| N3 | **Servo is energised before its controller.** J7.1 is on unswitched `+5V`; the ServoNano generating `SIG` is on switched `5VSWED`. Between power-on and D11 asserting, the servo has power and an 82 mm floating signal line. Fix: 10 kΩ pull-down on `SIG`. | Minor |
-| N4 | **J8 does not bring out the TCS3200's `/OE`.** If the breakout does not tie it low, `OUT` is high-Z and the sensor reads nothing. | Medium |
-| N5 | **Near-zero solder-mask expansion** on the 15-pin header pads: copper Ø1.7 mm, mask Ø1.7016 mm — 0.8 µm/side. With ±0.05 mm registration the mask encroaches. Set 0.05 mm expansion or confirm the fab overrides it. | Minor |
-| N6 | **`LED-` return is 137.7 mΩ** — Q1 sits 34.9 mm from J9 on 10-mil trace. At 500 mA that is 69 mV in series with the FET's ill-defined R_DS(on), directly modulating LED brightness. Widen and move Q1 to J9. | Minor |
-| N7 | **`LED-`‖`SCL` is 53 mm, not 27 mm**, at a 6 mil gap — with an estimated ~0.92 V injected glitch against an I²C V_IL max of 0.99 V. **Second-order and important: today's weakly-driven 2N7002 has slow edges, which is the only thing keeping this benign. Upgrading Q1 without also rerouting `LED-` trades an LED-repeatability problem for I²C corruption.** Add a 100–470 Ω gate resistor to keep the edge deliberately slow. | Major |
-| N8 | **J12's mapping to a Mega hardware UART is unproven** from the files. If pins 3/4 do not land on a Mega serial port, the ESP32↔GRBL link does not exist. Highest-priority bench check. | Verify |
-| N9 | `J2.12` on a Nano ESP32 is **VBUS**, not 5 V — an output live only under USB power. It is unconnected here, which is correct; never feed 5 V into it. | Nit |
-
-## Consolidated must-fix before fabrication
-
-Confirmed by two or three independent passes:
-
-1. **TCS3200 → 3.3 V** (`J8.6` to the unused `J2.2`), or divide `OUT` 2 k/3.3 k. Re-derive
-   `SCAN_ON_BLUE_MAX`, since output frequency scales with VDD.
-2. **`R6` → 1 kΩ** — prevents 1 W in an SC-70 whenever a debug USB is plugged in.
-3. **100 kΩ pull-down on `5VSW`** — the Smart Pull-Down is gone after the first assertion.
-4. **Route or delete the limit-switch nets**; add `LED+`.
-5. **100 kΩ gate pull-down + 100–470 Ω gate resistor on Q1**, and swap to AO3400A — but
-   reroute `LED-` away from `SCL` in the same spin (N7).
-6. **I²C pull-ups, 2.2 kΩ to 3V3** — requires routing 3V3.
-7. **Decoupling** — see the dedicated section below. Short version: **C_bulk at J7** and
-   **ceramics at U4**. Do *not* add caps at J11/J5/J2.
-8. **Protection on `+5V`**: polyfuse + P-FET or TVS.
-
-Deferred by decision, not oversight: the 3.3 V→5 V links (M2) remain unbuffered. They are
-inherited from the working hand-wired rig, not introduced by this board — but both auditors
-rate them higher than this document originally did, and they sit on the servo-command path
-with a documented dropped-command failure history. A 74LVC2T45 or 74AHCT1G125 is the fix if
-that failure recurs.
-
-
----
-
-# Decoupling — what is actually missing (revised 2026-08-17)
-
-The earlier "zero decoupling on the entire board" framing is accurate about the **shield**
-but misleading about the **system**. All three Arduino modules carry their own decoupling and
-bulk at their own supply pins, and they seat directly in the headers with essentially no
-trace between the shield's copper and their onboard caps. **Adding capacitors at J11 (Mega
-5 V), J5.12 (ServoNano 5 V) or J2/J3 (ESP32) duplicates what is already there and buys
-nothing.** Skip them.
-
-There is also a constraint that makes "more capacitance" actively wrong in one place. The
-TPS22919's slew rate is fixed at **3.2 mV/µs**, so turn-on inrush = C × 3.2 mA/µF, against a
-**1.5 A** device limit:
-
-| C on `5VSWED` | Inrush |
-|---|---|
-| 10 µF | 0.03 A |
-| 100 µF | 0.32 A |
-| 220 µF | 0.70 A |
-| 470 µF | **1.50 A — at the limit** |
-
-That budget is **already partly spent by the modules' own bulk**, which the switch must
-charge on every turn-on. At an estimated 200–300 µF across the Mega, the ServoNano and the
-two sensor breakouts, inrush is already 0.6–1.0 A before anything is added. So the switched
-rail can take a small ceramic and nothing more.
-
-The good news is that the load which actually needs bulk — the servo — **is no longer on the
-switched rail** (netlist V3 moved `J7.1` to unswitched `+5V`), so its capacitor sits outside
-the inrush constraint entirely and can be sized freely.
-
-## Fit these
-
-| Where | Part | Why |
-|---|---|---|
-| **J7 (servo), on `+5V`** | **470 µF low-ESR polymer/electrolytic + 10 µF X7R + 100 nF**, at the connector | **The single highest-value cap on the board.** The servo is the only real transient load (1.5 A steps) and currently has *no* local reservoir — C2 is 30.3 mm and ~41.5 mΩ away, so every current step is pulled through that impedance. Unswitched rail ⇒ no inrush limit. |
-| **U4 VIN (pin 1)** | **10 µF X7R + 100 nF**, within 2 mm | TI's datasheet **requires** C_IN ≥ 1 µF close to the device. U4 is a shield-mounted IC with no local capacitance of its own — this is not duplicated by any module. |
-| **U4 VOUT (pin 6)** | **10 µF X7R + 100 nF only** | Stabilises the switch output. **Deliberately small** — this rail's inrush budget is already consumed by the modules (table above). Do not fit 100 µF+ here. |
-
-## Worth having
-
-| Where | Part | Why |
-|---|---|---|
-| J6 (lidar), J8 (sensor) | 100 nF each, shield side | These run cables to a moving carriage. The breakouts usually carry their own caps, but a shield-side 100 nF terminates the cable inductance. Cheap; low risk either way. |
-| 12 V input / D1 cathode | 100 µF + 100 nF | The Nano ESP32's buck has only a small input cap. **Only worth it if the 12 V rail is shared with the stepper supply** — if it is, commutation transients land straight on the buck input. Confirm before fitting. |
-
-## Do not fit
-
-`J11.1/2` (Mega 5 V), `J5.12` (ServoNano 5 V), `J2/J3` (ESP32 rails). Each module already
-decouples its own pins, the header seating is direct, and on `5VSWED` any added capacitance
-eats the inrush budget for no benefit.
-
-**Net effect:** two capacitor groups that genuinely matter (J7 bulk, U4 ceramics), two
-optional, and five previously-recommended locations dropped as redundant.
+Not a finding — a candidate worth testing. The TCS3200 datasheet recommends buffering `OUT`
+beyond 12 inches, and this harness is longer. A **74LVC1G17 Schmitt receiver** at the MCU end
+is the most structural of the available explanations for false positives that appear only on
+70-minute full-board passes and never on the 13-minute bottom-rows test. O5's 100–200 mm²
+return loop on that same net is a second contributor pointing the same way.

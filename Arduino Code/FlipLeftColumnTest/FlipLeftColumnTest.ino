@@ -463,6 +463,10 @@ void servoTxLine(int us) {
 const int SERVO_ACK_PIN = D2;
 const unsigned long SERVO_ACK_TIMEOUT_MS = 80;   // must exceed the ~6 ms frame
 unsigned long servoAckMisses = 0;
+unsigned long servoAckStuck  = 0;   // line stuck asserted -> unverifiable
+// Idle-wait budget. Must exceed ACK_HOLD_MS (40) so a legitimate hold from the
+// PREVIOUS command is never mistaken for a stuck line.
+const unsigned long SERVO_ACK_IDLE_TIMEOUT_MS = 100;
 
 #if SERVO_ACK_MODE > 0
 // Read the ack as an ANALOG level, not a digital one.
@@ -489,9 +493,22 @@ static inline bool servoAckHigh() {
 }
 
 // Let the previous command's 40 ms hold expire so it cannot be mistaken for ours.
-static void servoAckWaitIdle() {
+// Returns FALSE if the line never returned to idle -- i.e. it is stuck asserted.
+//
+// !! THIS RETURN VALUE IS SAFETY-CRITICAL, DO NOT IGNORE IT. Under the
+// !! active-HIGH protocol a line stuck HIGH (ServoNano wedged mid-ack, a short
+// !! to the divider's top leg, or a ServoNano still running the old active-LOW
+// !! build) makes servoAckSeen() return true instantly and unconditionally.
+// !! The ack would then confirm every command without any command having
+// !! landed, and SERVO_ACK_MODE 2's retry-until-confirmed guarantee -- the one
+// !! thing stopping the carriage from moving on an unconfirmed arm position --
+// !! becomes vacuous. A stuck line must be treated as a FAULT, never as an ack.
+static bool servoAckWaitIdle() {
   unsigned long t0 = millis();
-  while (servoAckHigh() && millis() - t0 < 100) {}
+  while (servoAckHigh()) {
+    if (millis() - t0 >= SERVO_ACK_IDLE_TIMEOUT_MS) return false;
+  }
+  return true;
 }
 static bool servoAckSeen() {
   unsigned long t0 = millis();
@@ -525,12 +542,26 @@ void writeServoUs(int us, int settle_ms) {
   servoTxLine(us);
   delay(settle_ms);
 #else
-  servoAckWaitIdle();
   unsigned long t0 = millis();
   unsigned long attempt = 0;
   bool acked = false;
   do {
     attempt++;
+    // Stuck-asserted line: an ack read now would be meaningless. Treat exactly
+    // like a missing ack -- block and retry -- rather than believing it.
+    if (!servoAckWaitIdle()) {
+      servoAckStuck++;
+      if (attempt <= 5 || (attempt % 100) == 0) {
+        Serial.print("!! servo ack STUCK ASSERTED - cannot verify, blocking. us=");
+        Serial.print(us); Serial.print(" attempt="); Serial.println(attempt);
+      }
+#if SERVO_ACK_MODE == 1
+      break;                    // observe-only: record it and carry on
+#else
+      delay(50);
+      continue;                 // mode 2: never accept an unverifiable ack
+#endif
+    }
     servoTxLine(us);
     acked = servoAckSeen();
     if (!acked) {
