@@ -73,13 +73,27 @@ gate ramp, the charge current is ≈ 10.2 µF × 3.3 V / 100 µs ≈ **0.34 A** 
 
 **Fix:** 10 µF + 100 nF from `3V3` to GND, next to J2.2 / Q2.2.
 
-## N3. J8.6 has no decoupling within 12 mm 🟠 **OPEN in V6** — MEASURED
+## N3. J8.6 has no decoupling within 12 mm — MEASURED
+
+> 🟡 **OPEN in V7, but downgraded — optional.** The nearest switched-rail capacitor to J8.6 is
+> still **C16 at 11.98 mm / 24.4 mΩ** (C13/C17 are on `3V3`, upstream of Q2, so they do not
+> decouple this rail). Re-costed honestly, though: the load is the ~160 mA LED bank tapped at
+> the sensor, so an LED transition steps the sensor's supply by **160 mA × 24.4 mΩ ≈ 3.9 mV**.
+> Against the TCS3200's ±0.5 %/V supply sensitivity that is a **0.002 % output-frequency shift**,
+> and both the OFF and ON reads are 5-frame averages taken after `LED_SETTLE_MS` = 20 ms, so the
+> rail is settled before either sample. **Add a 100 nF across J8 pins 6–7 if convenient; it is
+> not worth a respin on its own.**
+
 
 C16 sits at Q2's drain; the run on to J8.6 is **11.98 mm / 24.4 mΩ** of 10-mil trace. So the
 TCS3200 — whose supply steadiness the ambient-subtracted read depends on — has no local
 reservoir. **Fix:** 100 nF across J8 pins 6–7.
 
-## N4. J9 silk says `SW+` / `SW-` but they are the same net 🟠 **OPEN in V6** — MEASURED
+## N4. J9 silk says `SW+` / `SW-` but they are the same net — MEASURED
+
+> ✅ **RESOLVED — V7.** Silk now reads **`LED-  SWI  SWO`** (read from the rendered top silk).
+> `SW IN` / `SW OUT` makes the pass-through unambiguous — nobody will wire a switch across them.
+
 
 `LIMSW` = {C1.2, J9.2, J9.3}: pins 2 and 3 are one node. That is correct for the intended
 in/filter/out pass-through — **but the silkscreen still labels them `SW+` and `SW-`**, which
@@ -161,7 +175,7 @@ third of a properly in-path 100 nF.
 | **N5** | ~~Silk-to-mask clearance as low as 0.038 mm~~ | ⚪ **WITHDRAWN.** Actual measured silk-in-opening area is **0.00000 mm²** — this was a registration-*tolerance* concern, not real overlap. Fabs clip silk off mask openings as standard, and even unclipped a 0.04 mm sliver on a 1206/SOT-23 pad edge costs a negligible fraction of the solderable area. The clearances are inherent to the library footprints, so fixing means editing footprints for no measurable gain. | none |
 | **N6** | Hole-to-hole 0.4134 mm | Vias at (32.893, −12.573) ↔ (32.385, −12.065); five more pairs under 0.5 mm. Below the 0.5 mm floor most low-cost fabs quote. | Nudge those pairs ≥0.1 mm apart |
 | **N7** | Copper balance top 21 % / bottom 89 % | Very asymmetric for 1.6 mm 2-layer; mild bow and plating-uniformity risk. | A top-side GND pour in the empty regions also helps the LEDGT/SCL coupling |
-| **O19** | Silk reads `PARBoard - V0.5`, and no date | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
+| **O19** | ~~Silk reads `PARBoard - V0.5`, no date~~ | ✅ **RESOLVED — V7.** Top silk now reads **`PARShield  V0.7`** and **`2026-08-22`** — name, revision and date. | none |
 | **O20** | ~~No test points~~ | ⚪ **WITHDRAWN — designer correct.** Everything worth probing is on a screw terminal or exposed male header: `+5V`/GND/`+12V` at J1, servo rail at J7.1, switched 3V3 at J6.1/J8.6, `5VSWED` at J11's male pins. The one socket-side net, `$1N7075`, is probeable at R4/R5's 1206 pads. | none |
 
 
