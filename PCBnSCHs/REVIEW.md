@@ -23,130 +23,13 @@ withdrawn. Original IDs (B*, C*, L*, m*) are unchanged so earlier discussion sta
 
 # 🔴 OPEN — BLOCKERS
 
-## O1. The TVS is wired in series with the +5 V rail 🔴 **OPEN in V5** — MEASURED
-
-**Verified in V5:** `$1N7100` = {J1.3, U3.1}; `$1N7101` = {D2.2, U3.2}; `+5V` = {…, D2.1, …}.
-**Neither D2 pin is on GND.**
-
-```
-J1.3 ─► U3 (polyfuse) ─► $1N7101 ─► D2.2 ─[SMBJ5.0A]─ D2.1 ─► +5V rail
-```
-
-A TVS is a shunt device. As drawn it is in the supply path and protects nothing:
-
-- **Reverse-biased** (normal orientation): blocks below its ~6.4 V breakdown ⇒ **the +5 V rail
-  is dead** and only the ESP32 (on 12 V) comes up.
-- **Forward-biased**: behaves as a plain diode — ~1.0 V at 1.5 A, **~1.5 W in an SMB**
-  (θJA ≈ 60 °C/W ⇒ ~90 °C rise), and the rail sags with servo current. That is precisely the
-  current-dependent series drop this project has already spent a day misdiagnosing.
-
-Confirmed independently by three passes. D2's silkscreen has no polarity bar, so which case
-applies is undetermined — it does not change the fix.
-
-**Fix:** `J1.3 → U3 → +5V` directly (bridge `$1N7101` into `+5V`; the pads are 5.18 mm apart
-with clear space), and move **D2.2 to GND** with D2.1 on `+5V`.
-
-**Also:** SMBJ5.0A has a **5.0 V stand-off**, which a 5.25 V rail exceeds ⇒ leakage.
-Use **SMBJ6.0A or SMBJ6.5A**.
-
-## O2. C11 is a 6.3 V part on an 11.3 V rail 🔴 **OPEN in V5** — MEASURED
-
-**Verified in V5:** `$1N1028` = {C10.1, **C11.2**, D1.1, J2.15} — the post-D1 VIN node, ~11.3 V.
-BOM V4 still lists C11 = **CL31A107MQHNNNE (LCSC C15008) = 100 µF 6.3 V X5R 1206**.
-
-**1.8× over rated voltage.** MLCCs fail **short**, so this takes the 12 V rail with it.
-
-**Fix:** 100 µF at 25 V does not exist in 1206. Use **C14860 (10 µF 25 V X7R 1206)** — already
-in your BOM for C4/C7/C9, so no new line item. 10 µF is a proper buck-input cap; at 11.3 V
-bias it derates to roughly 5–6 µF, which is fine.
-
-Every other capacitor's rating checks out: C2/C5 16 V on 5 V, C3/C6/C8/C10/C12 50 V,
-C4/C7/C9 25 V on ≤5 V. C11 is the only one wrong.
-
+**None. Both blockers were closed in V6** — the TVS is now a proper shunt to GND (O1) and
+C11 is a 25 V part (O2). Both are recorded under RESOLVED with the measurement that closed them.
 
 ---
 
 # 🟠 OPEN
 
-## B3. The limit-switch half of J9 is electrically dead — MEASURED
-
-> 🟠 **OPEN — verified still present in V5.** `LIMSW-` = {J9.3} remains the only genuine
-> single-pin net on the board. The designer's stated intent, and why the current wiring
-> cannot deliver it, are appended below.
-
-`LIMSW-` is a **single-node net** (`J9.3` only — the only one on the board). `LIMSW+`
-reaches `C1.2` and `J9.2` and nothing else. Neither touches an MCU pin, and C1 (1 nF) is
-debouncing a net connected to nothing.
-
-Note the main MCU has no limit-switch role in firmware — homing limits live on the
-Mega/CNC Shield V3. So either route these to a free GPIO (D3, D12, D13) with a pull-up, or
-delete the switch pins and C1 and mark them NC.
-
-Related: **there is no `LED+` net anywhere on the board.** Only `LED-` (Q1 drain) exists, so
-the LED bank's anode feed and any current limit stay off-board and undocumented. A tidy fix
-for both: repurpose J9 as the LED connector — `J9.2` → LED+, `J9.1` → LED−, drop `J9.3`/C1.
-
-**Update (V5) — the designer's intent, and why it is not implementable as drawn.** The stated
-purpose is: *take the Y limit-switch wire in, filter it, and export the filtered version to the
-CNC shield on the Mega.* Three things block that:
-
-1. **J9.3 connects to nothing at all** — not GND, not J9.2, not the cap. Nothing can leave it.
-2. **There is no series resistor**, so there is no RC filter — C1 is only a shunt cap.
-3. **C1 is 1 nF**, and this project's own Y-limit investigation concluded 1 nF (~50 µs) is too
-   small, recommending **1 kΩ + 100 nF**.
-
-**Fix:** `J9.2 → R (1 kΩ) → J9.3`, C1 raised to **100 nF** from J9.3 to GND. Switch in on J9.2,
-filtered signal out on J9.3, then the flying wire to the CNC shield.
-
-## O3. The polyfuse will nuisance-trip on a jammed arm 🟠 **OPEN in V5** — MEASURED copper / INFERRED fuse data
-
-`U3` (MF-NSMF200-2, **2.0 A hold**) is the sole element between J1.3 and everything on `+5V`
-*and* `5VSWED` — servo included.
-
-Load at stall ≈ 1.5 A servo + 0.2 A Mega + 0.03 A ServoNano + 0.05 A sensors ≈ **1.78 A**,
-i.e. **89 % of hold at 23 °C**, derating to ~1.4–1.6 A hold at 50 °C in an enclosure.
-
-A momentary stall will not trip it; a **jammed arm will** — and this rig has snapped its flip
-arm once. A tripped PPTC goes to hundreds of ohms, collapsing the rail, which at firmware
-level is indistinguishable from the failure modes already chased at length.
-
-It also costs droop budget: **30–70 mΩ** of fuse resistance on top of **48.2 mΩ** measured
-copper round-trip, roughly doubling the board's contribution to **117–177 mV at 1.5 A**.
-
-**Fix:** fuse only the logic / `5VSWED` branch and leave the servo unfused, or move to a
-≥3 A-hold, lower-resistance device. Re-verify Vmax ≥ 6 V either way.
-
-## O4. Q2 switches the sensors' ground, which cannot turn them off 🟠 **OPEN in V5** — MEASURED topology / INFERRED behaviour
-
-`CLRNLDRSRC` = {J6.2, J8.7, Q2.3}. `3V3` = {J2.2, J6.1, J8.6, R9.2, R10.1, R11.1} — always live.
-
-Only the **ground** is switched; VDD stays at 3.3 V. With Q2 off, both sensors' local ground
-floats, while the MCU still drives S0–S3 and the I²C pull-ups (**now fitted — R10/R11**) hold
-SDA/SCL. Current flows through the sensors' ESD structures into the floating ground, pulling
-it to ~0.7 V and **partially powering both parts through their I/O pins**. The "off" state is
-an undefined bias condition, not off — so the power-cycling Q2 exists to provide is not
-achieved, and the VL53L4CD has no guaranteed clean POR when Q2 re-closes.
-
-Note the interaction: **adding the I²C pull-ups in V5 made this worse**, since they now feed
-the floating ground.
-
-**Fix (recommended):** delete Q2 + R8, bond J6.2/J8.7 to the pour, and make **J6 5-pin with
-`XSHUT` on D3** — the VL53L4CD's purpose-built reset pin. The TCS3200 is stateless and never
-needs power-cycling. Alternative: switch the **high side** (P-FET in the 3V3 feed).
-
-## O5. `CLRNLDRSRC` is routed as a signal, not a return 🟠 **OPEN in V5** — MEASURED
-
-38.3 mm, **entirely 0.254 mm (10 mil)**: Q2.3→J6.2 = 47.4 mΩ, Q2.3→J8.7 = 22.0 mΩ.
-
-Resistively harmless (~1 mV at 25 mA). The cost is **return-path geometry**: every sensor
-signal — SDA, SCL, S0–S3 and `OUT` — returns through this thin trace to Q2 before entering
-the pour, instead of returning in the plane under its own signal. For `OUT` (the frequency
-output timed with `pulseIn`, and the channel the unresolved full-board false positives live
-on) the signal runs 24 mm on top while its return runs 9–23 mm on the bottom to a different
-point — a loop of order **100–200 mm²**.
-
-**Fix:** subsumed by O4 — deleting Q2 lets the pour be the return. If Q2 stays, widen to
-≥0.6 mm and route it directly beneath the J6/J8 signal groups.
 
 ## O6. `LED-` runs beside SCL and beside the servo-ack analog node 🟠 **OPEN in V5** — MEASURED geometry / INFERRED crosstalk
 
@@ -175,33 +58,6 @@ guard; **and** add a **100–470 Ω series gate resistor** at Q1 to slow the edg
 (the bank switches at a few kHz and needs no speed). Minimum viable: open the two sub-200 µm
 runs at x ≈ 63.7–64.2 to ≥0.5 mm.
 
-## O8. R6 (0 Ω) makes a plugged-in USB burn ~1 W in U4 🟠 **OPEN in V5** — MEASURED + datasheet
-
-R6 ties QOD to VOUT, which is **correct per TI SLVSEN5B** (one of three sanctioned options —
-see [Adjudicated facts](#adjudicated-datasheet-facts)). The problem is the interaction.
-
-Table 2: with ON low and QOD tied to VOUT, VOUT is pulled to GND through **RPD,QOD = 24 Ω**.
-`5VSWED` reaches the Mega's 5 V pins (J11.1/2) and the ServoNano's (J5.12), and the Mega's
-`T1` FDN340P **hard-connects its +5 V to USBVCC when no VIN is present** — so the Mega's 5 V
-pin is a genuine *source*, not a passive load.
-
-⇒ switch off + either USB plugged: **~196–208 mA, ~0.92–1.04 W in an SC-70-6**, and with
-**RθJA = 210.7 °C/W** that is a **194–219 °C rise** — past the 180 °C thermal shutdown.
-
-Live during any bring-up session (flashing GRBL over the Mega's USB with the shield
-unpowered). *Accepted as low-risk in production, where no USB is attached.*
-
-**Fix:** **R6 → 1 kΩ** caps the sink at ~5 mA. TI's own worked example uses 1 kΩ. Free.
-
-## O9. The 3V3 sensor rail has no decoupling 🟠 **OPEN in V5** — MEASURED
-
-Every capacitor sits on `+5V`, `5VSWED`, `$1N1028`, `+12V` or `LIMSW+`. **`3V3` has none.**
-
-Measured: J2.2 → J6.1 = **42.9 mΩ over ~40 mm**; J2.2 → J8.6 = 22.6 mΩ. The trace is 0.762 mm
-(generous) — the gap is the missing local reservoir at the far end of a 40 mm feed to a
-VL53L4CD whose VCSEL draws tens of mA in bursts.
-
-**Fix:** 100 nF + 4.7 µF at J6, 100 nF at J8. Both connector areas have room.
 
 ## O10. C3 and C4 are on stubs at J7; only C5 is in the current path 🟠 **OPEN in V5** — MEASURED
 
@@ -219,7 +75,226 @@ third of a properly in-path 100 nF.
 *through* its pads — exactly as was done correctly for C6–C9 at U4 (see R11).
 
 
-## O13. Feeding the Mega's 5 V pin back-drives its USB port 🟠 **OPEN in V5** — MEASURED / INFERRED (F20)
+---
+
+# 🟡 OPEN — minor
+
+| # | Finding | Detail | Fix |
+|---|---|---|---|
+| **O14** | **Silk on an exposed pad — one genuine case** | **R1 pad 2**, mask opening at (9.570, −44.069): **0.1995 mm² = 8.46 % of the pad**, a 0.152 mm band from U2's body outline at y = −43.752. Bottom side: **0.000 mm²**. | Move U2's courtyard line to y ≈ −43.2, or R1 down 0.6 mm |
+| **O15** | J6/J8 silkscreen still reads `+5V` | The net is now `3V3`. GND labels are also wrong while Q2 is in place. | Relabel; revisit after O4 |
+| **O16** | U4 mask dams are 128 µm | Below most fabs' 0.15–0.20 mm minimum, so pins 1-2-3 and 5-6 will share open windows. Not a defect; raises bridging risk on the one fine-pitch part. | Reduce mask expansion to 0.025 mm on U4, or stencil carefully |
+| **O17** | ~~Sub-0.15 mm silk segments~~ | ⚪ **WITHDRAWN.** The two arcs at (17.145, −13.081), r = 0.845 mm, are the **"~" fuse marker inside the U3 footprint** — decorative. Refdes and outline still print; nothing is lost if the squiggle comes out ragged. | none |
+| **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
+| **O19** | No board name, revision or date on the silk | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
+| **O20** | ~~No test points~~ | ⚪ **WITHDRAWN — designer correct.** Everything worth probing is on a screw terminal or exposed male header: `+5V`/GND/`+12V` at J1, servo rail at J7.1, switched 3V3 at J6.1/J8.6, `5VSWED` at J11's male pins. The one socket-side net, `$1N7075`, is probeable at R4/R5's 1206 pads. | none |
+
+
+---
+
+# ✅ RESOLVED
+
+*Original claim text preserved verbatim; the status line records what closed it.*
+
+## O1. The TVS is wired in series with the +5 V rail — MEASURED
+
+> ✅ **RESOLVED — V6.** `D2.1` is on `+5V` and **`D2.2` is on GND** — a proper shunt — and
+> `J1.3` now reaches `+5V` directly. The series-wiring blocker is gone.
+>
+> 🟡 **One residual, BOM-only:** D2 is still **SMBJ5.0A**, whose **5.0 V stand-off** sits below a
+> 5.25 V rail, so it will leak. Change to **SMBJ6.0A or SMBJ6.5A**. No layout impact.
+
+
+**Verified in V5:** `$1N7100` = {J1.3, U3.1}; `$1N7101` = {D2.2, U3.2}; `+5V` = {…, D2.1, …}.
+**Neither D2 pin is on GND.**
+
+```
+J1.3 ─► U3 (polyfuse) ─► $1N7101 ─► D2.2 ─[SMBJ5.0A]─ D2.1 ─► +5V rail
+```
+
+A TVS is a shunt device. As drawn it is in the supply path and protects nothing:
+
+- **Reverse-biased** (normal orientation): blocks below its ~6.4 V breakdown ⇒ **the +5 V rail
+  is dead** and only the ESP32 (on 12 V) comes up.
+- **Forward-biased**: behaves as a plain diode — ~1.0 V at 1.5 A, **~1.5 W in an SMB**
+  (θJA ≈ 60 °C/W ⇒ ~90 °C rise), and the rail sags with servo current. That is precisely the
+  current-dependent series drop this project has already spent a day misdiagnosing.
+
+Confirmed independently by three passes. D2's silkscreen has no polarity bar, so which case
+applies is undetermined — it does not change the fix.
+
+**Fix:** `J1.3 → U3 → +5V` directly (bridge `$1N7101` into `+5V`; the pads are 5.18 mm apart
+with clear space), and move **D2.2 to GND** with D2.1 on `+5V`.
+
+**Also:** SMBJ5.0A has a **5.0 V stand-off**, which a 5.25 V rail exceeds ⇒ leakage.
+Use **SMBJ6.0A or SMBJ6.5A**.
+
+## O2. C11 is a 6.3 V part on an 11.3 V rail — MEASURED
+
+> ✅ **RESOLVED — V6.** C11 is now in the `CL31B106KAHNNNE` group: **10 µF 25 V X7R 1206**.
+> The 100 µF 6.3 V part is gone from the BOM entirely.
+
+
+**Verified in V5:** `$1N1028` = {C10.1, **C11.2**, D1.1, J2.15} — the post-D1 VIN node, ~11.3 V.
+BOM V4 still lists C11 = **CL31A107MQHNNNE (LCSC C15008) = 100 µF 6.3 V X5R 1206**.
+
+**1.8× over rated voltage.** MLCCs fail **short**, so this takes the 12 V rail with it.
+
+**Fix:** 100 µF at 25 V does not exist in 1206. Use **C14860 (10 µF 25 V X7R 1206)** — already
+in your BOM for C4/C7/C9, so no new line item. 10 µF is a proper buck-input cap; at 11.3 V
+bias it derates to roughly 5–6 µF, which is fine.
+
+Every other capacitor's rating checks out: C2/C5 16 V on 5 V, C3/C6/C8/C10/C12 50 V,
+C4/C7/C9 25 V on ≤5 V. C11 is the only one wrong.
+
+## B3. The limit-switch half of J9 is electrically dead — MEASURED
+
+> ✅ **RESOLVED — V6.** `LIMSW` is now a single net across `J9.2`, `J9.3` and `C1.2`, so the
+> pass-through works: switch wire in on one terminal, filtered signal out on the other.
+>
+> 🟡 **Residual, optional:** it is still a bare **1 nF** shunt with no series resistor, and the
+> 2026-06-12 Y-limit investigation concluded 1 nF (~50 µs) is too small, recommending
+> **1 kΩ + 100 nF**. The software debounce (`HOMING_LIMIT_DEBOUNCE_N 8`) is deployed and holding,
+> so this is a nicety — just don't expect the hardware filter to do much if the glitch returns.
+
+`LIMSW-` is a **single-node net** (`J9.3` only — the only one on the board). `LIMSW+`
+reaches `C1.2` and `J9.2` and nothing else. Neither touches an MCU pin, and C1 (1 nF) is
+debouncing a net connected to nothing.
+
+Note the main MCU has no limit-switch role in firmware — homing limits live on the
+Mega/CNC Shield V3. So either route these to a free GPIO (D3, D12, D13) with a pull-up, or
+delete the switch pins and C1 and mark them NC.
+
+Related: **there is no `LED+` net anywhere on the board.** Only `LED-` (Q1 drain) exists, so
+the LED bank's anode feed and any current limit stay off-board and undocumented. A tidy fix
+for both: repurpose J9 as the LED connector — `J9.2` → LED+, `J9.1` → LED−, drop `J9.3`/C1.
+
+**Update (V5) — the designer's intent, and why it is not implementable as drawn.** The stated
+purpose is: *take the Y limit-switch wire in, filter it, and export the filtered version to the
+CNC shield on the Mega.* Three things block that:
+
+1. **J9.3 connects to nothing at all** — not GND, not J9.2, not the cap. Nothing can leave it.
+2. **There is no series resistor**, so there is no RC filter — C1 is only a shunt cap.
+3. **C1 is 1 nF**, and this project's own Y-limit investigation concluded 1 nF (~50 µs) is too
+   small, recommending **1 kΩ + 100 nF**.
+
+**Fix:** `J9.2 → R (1 kΩ) → J9.3`, C1 raised to **100 nF** from J9.3 to GND. Switch in on J9.2,
+filtered signal out on J9.3, then the flying wire to the CNC shield.
+
+## O3. The polyfuse will nuisance-trip on a jammed arm — MEASURED copper / INFERRED fuse data
+
+> ✅ **RESOLVED — V6.** The polyfuse moved out of the servo path. The chain is now
+> `U4.6 → $1N7109 → U3 → 5VSWED → {J5.12 ServoNano, D3 → J11 Mega}`, while the servo runs
+> `J1.3 → +5V → J7.1` **unfused**. U3 now sees ~330 mA against its 2 A hold — roughly 6×
+> margin instead of 89 % of it — and its 30–70 mΩ is out of the droop budget entirely.
+
+
+`U3` (MF-NSMF200-2, **2.0 A hold**) is the sole element between J1.3 and everything on `+5V`
+*and* `5VSWED` — servo included.
+
+Load at stall ≈ 1.5 A servo + 0.2 A Mega + 0.03 A ServoNano + 0.05 A sensors ≈ **1.78 A**,
+i.e. **89 % of hold at 23 °C**, derating to ~1.4–1.6 A hold at 50 °C in an enclosure.
+
+A momentary stall will not trip it; a **jammed arm will** — and this rig has snapped its flip
+arm once. A tripped PPTC goes to hundreds of ohms, collapsing the rail, which at firmware
+level is indistinguishable from the failure modes already chased at length.
+
+It also costs droop budget: **30–70 mΩ** of fuse resistance on top of **48.2 mΩ** measured
+copper round-trip, roughly doubling the board's contribution to **117–177 mV at 1.5 A**.
+
+**Fix:** fuse only the logic / `5VSWED` branch and leave the servo unfused, or move to a
+≥3 A-hold, lower-resistance device. Re-verify Vmax ≥ 6 V either way.
+
+## O4. Q2 switches the sensors' ground, which cannot turn them off — MEASURED topology / INFERRED behaviour
+
+> ✅ **RESOLVED — V6.** Q2 is now an **AO3401A P-FET switching the HIGH side** of the 3.3 V feed
+> (`3V3` → Q2 source, `CLRNLDRDRN` → J6.1/J8.6), and **`J6.2`/`J8.7` are bonded to GND**. Cutting
+> VDD while the grounds stay bonded is a real off state, so the parasitic-powering path is gone.
+> The gate network is right too: R8 100 kΩ to source ⇒ **default-OFF when D3 is high-Z on reset**,
+> R12 1 kΩ limits the drive, C13 slows the edge.
+
+
+`CLRNLDRSRC` = {J6.2, J8.7, Q2.3}. `3V3` = {J2.2, J6.1, J8.6, R9.2, R10.1, R11.1} — always live.
+
+Only the **ground** is switched; VDD stays at 3.3 V. With Q2 off, both sensors' local ground
+floats, while the MCU still drives S0–S3 and the I²C pull-ups (**now fitted — R10/R11**) hold
+SDA/SCL. Current flows through the sensors' ESD structures into the floating ground, pulling
+it to ~0.7 V and **partially powering both parts through their I/O pins**. The "off" state is
+an undefined bias condition, not off — so the power-cycling Q2 exists to provide is not
+achieved, and the VL53L4CD has no guaranteed clean POR when Q2 re-closes.
+
+Note the interaction: **adding the I²C pull-ups in V5 made this worse**, since they now feed
+the floating ground.
+
+**Fix (recommended):** delete Q2 + R8, bond J6.2/J8.7 to the pour, and make **J6 5-pin with
+`XSHUT` on D3** — the VL53L4CD's purpose-built reset pin. The TCS3200 is stateless and never
+needs power-cycling. Alternative: switch the **high side** (P-FET in the 3V3 feed).
+
+## O5. `CLRNLDRSRC` is routed as a signal, not a return — MEASURED
+
+> ✅ **RESOLVED — V6.** `CLRNLDRSRC` no longer exists. Sensor grounds are on the pour, so every
+> sensor signal — `OUT` included — returns in the plane beneath itself. The 100–200 mm² return
+> loop is gone.
+
+
+38.3 mm, **entirely 0.254 mm (10 mil)**: Q2.3→J6.2 = 47.4 mΩ, Q2.3→J8.7 = 22.0 mΩ.
+
+Resistively harmless (~1 mV at 25 mA). The cost is **return-path geometry**: every sensor
+signal — SDA, SCL, S0–S3 and `OUT` — returns through this thin trace to Q2 before entering
+the pour, instead of returning in the plane under its own signal. For `OUT` (the frequency
+output timed with `pulseIn`, and the channel the unresolved full-board false positives live
+on) the signal runs 24 mm on top while its return runs 9–23 mm on the bottom to a different
+point — a loop of order **100–200 mm²**.
+
+**Fix:** subsumed by O4 — deleting Q2 lets the pour be the return. If Q2 stays, widen to
+≥0.6 mm and route it directly beneath the J6/J8 signal groups.
+
+## O8. R6 (0 Ω) makes a plugged-in USB burn ~1 W in U4 — MEASURED + datasheet
+
+> ✅ **RESOLVED — V6.** R6 is now **1 kΩ** (2512). The QOD sink is capped at ~5 mA instead of
+> 208 mA, so a plugged-in USB can no longer cook U4.
+
+
+R6 ties QOD to VOUT, which is **correct per TI SLVSEN5B** (one of three sanctioned options —
+see [Adjudicated facts](#adjudicated-datasheet-facts)). The problem is the interaction.
+
+Table 2: with ON low and QOD tied to VOUT, VOUT is pulled to GND through **RPD,QOD = 24 Ω**.
+`5VSWED` reaches the Mega's 5 V pins (J11.1/2) and the ServoNano's (J5.12), and the Mega's
+`T1` FDN340P **hard-connects its +5 V to USBVCC when no VIN is present** — so the Mega's 5 V
+pin is a genuine *source*, not a passive load.
+
+⇒ switch off + either USB plugged: **~196–208 mA, ~0.92–1.04 W in an SC-70-6**, and with
+**RθJA = 210.7 °C/W** that is a **194–219 °C rise** — past the 180 °C thermal shutdown.
+
+Live during any bring-up session (flashing GRBL over the Mega's USB with the shield
+unpowered). *Accepted as low-risk in production, where no USB is attached.*
+
+**Fix:** **R6 → 1 kΩ** caps the sink at ~5 mA. TI's own worked example uses 1 kΩ. Free.
+
+## O9. The 3V3 sensor rail has no decoupling — MEASURED
+
+> ✅ **RESOLVED — V6.** C14 (100 nF) + C15 (10 µF) + C16 (100 nF) now sit on `CLRNLDRDRN`, the
+> switched sensor rail — inside the switched domain, so Q2 still isolates. C13 (100 nF)
+> additionally sits across Q2's gate–source.
+
+
+Every capacitor sits on `+5V`, `5VSWED`, `$1N1028`, `+12V` or `LIMSW+`. **`3V3` has none.**
+
+Measured: J2.2 → J6.1 = **42.9 mΩ over ~40 mm**; J2.2 → J8.6 = 22.6 mΩ. The trace is 0.762 mm
+(generous) — the gap is the missing local reservoir at the far end of a 40 mm feed to a
+VL53L4CD whose VCSEL draws tens of mA in bursts.
+
+**Fix:** 100 nF + 4.7 µF at J6, 100 nF at J8. Both connector areas have room.
+
+## O13. Feeding the Mega's 5 V pin back-drives its USB port — MEASURED / INFERRED (F20)
+
+> ✅ **RESOLVED — V6.** D3 = **SS34** (LCSC `C8678`) between `5VSWED` and J11, blocking the Mega
+> from back-feeding the switched rail.
+>
+> The forward half is unchanged by design: the shield's 5 V still reaches the Mega's USB VBUS
+> through its T1 FDN340P. Keep the "do not attach USB to the Mega while the shield is powered"
+> note, or power the Mega through VIN rather than its 5 V pin.
+
 
 `5VSWED` drives J11.1/J11.2 = the Mega's +5 V pins. Arduino's own documentation: *"Supplying
 voltage via the 5V or 3.3V pins bypasses the regulator, and can damage your board. We don't
@@ -237,28 +312,6 @@ above its needs; the 3 A rating is deliberate overkill to keep Vf and dissipatio
 **not** stop the shield's 5 V reaching the Mega's USB VBUS through T1, because that is the
 forward direction. So still document "do not attach USB to the Mega while the shield is
 powered", or power the Mega through VIN instead of its 5 V pin.
-
-
----
-
-# 🟡 OPEN — minor
-
-| # | Finding | Detail | Fix |
-|---|---|---|---|
-| **O14** | **Silk on an exposed pad — one genuine case** | **R1 pad 2**, mask opening at (9.570, −44.069): **0.1995 mm² = 8.46 % of the pad**, a 0.152 mm band from U2's body outline at y = −43.752. Bottom side: **0.000 mm²**. | Move U2's courtyard line to y ≈ −43.2, or R1 down 0.6 mm |
-| **O15** | J6/J8 silkscreen still reads `+5V` | The net is now `3V3`. GND labels are also wrong while Q2 is in place. | Relabel; revisit after O4 |
-| **O16** | U4 mask dams are 128 µm | Below most fabs' 0.15–0.20 mm minimum, so pins 1-2-3 and 5-6 will share open windows. Not a defect; raises bridging risk on the one fine-pitch part. | Reduce mask expansion to 0.025 mm on U4, or stencil carefully |
-| **O17** | Two silk segments use a 0.0762 mm (3 mil) aperture | 1.8 mm total; below the ~0.15 mm printable minimum, so they print raggedly or not at all. | Widen to ≥0.15 mm |
-| **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
-| **O19** | No board name, revision or date on the silk | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
-| **O20** | No test points | The documented bring-up procedure is built on probing the servo feed and the divider nodes. | Pads on `+5V`, `5VSWED`, `3V3`, GND, J7.1 and `$1N7075` |
-
-
----
-
-# ✅ RESOLVED
-
-*Original claim text preserved verbatim; the status line records what closed it.*
 
 ## O11. `LED+` is tapped from the TCS3200's 3V3 line ✅ **RESOLVED — documented 2026-08-21**
 
