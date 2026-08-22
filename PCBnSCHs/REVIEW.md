@@ -218,26 +218,6 @@ third of a properly in-path 100 nF.
 **Fix:** widen the C3/C4 taps to 0.6 mm, double the vias, and place C3 so the trunk passes
 *through* its pads — exactly as was done correctly for C6–C9 at U4 (see R11).
 
-## O11. There is still no `LED+` on the board 🟠 **OPEN in V5** — MEASURED
-
-`LED-` = {J9.1, Q1.3} is the only LED connection. The anode feed and any current-limiting
-element remain off-board and undocumented, so the bank's current is unknown — which is what
-prevents sizing `LED-` (O12) and confirming Q1.
-
-If the anode is tapped from a sensor supply, the LED current flows through that sensor's own
-supply pin, producing a droop that appears **only when the LEDs are on** — i.e. exactly in
-phase with the (on − off) subtraction, and therefore not cancelled by it.
-
-**Fix:** make J9 4-pin with a dedicated `LED+` from unswitched `+5V`, with its own local bulk,
-star-separated from the sensor feed.
-
-## O12. `LED-` carries the bank current over 64 mm of 10-mil trace 🟠 **OPEN in V5** — MEASURED / current UNDETERMINED
-
-J9.1 → Q1.3 = **125.5 mΩ** (≈64 mm of 0.254 mm, vs 36 mm straight). At 0.2 A that is 25 mV and
-5 mW — fine. At 1 A it is 125 mV and above the IPC 10 °C-rise limit of ~0.88 A for that width.
-
-Blocked on O11 (bank current unknown). **Fix:** if >0.5 A, widen to ≥0.6 mm — which also
-creates the room to move it away from SCL (O6).
 
 ## O13. Feeding the Mega's 5 V pin back-drives its USB port 🟠 **OPEN in V5** — MEASURED / INFERRED (F20)
 
@@ -248,9 +228,15 @@ advise it."* There is no sanctioned voltage or current rating for injecting into
 Via the FDN340P path described in O8, the shield's 5 V propagates onto the Mega's USB VBUS
 through its 500 mA polyfuse and out to any attached host.
 
-**Fix:** a series Schottky or ideal-diode between U4's output and J11.1/2 — **or** accept it
-and document "do not attach USB to the Mega while the shield is powered." The O8 fix handles
-the destructive half regardless.
+**Fix:** a series Schottky between U4's output and J11.1/2 — **LCSC `C8678`** (MDD **SS34**,
+40 V / 3 A, SMA). Vf ≈ 0.3 V at the expected ~300 mA, so the Mega sees ~4.7 V, comfortably
+above its needs; the 3 A rating is deliberate overkill to keep Vf and dissipation low.
+
+⚠ **It fixes only half of this.** The diode blocks current flowing *back* from the Mega into
+`5VSWED` — the destructive half, since that is what drives the 24 Ω QOD sink in O8. It does
+**not** stop the shield's 5 V reaching the Mega's USB VBUS through T1, because that is the
+forward direction. So still document "do not attach USB to the Mega while the shield is
+powered", or power the Mega through VIN instead of its 5 V pin.
 
 
 ---
@@ -268,12 +254,39 @@ the destructive half regardless.
 | **O20** | No test points | The documented bring-up procedure is built on probing the servo feed and the divider nodes. | Pads on `+5V`, `5VSWED`, `3V3`, GND, J7.1 and `$1N7075` |
 
 
-
 ---
 
 # ✅ RESOLVED
 
 *Original claim text preserved verbatim; the status line records what closed it.*
+
+## O11. `LED+` is tapped from the TCS3200's 3V3 line ✅ **RESOLVED — documented 2026-08-21**
+
+> ✅ **RESOLVED.** The anode feed is deliberate and now documented: **the LEDs are powered from
+> the TCS3200's 3V3 line, soldered at the sensor.** The original claim — that this would put
+> LED current through the sensor's own supply pin and produce a droop *in phase* with the
+> (on − off) subtraction — is **quantitatively negligible**, so the mechanism I warned about
+> does not bite:
+>
+> LED load ≈ **160 mA** (the TCS3200 module's own 4 LEDs plus 4 more, all at 3V3) through the
+> measured **22.6 mΩ** of 3V3 copper from J2.2 to J8.6 ⇒ **3.6 mV** of sensor-VDD droop when
+> the bank is on. Against the TCS3200's supply-voltage sensitivity of **±0.5 %/V**, that is a
+> **0.002 % shift in output frequency** — five orders of magnitude below the 2.17× threshold
+> margin. Not measurable, let alone significant.
+>
+> One residual worth a single check, not a respin: the 3V3 rail now carries ~160 mA of LED
+> load on top of the ESP32-S3's own draw, all from the Nano's onboard MP2322GQH buck. That
+> part is a 2 A class device so headroom is almost certainly fine — confirm once and forget it.
+
+## O12. `LED-` carries the bank current over 64 mm of 10-mil trace ✅ **RESOLVED — current now known**
+
+> ✅ **RESOLVED.** This was blocked on not knowing the bank current. It is now known: **8 LEDs
+> at 3V3, ≈160 mA**. The measured **125.5 mΩ** of `LED-` therefore drops **20 mV** and
+> dissipates **3.2 mW** — and 160 mA is **18 %** of the IPC-2221 10 °C-rise limit (0.89 A) for
+> 0.254 mm on 1 oz copper. **The 10-mil trace is adequate; no widening needed.**
+>
+> Note this does not clear **O6** — the coupling between `LED-` and SCL / the ack analog node
+> is about the switching edge, not the current, so it stands on its own.
 
 ## B1. The switched rail is never enabled — MEASURED
 
