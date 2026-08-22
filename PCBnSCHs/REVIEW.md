@@ -1,6 +1,15 @@
 # P.A.R. Shield — design review
 
-**Current revision reviewed: Gerber V5 / Netlist V5 / BOM V4 (2026-08-19).**
+**Current revision reviewed: Gerber V7 / Netlist V7 / BOM V6 (2026-08-22) — silk `PARShield V0.7`.**
+
+> ## ✅ VERDICT: FABRICATION-READY
+> Full DFM sweep passes with margin; copper matches the netlist exactly (113 islands,
+> **0 shorts, 0 opens, 0 floating copper**); the D3 removal was verified forensically — no
+> orphan pad, no gap, no stub in the `5VSWED` trunk. Servo loop **≈51 mΩ, 77 mV at 1.5 A stall**
+> against a 0.2–0.3 V budget. Mega rail **4.93 V**, 430 mV above its 4.5 V floor.
+>
+> **One thing worth adding before you order: a 100 nF across J8.6/J8.7 (N3).** Everything else
+> open is optional.
 2-layer, 90.68 × 51.82 mm. Hosts an Arduino Nano ESP32 and a 5 V Arduino Nano, powers and
 talks to an Arduino Mega running GRBL, and carries the servo, colour sensor, lidar and LED
 bank connectors.
@@ -75,14 +84,19 @@ gate ramp, the charge current is ≈ 10.2 µF × 3.3 V / 100 µs ≈ **0.34 A** 
 
 ## N3. J8.6 has no decoupling within 12 mm — MEASURED
 
-> 🟡 **OPEN in V7, but downgraded — optional.** The nearest switched-rail capacitor to J8.6 is
-> still **C16 at 11.98 mm / 24.4 mΩ** (C13/C17 are on `3V3`, upstream of Q2, so they do not
-> decouple this rail). Re-costed honestly, though: the load is the ~160 mA LED bank tapped at
-> the sensor, so an LED transition steps the sensor's supply by **160 mA × 24.4 mΩ ≈ 3.9 mV**.
-> Against the TCS3200's ±0.5 %/V supply sensitivity that is a **0.002 % output-frequency shift**,
-> and both the OFF and ON reads are 5-frame averages taken after `LED_SETTLE_MS` = 20 ms, so the
-> rail is settled before either sample. **Add a 100 nF across J8 pins 6–7 if convenient; it is
-> not worth a respin on its own.**
+> 🟡 **OPEN in V7 — the only item worth acting on, and it is cheap.** Confirmed unchanged:
+> nearest switched-rail cap to J8.6 is **C16 at 11.977 mm / 21.9 mΩ**. C14/C15 were placed at
+> **J6** (3.34 mm / 3.83 mΩ and 5.05 mm / 9.01 mΩ) — the lidar got its local decoupling, the
+> colour sensor did not. Q2.3 → J8.6 is 10.7 mm of 0.254 mm trace ⇒ **20–25 nH** of supply-loop
+> inductance at the connector with no local bypass.
+>
+> Two mechanisms, and they differ in size. **DC:** the ~160 mA LED bank steps the sensor supply
+> by 160 mA × 21.9 mΩ ≈ **3.5 mV**, which against ±0.5 %/V is a 0.002 % frequency shift and is
+> settled long before either 5-frame sample — negligible, as previously argued. **HF:** the
+> TCS3200's own output driver switching into 20–25 nH of unbypassed supply is a different and
+> genuinely un-modelled path. Small, but this is the sensor at the centre of the unexplained
+> full-board false positives, and the fix is **one 100 nF 0603 across J8.6/J8.7** — adjacent
+> pins, clear board area. **Do it.**
 
 
 C16 sits at Q2's drain; the run on to J8.6 is **11.98 mm / 24.4 mΩ** of 10-mil trace. So the
@@ -165,6 +179,26 @@ third of a properly in-path 100 nF.
 
 # 🟡 OPEN — minor
 
+## Standing corrections — do NOT "fix" these
+
+**R6 (1 kΩ, 2512, U4.5→U4.6) is CORRECT. Three separate reviewers have now flagged it as a CT
+soft-start pin wired wrongly.** It is not. From the TI TPS22919 datasheet (SLVSEN5B) directly:
+pin 4 is NC and **pin 5 is QOD**; §8.3.3 lists *"Placing an external resistor between VOUT and
+QOD"* as one of three sanctioned configurations; `RPD,QOD` = 24 Ω; and TI's own worked example
+uses **RQOD = 1 kΩ** (Figure 31). R6 is exactly right as fitted.
+
+**R9 (100 kΩ, `5VSW`→3V3) is CORRECT as a pull-UP. Two reviewers have now asked for it to be
+flipped to a pull-down.** Keep it. It ties U4's ON to the ESP32 module's *own* 3.3 V regulator,
+so the peripheral rail comes up **with** the MCU's supply — and ESP32 GPIOs are high-Z at reset,
+so nothing is driving peripheral pins during that window. A pull-down instead leaves a window
+between ESP32 boot and the firmware's `digitalWrite(D11, HIGH)` in which the MCU is running
+while peripherals are unpowered; any sketch that touches a peripheral pin first — or any older
+sketch — then injects current into dead rails. That was the original hazard, and the pull-up
+prevents it structurally rather than by convention. It also means an ESP32 reset no longer drops
+the Mega and ServoNano. The observation that Q2 defaults OFF while U4 defaults ON is correct and
+intended: Q2 gates a rail firmware deliberately power-cycles, U4 gates one that should just be on.
+
+
 | # | Finding | Detail | Fix |
 |---|---|---|---|
 | **O14** | ~~Silk on an exposed pad (R1 pad 2)~~ | ✅ **RESOLVED — V6.** Re-measured against solder-mask openings: **0.00000 mm² of silk intrusion on both sides**. R1 pad 2 is clear. Nothing to see, as the designer said — I should have marked this when the V6 layout pass reported it. | none |
@@ -173,7 +207,7 @@ third of a properly in-path 100 nF.
 | **O17** | ~~Sub-0.15 mm silk segments~~ | ⚪ **WITHDRAWN.** The two arcs at (17.145, −13.081), r = 0.845 mm, are the **"~" fuse marker inside the U3 footprint** — decorative. Refdes and outline still print; nothing is lost if the squiggle comes out ragged. | none |
 | **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
 | **N5** | ~~Silk-to-mask clearance as low as 0.038 mm~~ | ⚪ **WITHDRAWN.** Actual measured silk-in-opening area is **0.00000 mm²** — this was a registration-*tolerance* concern, not real overlap. Fabs clip silk off mask openings as standard, and even unclipped a 0.04 mm sliver on a 1206/SOT-23 pad edge costs a negligible fraction of the solderable area. The clearances are inherent to the library footprints, so fixing means editing footprints for no measurable gain. | none |
-| **N6** | Hole-to-hole 0.4134 mm | Vias at (32.893, −12.573) ↔ (32.385, −12.065); five more pairs under 0.5 mm. Below the 0.5 mm floor most low-cost fabs quote. | Nudge those pairs ≥0.1 mm apart |
+| **N6** | ~~Hole-to-hole 0.4134 mm~~ | ✅ **RESOLVED — V7.** Re-measured: minimum is now **0.4809 mm**, and that pair is **same-net** (both `3V3`), where fab minimums drop to 0.254–0.3 mm. Only one pair under 0.5 mm and it is not a violation. | none |
 | **N7** | Copper balance top 21 % / bottom 89 % | Very asymmetric for 1.6 mm 2-layer; mild bow and plating-uniformity risk. | A top-side GND pour in the empty regions also helps the LEDGT/SCL coupling |
 | **O19** | ~~Silk reads `PARBoard - V0.5`, no date~~ | ✅ **RESOLVED — V7.** Top silk now reads **`PARShield  V0.7`** and **`2026-08-22`** — name, revision and date. | none |
 | **O20** | ~~No test points~~ | ⚪ **WITHDRAWN — designer correct.** Everything worth probing is on a screw terminal or exposed male header: `+5V`/GND/`+12V` at J1, servo rail at J7.1, switched 3V3 at J6.1/J8.6, `5VSWED` at J11's male pins. The one socket-side net, `$1N7075`, is probeable at R4/R5's 1206 pads. | none |
