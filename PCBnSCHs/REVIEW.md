@@ -30,9 +30,11 @@ C11 is a 25 V part (O2). Both are recorded under RESOLVED with the measurement t
 
 # 🟠 OPEN
 
-## N1. D3 (SS34) drops the Mega below its 4.5 V minimum 🟠 **OPEN in V6** — MEASURED copper / datasheet
+## N1. D3 (SS34) drops the Mega below its 4.5 V minimum — MEASURED copper / datasheet
 
-> ⚠ **This one is a consequence of my own earlier recommendation, and it was wrong for this rail.**
+> ✅ **RESOLVED — V7.** D3 removed; `5VSWED` now reaches `J11.1`/`J11.2` directly and the
+> `$1N7047` net is gone. The Mega is back to **~4.93 V, 430 mV above its 4.5 V floor**. The
+> back-feed hazard stays covered by R6 = 1 kΩ, which caps the QOD sink at ~5 mA.
 
 **Microchip ATmega2560 datasheet, p.1 speed grades: `0–16 MHz @ 4.5 V – 5.5 V`.** The Mega runs
 at 16 MHz, so 4.5 V is a hard floor.
@@ -57,7 +59,10 @@ If the isolation is genuinely wanted, it needs an ideal-diode / P-FET ORing cont
 (~30 mV) rather than a Schottky — but given R6 already removes the destructive failure, the
 simplest correct answer is no diode.
 
-## N2. No 3V3 bypass capacitor to GND 🟠 **OPEN in V6** — MEASURED
+## N2. No 3V3 bypass capacitor to GND — MEASURED
+
+> ✅ **RESOLVED — V7.** C17 (100 nF) + C18 (10 µF) added from `3V3` to GND.
+
 
 `3V3` = {C13.2, J2.2, Q2.2, R8.2, R9.2, R10.1, R11.1}. **Nothing goes to GND.** C13 is 100 nF
 from 3V3 to Q2's *gate* — a slew-limiter, not a bypass.
@@ -148,12 +153,12 @@ third of a properly in-path 100 nF.
 
 | # | Finding | Detail | Fix |
 |---|---|---|---|
-| **O14** | **Silk on an exposed pad — one genuine case** | **R1 pad 2**, mask opening at (9.570, −44.069): **0.1995 mm² = 8.46 % of the pad**, a 0.152 mm band from U2's body outline at y = −43.752. Bottom side: **0.000 mm²**. | Move U2's courtyard line to y ≈ −43.2, or R1 down 0.6 mm |
-| **O15** | J6/J8 silkscreen still reads `+5V` | The net is now `3V3`. GND labels are also wrong while Q2 is in place. | Relabel; revisit after O4 |
-| **O16** | U4 mask dams **179 µm** (was 128) | Below most fabs' 0.15–0.20 mm minimum, so pins 1-2-3 and 5-6 will share open windows. Not a defect; raises bridging risk on the one fine-pitch part. | Reduce mask expansion to 0.025 mm on U4, or stencil carefully |
+| **O14** | ~~Silk on an exposed pad (R1 pad 2)~~ | ✅ **RESOLVED — V6.** Re-measured against solder-mask openings: **0.00000 mm² of silk intrusion on both sides**. R1 pad 2 is clear. Nothing to see, as the designer said — I should have marked this when the V6 layout pass reported it. | none |
+| **O15** | ~~J6/J8 silk reads `+5V`~~ | ✅ **RESOLVED — V6**, and the residual withdrawn. Silk now reads `3V3 GND SDA SCL` (J6) and `S0 S1 S2 S3 OUT 3V3 GND` (J8). Labelling the Q2-switched rail simply `3V3` is correct — it *is* 3.3 V — and there is no room for `SW3V3`. | none |
+| **O16** | U4 mask dam 179 µm (expansion already cut to 1 mil) | Arithmetic: pitch 0.65 − pad 0.42 = **0.230 mm** copper gap; dam = gap − 2×expansion. At 1 mil (25.4 µm) → 0.179 mm. **0.5 mil → 0.205 mm ✓**; **zero → 0.230 mm ✓**. Alternatively narrow U4's pads to 0.38 mm → 0.219 mm at 1 mil. | Set U4's mask expansion to **0.5 mil or 0**, *or* narrow its pads to 0.38 mm. Accepting is also defensible — a missing dam on a 6-pin SC70 is a modest bridging risk with a decent stencil |
 | **O17** | ~~Sub-0.15 mm silk segments~~ | ⚪ **WITHDRAWN.** The two arcs at (17.145, −13.081), r = 0.845 mm, are the **"~" fuse marker inside the U3 footprint** — decorative. Refdes and outline still print; nothing is lost if the squiggle comes out ragged. | none |
 | **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
-| **N5** | Silk-to-mask-opening clearance as low as 0.038 mm | C2 pad 1 (0.038 mm), Q1 ×3 (0.043 mm), D2.1 (0.044 mm), D3 (0.045/0.049 mm). Nominal geometry is legal, but at typical ±0.05–0.10 mm silk registration ink **will** land on the Q1 and C2 pads on some panels. | Pull silk ≥0.10 mm off those openings |
+| **N5** | ~~Silk-to-mask clearance as low as 0.038 mm~~ | ⚪ **WITHDRAWN.** Actual measured silk-in-opening area is **0.00000 mm²** — this was a registration-*tolerance* concern, not real overlap. Fabs clip silk off mask openings as standard, and even unclipped a 0.04 mm sliver on a 1206/SOT-23 pad edge costs a negligible fraction of the solderable area. The clearances are inherent to the library footprints, so fixing means editing footprints for no measurable gain. | none |
 | **N6** | Hole-to-hole 0.4134 mm | Vias at (32.893, −12.573) ↔ (32.385, −12.065); five more pairs under 0.5 mm. Below the 0.5 mm floor most low-cost fabs quote. | Nudge those pairs ≥0.1 mm apart |
 | **N7** | Copper balance top 21 % / bottom 89 % | Very asymmetric for 1.6 mm 2-layer; mild bow and plating-uniformity risk. | A top-side GND pour in the empty regions also helps the LEDGT/SCL coupling |
 | **O19** | Silk reads `PARBoard - V0.5`, and no date | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
