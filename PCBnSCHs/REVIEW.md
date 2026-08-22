@@ -30,8 +30,69 @@ C11 is a 25 V part (O2). Both are recorded under RESOLVED with the measurement t
 
 # 🟠 OPEN
 
+## N1. D3 (SS34) drops the Mega below its 4.5 V minimum 🟠 **OPEN in V6** — MEASURED copper / datasheet
 
-## O6. `LED-` runs beside SCL and beside the servo-ack analog node 🟠 **OPEN in V5** — MEASURED geometry / INFERRED crosstalk
+> ⚠ **This one is a consequence of my own earlier recommendation, and it was wrong for this rail.**
+
+**Microchip ATmega2560 datasheet, p.1 speed grades: `0–16 MHz @ 4.5 V – 5.5 V`.** The Mega runs
+at 16 MHz, so 4.5 V is a hard floor.
+
+Measured budget to J11 at ~330 mA:
+
+| Element | Drop | Rail |
+|---|---|---|
+| U4 R_ON (108 mΩ) | 35.6 mV | 4.964 V |
+| U3 polyfuse (~50 mΩ) | 16.5 mV | 4.948 V |
+| copper (43.7 mΩ) | 14.4 mV | 4.933 V |
+| **D3 SS34 Vf typ @0.33 A** | **350 mV** | **4.583 V** |
+| **D3 SS34 Vf max @0.33 A** | **450 mV** | **4.483 V — below spec** |
+
+**Fix: remove D3** (or DNP it and bridge the pads). The hazard D3 was added for — the Mega's USB
+back-feeding `5VSWED` into the TPS22919's QOD pull-down — **is already solved by R6 → 1 kΩ**,
+which caps that sink at ~5 mA instead of 208 mA. D3 only added *isolation* (the ability to
+actually cut the Mega's power), and it is not worth 0.45 V of the Mega's supply to have it.
+Without D3 the Mega sits at **4.93 V, with 430 mV of margin**.
+
+If the isolation is genuinely wanted, it needs an ideal-diode / P-FET ORing controller
+(~30 mV) rather than a Schottky — but given R6 already removes the destructive failure, the
+simplest correct answer is no diode.
+
+## N2. No 3V3 bypass capacitor to GND 🟠 **OPEN in V6** — MEASURED
+
+`3V3` = {C13.2, J2.2, Q2.2, R8.2, R9.2, R10.1, R11.1}. **Nothing goes to GND.** C13 is 100 nF
+from 3V3 to Q2's *gate* — a slew-limiter, not a bypass.
+
+Q2 switches into C14 + C15 + C16 ≈ 10.2 µF plus the sensor and LED load, and that inrush comes
+straight out of the module's 3.3 V pin with no local reservoir. With C13/R12 giving a ~100 µs
+gate ramp, the charge current is ≈ 10.2 µF × 3.3 V / 100 µs ≈ **0.34 A** off the module regulator.
+
+**Fix:** 10 µF + 100 nF from `3V3` to GND, next to J2.2 / Q2.2.
+
+## N3. J8.6 has no decoupling within 12 mm 🟠 **OPEN in V6** — MEASURED
+
+C16 sits at Q2's drain; the run on to J8.6 is **11.98 mm / 24.4 mΩ** of 10-mil trace. So the
+TCS3200 — whose supply steadiness the ambient-subtracted read depends on — has no local
+reservoir. **Fix:** 100 nF across J8 pins 6–7.
+
+## N4. J9 silk says `SW+` / `SW-` but they are the same net 🟠 **OPEN in V6** — MEASURED
+
+`LIMSW` = {C1.2, J9.2, J9.3}: pins 2 and 3 are one node. That is correct for the intended
+in/filter/out pass-through — **but the silkscreen still labels them `SW+` and `SW-`**, which
+invites wiring a limit switch *across* them, where it would be permanently shorted.
+
+**Fix:** relabel to something unambiguous — `SW IN` / `SW OUT`, or `SW` / `SW`.
+
+
+
+## O6. `LED-` runs beside SCL and beside the servo-ack analog node — MEASURED geometry / INFERRED crosstalk
+
+> ✅ **RESOLVED — V6.** The 45.7 mm run alongside SCL is gone; worst is now **8.16 mm at
+> 152 µm** (`LEDGT` ∥ `SCL`, top), worth a few mV into Q1's ~700 pF gate — LOW.
+>
+> The item that actually mattered is clean: **`$1N7075`, the ack analog node, is now 1.69 mm
+> from `LEDGT` and 6.27 mm from `LED-`** (was 5.7 mm at 184 µm). Its only coupled run is to
+> `SDA`, worth ≈5 mV against a 1.2 V threshold.
+
 
 | Victim | Coupled length | Min gap |
 |---|---|---|
@@ -59,7 +120,13 @@ guard; **and** add a **100–470 Ω series gate resistor** at Q1 to slow the edg
 runs at x ≈ 63.7–64.2 to ≥0.5 mm.
 
 
-## O10. C3 and C4 are on stubs at J7; only C5 is in the current path 🟠 **OPEN in V5** — MEASURED
+## O10. C3 and C4 are on stubs at J7; only C5 is in the current path — MEASURED
+
+> ✅ **RESOLVED — V6, and conceded as never functional.** C3/C4 taps went 10 mil → **23 mil**.
+> They remain single-via stubs carrying no DC current, but the loop is ~6–9 nH, which for a
+> 1.5 A step in ~10 µs is **~1.3 mV**. Electrically harmless — this was a principle issue, not a
+> functional one. C5 remains correctly in-path (7.06 mΩ loop).
+
 
 | Cap | Value | Distance to J7.1 | R | In path? |
 |---|---|---|---|---|
@@ -83,10 +150,13 @@ third of a properly in-path 100 nF.
 |---|---|---|---|
 | **O14** | **Silk on an exposed pad — one genuine case** | **R1 pad 2**, mask opening at (9.570, −44.069): **0.1995 mm² = 8.46 % of the pad**, a 0.152 mm band from U2's body outline at y = −43.752. Bottom side: **0.000 mm²**. | Move U2's courtyard line to y ≈ −43.2, or R1 down 0.6 mm |
 | **O15** | J6/J8 silkscreen still reads `+5V` | The net is now `3V3`. GND labels are also wrong while Q2 is in place. | Relabel; revisit after O4 |
-| **O16** | U4 mask dams are 128 µm | Below most fabs' 0.15–0.20 mm minimum, so pins 1-2-3 and 5-6 will share open windows. Not a defect; raises bridging risk on the one fine-pitch part. | Reduce mask expansion to 0.025 mm on U4, or stencil carefully |
+| **O16** | U4 mask dams **179 µm** (was 128) | Below most fabs' 0.15–0.20 mm minimum, so pins 1-2-3 and 5-6 will share open windows. Not a defect; raises bridging risk on the one fine-pitch part. | Reduce mask expansion to 0.025 mm on U4, or stencil carefully |
 | **O17** | ~~Sub-0.15 mm silk segments~~ | ⚪ **WITHDRAWN.** The two arcs at (17.145, −13.081), r = 0.845 mm, are the **"~" fuse marker inside the U3 footprint** — decorative. Refdes and outline still print; nothing is lost if the squiggle comes out ragged. | none |
 | **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
-| **O19** | No board name, revision or date on the silk | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
+| **N5** | Silk-to-mask-opening clearance as low as 0.038 mm | C2 pad 1 (0.038 mm), Q1 ×3 (0.043 mm), D2.1 (0.044 mm), D3 (0.045/0.049 mm). Nominal geometry is legal, but at typical ±0.05–0.10 mm silk registration ink **will** land on the Q1 and C2 pads on some panels. | Pull silk ≥0.10 mm off those openings |
+| **N6** | Hole-to-hole 0.4134 mm | Vias at (32.893, −12.573) ↔ (32.385, −12.065); five more pairs under 0.5 mm. Below the 0.5 mm floor most low-cost fabs quote. | Nudge those pairs ≥0.1 mm apart |
+| **N7** | Copper balance top 21 % / bottom 89 % | Very asymmetric for 1.6 mm 2-layer; mild bow and plating-uniformity risk. | A top-side GND pour in the empty regions also helps the LEDGT/SCL coupling |
+| **O19** | Silk reads `PARBoard - V0.5`, and no date | Divider values and part choices have changed between revisions; an unmarked board is a real hazard. | Add `P.A.R. Shield — Rev E — 2026-08-19` |
 | **O20** | ~~No test points~~ | ⚪ **WITHDRAWN — designer correct.** Everything worth probing is on a screw terminal or exposed male header: `+5V`/GND/`+12V` at J1, servo rail at J7.1, switched 3V3 at J6.1/J8.6, `5VSWED` at J11's male pins. The one socket-side net, `$1N7075`, is probeable at R4/R5's 1206 pads. | none |
 
 
