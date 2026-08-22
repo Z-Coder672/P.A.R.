@@ -84,11 +84,10 @@ gate ramp, the charge current is ≈ 10.2 µF × 3.3 V / 100 µs ≈ **0.34 A** 
 
 ## N3. J8.6 has no decoupling within 12 mm — MEASURED
 
-> 🟡 **OPEN in V7 — the only item worth acting on, and it is cheap.** Confirmed unchanged:
-> nearest switched-rail cap to J8.6 is **C16 at 11.977 mm / 21.9 mΩ**. C14/C15 were placed at
-> **J6** (3.34 mm / 3.83 mΩ and 5.05 mm / 9.01 mΩ) — the lidar got its local decoupling, the
-> colour sensor did not. Q2.3 → J8.6 is 10.7 mm of 0.254 mm trace ⇒ **20–25 nH** of supply-loop
-> inductance at the connector with no local bypass.
+> ✅ **RESOLVED — V8.** C19 (100 nF) added on `CLRNLDRDRN`, and it landed where it needed to:
+> **4.52 mm from J8.6 / 4.46 mm from J8.7, loop 12.8 mΩ** (was C16 at 11.98 mm / 26.7 mΩ).
+> Independently measured. The lidar end was already fine — C14 is 3.8 mΩ from J6.1.
+
 >
 > Two mechanisms, and they differ in size. **DC:** the ~160 mA LED bank steps the sensor supply
 > by 160 mA × 21.9 mΩ ≈ **3.5 mV**, which against ±0.5 %/V is a 0.002 % frequency shift and is
@@ -180,6 +179,13 @@ third of a properly in-path 100 nF.
 # 🟡 OPEN — minor
 
 ## Standing corrections — do NOT "fix" these
+
+**J7 (KF128-2.54-3P) is adequate for the servo. A reviewer proposed swapping it to KF301-5.0
+on the grounds that 2.54 mm pitch caps the wire gauge — the premise is wrong.** LCSC's page for
+the exact BOM part gives **8 A, 18–26 AWG (1 mm²)**. At 18 AWG a 0.5 m run contributes **31 mV**
+at 1.5 A, so board (79 mV) + harness (31 mV) = **110 mV** against a 200–300 mV budget. Use
+18 AWG and the connector is a non-issue.
+
 
 **R6 (1 kΩ, 2512, U4.5→U4.6) is CORRECT. Three separate reviewers have now flagged it as a CT
 soft-start pin wired wrongly.** It is not. From the TI TPS22919 datasheet (SLVSEN5B) directly:
