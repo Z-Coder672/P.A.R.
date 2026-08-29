@@ -1,15 +1,23 @@
 # P.A.R. Shield — design review
 
-**Current revision reviewed: Gerber V7 / Netlist V7 / BOM V6 (2026-08-22) — silk `PARShield V0.7`.**
+**Current revision reviewed: Gerber V12 / Netlist V9 / BOM V8 (2026-08-29) — silk `PARShield V0.8.7`.**
 
-> ## ✅ VERDICT: FABRICATION-READY
-> Full DFM sweep passes with margin; copper matches the netlist exactly (113 islands,
-> **0 shorts, 0 opens, 0 floating copper**); the D3 removal was verified forensically — no
-> orphan pad, no gap, no stub in the `5VSWED` trunk. Servo loop **≈51 mΩ, 77 mV at 1.5 A stall**
+> ## ✅ VERDICT: COPPER IS FABRICATION-READY — settle four items before ordering
+> Re-verified from scratch on V12, parsing Gerbers/drills/netlist/flying-probe directly rather
+> than carrying the V7 verdict forward. **Copper matches the netlist exactly: 113 nets,
+> 113 galvanic islands, 0 shorts, 0 opens, 0 floating copper.** Full DFM sweep passes with
+> margin (see [DFM](#dfm--v12-re-measured)). Servo loop **54.2 mΩ, 81 mV at 1.5 A stall**
 > against a 0.2–0.3 V budget. Mega rail **4.93 V**, 430 mV above its 4.5 V floor.
 >
-> **One thing worth adding before you order: a 100 nF across J8.6/J8.7 (N3).** Everything else
-> open is optional.
+> **Before you place the order:**
+> 1. **N8 — three connectors (J10/J11/J12) are BOTTOM-side.** This is a two-sided assembly job.
+> 2. **N9 — the 10 µF group went X7R → X5R.** Verify C11's voltage rating; it is on the 11.3 V rail.
+> 3. **O1 residual — D2 is still SMBJ5.0A.** Third revision unchanged. Needs SMBJ6.0A/6.5A.
+> 4. **N10 — C5 changed manufacturer** while the 8.0 mm / 3.5 mm-pitch footprint did not.
+>
+> Newly closed on measurement this pass: **O6** (LED-/SCL coupling gone) and **O16**
+> (U4 mask dam 175 µm, above the fab minimum).
+
 2-layer, 90.68 × 51.82 mm. Hosts an Arduino Nano ESP32 and a 5 V Arduino Nano, powers and
 talks to an Arduino Mega running GRBL, and carries the servo, colour sensor, lidar and LED
 bank connectors.
@@ -33,11 +41,112 @@ withdrawn. Original IDs (B*, C*, L*, m*) are unchanged so earlier discussion sta
 # 🔴 OPEN — BLOCKERS
 
 **None. Both blockers were closed in V6** — the TVS is now a proper shunt to GND (O1) and
-C11 is a 25 V part (O2). Both are recorded under RESOLVED with the measurement that closed them.
+C11 was moved off the 6.3 V part (O2). Both are recorded under RESOLVED with the measurement
+that closed them.
+
+⚠ **O2 needs one confirmation at V12.** BOM V8 changed the whole 10 µF group to a different
+Samsung part, and C11 is the member that sits on the 11.3 V rail. If that part turns out to be
+rated under 25 V, O2 reopens as a blocker. **See N9** — this is a datasheet lookup, not a
+layout question.
 
 ---
 
 # 🟠 OPEN
+
+## N8. J10, J11 and J12 are on the BOTTOM layer — this is a two-sided assembly — MEASURED
+
+Component placement layer, read from `FlyingProbeTesting.json` (`components.rows`, LAYER
+column): **301 components on T, 3 on B — `J10`, `J11`, `J12`.** Everything else (J1–J9, all
+passives, U3, U4, Q1, Q2, D1, D2) is top-side.
+
+Mechanically that is right: they are male headers whose pins point down into the Mega. But it
+means a **top-side-only** assembly order will leave unpopulated the 36-pin
+`HC-PZ254-11.5L-2x18PZ` that carries `5VSWED` to the Mega's 5 V pins, plus both 8-pin headers.
+Bottom-side through-hole is a separate setup and a separate charge at JLCPCB.
+
+**Action:** confirm the quote covers bottom-side placement, or plan to hand-solder those three.
+Does not affect the customs classification — the board still ships populated (`8537.10.90`).
+
+## N9. The 10 µF group changed X7R → X5R; verify C11's voltage rating — MEASURED (BOM V8)
+
+BOM V8 swapped `CL31B106KAHNNNE` (LCSC **C14860**) → `CL31A106KBHNNNE` (LCSC **C13585**)
+across **C4, C7, C9, C11, C15, C18**.
+
+In Samsung's scheme the letter after `CL31` is the dielectric, and it moved **B → A, i.e.
+X7R → X5R**. That is unambiguous and, on its own, minor: X5R is −55…+85 °C where X7R is
+−55…+125 °C, which an enclosure will not trouble.
+
+The voltage code moved in the opposite direction (`A` → `B` in the voltage position), so the
+rating may have gone *up*. **That has to be confirmed, not assumed.** `C11` sits on
+`$1N1028`, the ~11.3 V post-D1 node — **the exact position that was a fabrication blocker in
+V5** (O2) when it held a 6.3 V part, and that was deliberately specified to 25 V to close it.
+
+**Action:** read the rating off LCSC C13585. If it is under 25 V, put C11 back on **C14860**
+— identical footprint, one line item. See also the [DC-bias trap](#decoupling--what-is-actually-needed).
+
+The other two capacitor swaps are fine and need no action: `CC0603KRX7R9BB104` (**C14663**) is
+100 nF 50 V X7R 0603, equivalent to the Samsung part it replaces; and Q1 moving to **AOS
+C20917** for the AO3400A is a straight improvement over the ChipNobo clone.
+
+## N10. C5 changed manufacturer while the footprint did not — MEASURED (BOM V8 / netlist V9)
+
+`RXK471M1CBK-0811` (Lelon, 8 × 11.5 mm) → **`ERS1CM471F12OT`** (AISHI, LCSC **C160146**).
+The land pattern is **unchanged**: `CAP-TH_BD8.0-P3.50-D0.6-FD` — 8.0 mm body, **3.5 mm lead
+pitch**.
+
+470 µF 16 V is also sold in 6.3 mm cans on 2.5 mm pitch, and that will not seat.
+
+**Action:** confirm the AISHI part is 8 mm diameter on 3.5 mm pitch before ordering. On the
+plus side ERS is a low-ESR series, which partly answers the standing note that LCSC publishes
+no ESR figure for the Lelon part.
+
+## N11. Silkscreen prints across 16.7 % of R4 pad 1 — MEASURED
+
+The **"Limit Switch & LEDs"** legend runs straight over `R4` pad 1:
+**0.3406 mm² of a 2.054 mm² pad — 16.7 %.** Measured as silk ∩ solder-mask-opening, the same
+method that closed O14 and N5. It is the **only** silk-on-pad on the board (0.4164 mm² of
+silk falls inside top mask openings in total; the remaining 0.0758 mm² is on bare mask, and
+the bottom side is 0.00000 mm²).
+
+JLCPCB auto-clips silk off mask openings, so the realistic outcome is a chopped-looking
+legend rather than a bad joint — the same reasoning that withdrew **N5**. Two things make
+this one worth fixing anyway: it is 16.7 % of a pad rather than a 0.04 mm sliver, and the
+board is now going to **assembly**, where asymmetric wetting on a 1206 is the tombstoning
+mechanism.
+
+The affected net is **`$1N7075`, the servo-ack analog node**. A weak joint there lets R5 hold
+the line low, `servoAckHigh()` reads "no ack", and `SERVO_ACK_MODE 2` retries forever — the
+fail-safe direction (see C4), but it stalls the machine.
+
+**Fix:** move the legend ~1 mm clear of R4.
+
+## N12. J10 has no net connections at all — MEASURED
+
+All eight pins of `J10` carry no net, in the netlist and in the copper (they appear only as
+auto-named single-pad nets `NET_1`…`NET_8`). It mates to the Mega's POWER header and is doing
+pure mechanical support.
+
+Leaving it unconnected is defensible — it is how you avoid re-creating **C11**'s two-5 V-sources
+problem. Two consequences follow:
+
+- You are paying to place an 8-pin bottom-side header with **zero electrical function** (N8).
+- The Mega's POWER header **does** carry GND, so tying one J10 pin to `GND` would give a
+  second, shorter shield-to-Mega ground return for free. Right now `J11.35/36` is the only
+  bond. Ground measures fine as-is (J7.2 → J1.2 = 4.46 mΩ), so this is **margin, not a repair**.
+
+## N13. V12 removed ~228 mm² of top-side GND pour on the left edge — MEASURED
+
+Copper diff V11 → V12: **237.5 mm² of top copper removed, 10.3 mm² added**; bottom changed by
+±1.7 mm². The dominant loss is a single GND region spanning **X −7.5 … +9.8 across the full
+board height**, around the J4/J5 ServoNano sockets. Top copper went **3088 → 2861 mm²**.
+
+If that was to clear the ServoNano's USB shell, fine. If it was collateral from the R1
+footprint edit (R1 sits at (0.57, −33.94), inside the affected region), you may want it back:
+it partly undoes **N7**, and it is the region carrying the servo command line that
+`CLAUDE.md` nominates as the untested stepper-EMI coupling path.
+
+**Electrically it costs almost nothing** — the bottom plane is untouched there and the GND
+return only moved 3.08 → 4.46 mΩ. Flagged because it looks unintended, not because it hurts.
 
 ## N1. D3 (SS34) drops the Mega below its 4.5 V minimum — MEASURED copper / datasheet
 
@@ -118,7 +227,18 @@ invites wiring a limit switch *across* them, where it would be permanently short
 
 ## O6. `LED-` runs beside SCL and beside the servo-ack analog node — MEASURED geometry / INFERRED crosstalk
 
-> ✅ **RESOLVED — V6.** The 45.7 mm run alongside SCL is gone; worst is now **8.16 mm at
+> ✅ **RESOLVED — V12, fully.** Re-measured on V12 by coupled-run length (area of victim
+> copper within a gap threshold, ÷ trace width). **`LED-` no longer runs near SCL, SDA, S0 or
+> the ack node at all** — none of those pairs reaches even 0.4 mm of coupled length at
+> ≤0.5 mm gap. Its only sub-0.2 mm neighbour is **`5VSW` (3.07 mm)**, the U4 `ON` net, which is
+> static DC. `LEDGT ∥ SCL` is down to **0.04 mm at ≤0.2 mm** (min gap 162.5 µm), from 8.16 mm.
+> `SDA ∥ $1N7075` is 0.08 mm at ≤0.2 mm / 11.85 mm at ≤0.5 mm, min gap 162.5 µm — the
+> ≈5 mV-against-1.2 V estimate below still applies and is still fine.
+>
+> ⚠ **Q1 still has no gate series resistor.** That half of the fix was never fitted. With the
+> coupling now gone it is much less pressing, but it is not "done".
+>
+> *(Superseded — V6 text kept for the record:)* The 45.7 mm run alongside SCL is gone; worst is now **8.16 mm at
 > 152 µm** (`LEDGT` ∥ `SCL`, top), worth a few mV into Q1's ~700 pF gate — LOW.
 >
 > The item that actually mattered is clean: **`$1N7075`, the ack analog node, is now 1.69 mm
@@ -209,14 +329,16 @@ intended: Q2 gates a rail firmware deliberately power-cycles, U4 gates one that 
 |---|---|---|---|
 | **O14** | ~~Silk on an exposed pad (R1 pad 2)~~ | ✅ **RESOLVED — V6.** Re-measured against solder-mask openings: **0.00000 mm² of silk intrusion on both sides**. R1 pad 2 is clear. Nothing to see, as the designer said — I should have marked this when the V6 layout pass reported it. | none |
 | **O15** | ~~J6/J8 silk reads `+5V`~~ | ✅ **RESOLVED — V6**, and the residual withdrawn. Silk now reads `3V3 GND SDA SCL` (J6) and `S0 S1 S2 S3 OUT 3V3 GND` (J8). Labelling the Q2-switched rail simply `3V3` is correct — it *is* 3.3 V — and there is no room for `SW3V3`. | none |
-| **O16** | U4 mask dam 179 µm (expansion already cut to 1 mil) | Arithmetic: pitch 0.65 − pad 0.42 = **0.230 mm** copper gap; dam = gap − 2×expansion. At 1 mil (25.4 µm) → 0.179 mm. **0.5 mil → 0.205 mm ✓**; **zero → 0.230 mm ✓**. Alternatively narrow U4's pads to 0.38 mm → 0.219 mm at 1 mil. | Set U4's mask expansion to **0.5 mil or 0**, *or* narrow its pads to 0.38 mm. Accepting is also defensible — a missing dam on a 6-pin SC70 is a modest bridging risk with a decent stencil |
+| **O16** | ~~U4 mask dam 179 µm~~ | ✅ **RESOLVED — V12, accept as drawn.** Measured directly off the mask Gerber (min web between distinct openings, rasterised): **175 µm on top** at U4, 437 µm on bottom. That is above JLCPCB's 0.1 mm minimum dam, so it builds. The earlier arithmetic (0.179 mm) was right; what was missing was the fab's actual limit. U4's mask expansion is confirmed at 1 mil, everything else on the board at 2 mil. | none |
 | **O17** | ~~Sub-0.15 mm silk segments~~ | ⚪ **WITHDRAWN.** The two arcs at (17.145, −13.081), r = 0.845 mm, are the **"~" fuse marker inside the U3 footprint** — decorative. Refdes and outline still print; nothing is lost if the squiggle comes out ragged. | none |
 | **O18** | A 0.254 mm neck in the `5VSWED` trunk | At (25.512,−14.239)→(25.400,−14.351), in the *entire* switched-rail current path. Thermally OK (~0.88 A limit) but careless. | Widen the C9→trunk section to 0.762 mm |
 | **N5** | ~~Silk-to-mask clearance as low as 0.038 mm~~ | ⚪ **WITHDRAWN.** Actual measured silk-in-opening area is **0.00000 mm²** — this was a registration-*tolerance* concern, not real overlap. Fabs clip silk off mask openings as standard, and even unclipped a 0.04 mm sliver on a 1206/SOT-23 pad edge costs a negligible fraction of the solderable area. The clearances are inherent to the library footprints, so fixing means editing footprints for no measurable gain. | none |
 | **N6** | ~~Hole-to-hole 0.4134 mm~~ | ✅ **RESOLVED — V7.** Re-measured: minimum is now **0.4809 mm**, and that pair is **same-net** (both `3V3`), where fab minimums drop to 0.254–0.3 mm. Only one pair under 0.5 mm and it is not a violation. | none |
-| **N7** | Copper balance top 21 % / bottom 89 % | Very asymmetric for 1.6 mm 2-layer; mild bow and plating-uniformity risk. | A top-side GND pour in the empty regions also helps the LEDGT/SCL coupling |
+| **N7** | Copper balance top 21 % / bottom 89 % | 🟢 **MOSTLY RESOLVED — V12.** A top-side GND pour was added: **2049 mm² of GND on top**, taking top copper to **2861 mm² = 67 %** against bottom 3777 mm² = 89 % (board area 4259 mm²). Bow and plating risk are now mild. It also did most of the work on **O6**. ⚠ V12 then removed ~228 mm² of that pour on the left edge — see **N13**. | Optional: restore the left-edge pour (N13) |
+| **N14** | Silk date is stale | Top silk reads **`PARShield V0.8.7`** and **`2026-08-22`**, but the files are dated **2026-08-29** and the revision bumped. A date stamp a week behind the revision defeats the traceability it exists for. | Update the date string with the version string |
+| **N15** | Via annular ring is exactly at the fab minimum | All 99 vias are **0.305 mm hole in a 0.610 mm pad ⇒ 152.5 µm ring** — JLCPCB's floor, with zero margin on drill registration. It will build; there is simply no headroom. | Optional: 0.7 mm via pads. The board has plenty of free area and it costs nothing |
 | **O19** | ~~Silk reads `PARBoard - V0.5`, no date~~ | ✅ **RESOLVED — V7.** Top silk now reads **`PARShield  V0.7`** and **`2026-08-22`** — name, revision and date. | none |
-| **O20** | ~~No test points~~ | ⚪ **WITHDRAWN — designer correct.** Everything worth probing is on a screw terminal or exposed male header: `+5V`/GND/`+12V` at J1, servo rail at J7.1, switched 3V3 at J6.1/J8.6, `5VSWED` at J11's male pins. The one socket-side net, `$1N7075`, is probeable at R4/R5's 1206 pads. | none |
+| **O20** | ~~No test points~~ | ⚪ **WITHDRAWN — designer correct.** Everything worth probing is on a screw terminal or exposed male header: `+5V`/GND/`+12V` at J1, servo rail at J7.1, switched 3V3 at J6.1/J8.6, `5VSWED` at J11's male pins. The one socket-side net, `$1N7075`, is probeable at R4's 1206 pad and R5's 0805 pad. | none |
 
 
 ---
@@ -230,8 +352,13 @@ intended: Q2 gates a rail firmware deliberately power-cycles, U4 gates one that 
 > ✅ **RESOLVED — V6.** `D2.1` is on `+5V` and **`D2.2` is on GND** — a proper shunt — and
 > `J1.3` now reaches `+5V` directly. The series-wiring blocker is gone.
 >
-> 🟡 **One residual, BOM-only:** D2 is still **SMBJ5.0A**, whose **5.0 V stand-off** sits below a
-> 5.25 V rail, so it will leak. Change to **SMBJ6.0A or SMBJ6.5A**. No layout impact.
+> 🟠 **Residual, BOM-only, STILL OPEN AT V12 — now unchanged across three revisions.** D2 is
+> still **SMBJ5.0A**, whose **5.0 V stand-off** sits below a 5.25 V rail, so it sits in reverse
+> leakage continuously. Change to **SMBJ6.0A or SMBJ6.5A** — same SMB footprint, no layout impact.
+>
+> Everything *else* about D2 was re-verified on V12 rather than assumed: `D2.1` is on `+5V`,
+> `D2.2` on `GND` (a proper shunt), and **the top silk does carry a cathode bar, on the `+5V`
+> side** — correct for a unidirectional TVS on a positive rail. Only the part number is wrong.
 
 
 **Verified in V5:** `$1N7100` = {J1.3, U3.1}; `$1N7101` = {D2.2, U3.2}; `+5V` = {…, D2.1, …}.
@@ -820,21 +947,61 @@ Narrowest corridor: **1.80 mm** at y ≈ −33. The dominant discontinuity is J1
 pads leaving **0.227 mm** of web between antipads — a comb across mid-board, with only 4 of 36
 pins used.
 
-## DFM — everything else passes
+## DFM — V12 re-measured
 
-Min track 0.254 mm ✅ · min clearance 0.152 mm ✅ · min annular ring 0.152 mm (vias) ✅ ·
-hole-to-hole 413 µm ✅ · hole-to-edge 566 µm ✅ · copper-to-edge 256 µm, none outside the
-outline ✅ · all 49 vias tented ✅ · zero pads without mask openings ✅ ·
-**copper matches the netlist exactly: 114 nets, 114 islands, 0 shorts, 0 opens, 0 floating
-copper** ✅.
+Re-derived from the V12 Gerbers/drills by rasterising every layer at 12.5 µm, labelling
+connected copper per layer, and merging across layers through the PTH list. Pad→net truth
+comes from `FlyingProbeTesting.json`, which carries every pin's coordinate, layer, pad shape,
+size, rotation, hole size **and net name** — use it, it is far better than inferring pads
+from apertures.
 
-Hole counts differ by revision — V3: 158 PTH (24 vias) + 8 NPTH; **V5: 185 PTH (49 vias) +
-7 NPTH**. The 49 via coordinates appear in **both** drill files; deduplicate by coordinate or
-you will double-count.
+| Check | V12 | Verdict |
+|---|---|---|
+| Netlist ↔ copper | **113 nets, 113 galvanic islands, 0 shorts, 0 opens, 0 floating copper** | ✅ |
+| Board outline | 90.678 × 51.816 mm incl. the 3.29 × 5.08 mm J12 tab; **4259 mm²**; identical to V11 | ✅ |
+| Min track | 0.254 mm (the 0.2032 mm aperture is pour-outline stroking, not routed track) | ✅ |
+| Min clearance | **0.150 mm** — `SDA`↔`SCL`, `GND`↔`3V3`, `SDA`↔`$1N7075`, `+5V`↔`GND`, `5VSW`↔`LED-` | ✅ |
+| Annular ring | 237 µm on component PTH; **152.5 µm on vias** (see N15) | ✅ |
+| Hole-to-hole | **481 µm**, and that pair is **same-net** (both `3V3`) | ✅ |
+| Copper-to-edge | 262 µm top, 257 µm bottom; **zero copper outside the outline** | ✅ |
+| Hole-to-edge | 561 µm (the four corner NPTH) | ✅ |
+| **NPTH-to-copper** | **≥ 251 µm on all 7**, both layers — incl. the three 3.2 mm mounting holes | ✅ |
+| Solder mask | all **212 pads** have openings on both sides; min dam **175 µm** top / 437 µm bottom | ✅ |
+| Solder paste | all **76 SMD pads** covered; **zero paste on through-hole pads** | ✅ |
+| Silk in mask openings | 0.4164 mm² top, 0.00000 mm² bottom — **all of it one spot, see N11** | 🟠 |
+| Copper balance | top 2861 mm² (67 %) / bottom 3777 mm² (89 %) | see N7 |
 
-Note: netlist V5 is exported from the **PCB** document, so the U1/U2 module symbols are absent
+**Copper resistance, solved as a finite-difference resistor network** on the 50 µm-coarsened
+raster (1 oz, R□ = 0.4826 mΩ, vias 1.1 mΩ) — reproduce with the method, not the numbers:
+
+| Path | R | Note |
+|---|---|---|
+| J1.3 → J7.1 (servo feed) | **49.71 mΩ** | |
+| J7.2 → J1.2 (servo GND return) | 4.46 mΩ | was 3.08 mΩ in V7; N13 |
+| **servo loop total** | **54.2 mΩ** | **81 mV at 1.5 A** vs a 200–300 mV budget ✅ |
+| J1.3 → U4.1 · U4.6 → U3.2 · U3.1 → J11.1 | 7.10 / 7.99 / 39.72 mΩ | 54.8 mΩ copper ⇒ Mega **4.93 V** ✅ |
+| U3.1 → J5.12 (ServoNano) | 19.70 mΩ | |
+| J2.2 → Q2.2 · Q2.3 → J8.6 · Q2.3 → J6.1 | 37.86 / 25.25 / 53.98 mΩ | sensor rail |
+| Q1.3 → J9.1 (`LED-`) | 135.36 mΩ | 22 mV, 3.5 mW at 160 mA ✅ |
+| C6/C7 → U4.1 · C8 → U4.6 | 1.52 / 3.00 / 1.16 mΩ | U4 decoupling is excellent |
+| C17/C18 → Q2 source | **3.04 / 9.39 mΩ** | N2's fix landed where it needed to |
+| C19 → J8.6 · C16 → J8.6 · C15 → J8.6 | 10.81 / 27.15 / 87.43 mΩ | N3's fix holds |
+| C14 → J6.1 (lidar) | 4.39 mΩ | |
+| C5/C4/C3 → J7.1 | 9.02 / 10.94 / 6.29 mΩ | O10 stubs, still harmless |
+
+Hole counts differ by revision — V3: 158 PTH (24 vias) + 8 NPTH; V5: 185 PTH (49 vias) +
+7 NPTH; **V12: 235 PTH (99 vias) + 7 NPTH**. The via coordinates appear in **both** drill
+files; deduplicate by coordinate or you will double-count.
+
+Note: the netlist is exported from the **PCB** document, so the U1/U2 module symbols are absent
 and ~36 header pins appear as single-pin nets. Those are unpopulated header positions, not
-defects. **`LIMSW-` is the only genuine one (B3).**
+defects. **`LIMSW-` was the only genuine one (B3), and it is gone in V9.**
+
+**Netlist V8 → V9 carries no connectivity change at all** — the only delta is five footprints:
+**R1, R3, R5, R10, R11 moved 1206 → 0805** (R2 and R4 stay 1206). Confirmed in copper: those
+lands are now 1.13 × 1.38 mm on a 2.0 mm span, against 1.21 × 1.70 mm for the remaining 1206s.
+A useful side effect — **R2/R4 also went from ±5 % to ±1 %**, so B2's 3.11 V into the ESP32's
+2.475 V V_IH is held tighter than before.
 
 ## Adjudicated datasheet facts
 
