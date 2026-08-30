@@ -1,6 +1,6 @@
 // Walks every row of the known-pattern board, samples the center of each
 // cell with the TCS3200, classifies each disc with the LED ambient-subtracted
-// read + clear-channel threshold, and prints the resulting cyan/black accuracy.
+// read + BLUE-channel threshold, and prints the resulting cyan/black accuracy.
 //
 // Uses the same homing/grid/streaming setup as CollectColorTrainingData,
 // but only one sample per cell — this is a quick threshold sanity check, not
@@ -26,11 +26,21 @@ const int TCS_S3  = D7;
 const int TCS_OUT = D8;
 const int TCS_LED = D10;
 
+// S2/S3 select the photodiode filter bank. Datasheet names; whether they
+// are physically right on this rig is unresolved and does not matter.
+//
+// !! CHANNEL: classifyDisc thresholds the `c` slot -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Reversed 2026-08-22 from the 2026-08-20 decision
+// !! to threshold `b`; slot `b`'s two populations OVERLAP and cannot be
+// !! separated by any cut. Measured on 666 cells of full-board ground truth:
+// !! best achievable errors r=7 g=6 b=14 c=6, and 40 earlier jobs (26,640
+// !! cells) thresholding `c` scored 0.33%. Threshold and rationale live in
+// !! PARMain.ino -- keep this file in sync with it, do not re-derive here.
 enum TcsFilter {
-  TCS_RED   = 0,
-  TCS_BLUE  = 1,
-  TCS_CLEAR = 2,
-  TCS_GREEN = 3
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates ~as well as value 2, unused
 };
 
 struct Coord { float x; float y; };
@@ -136,8 +146,8 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
     unsigned long fr, fg, fb, fc;
     tcsSelect(TCS_RED);   delay(2); fr = tcsReadFrequencyHz();
     tcsSelect(TCS_GREEN); delay(2); fg = tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);  delay(2); fb = tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR); delay(2); fc = tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);  delay(2); fb = tcsReadFrequencyHz();
 
     if (ringFilled == AVG_WINDOW) {
       ringSum[0] -= ring[ringIdx][0];
@@ -175,17 +185,18 @@ void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
   c = (long)lc - (long)ac; if (c < 0) c = 0;
 }
 
-// Simple threshold on the ambient-subtracted clear channel. 1 = cyan/on
+// Simple threshold on the ambient-subtracted BLUE channel. 1 = cyan/on
 // (front), 0 = black/off. Sensor views the disc BACK, so front cyan = clear
 // below the threshold.
 // Classification threshold. Physically the BLUE channel, not clear — the S2/S3
-// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// select lines are crossed on this rig; the enum labels name the PHYSICAL
+// filter, so tcsReadRGBC's `b` output holds true BLUE and `c` holds true CLEAR.
 // That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
 // Full explanation and the measurements are in PARMain.ino at this constant.
 // 3535 = geometric mean of the measured populations; was 6000, which was
 // lopsided (3.69x / 1.28x) toward the failure side.
-const long SCAN_ON_BLUE_MAX = 3535;
-static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+const long SCAN_ON_CLEAR_MAX = 900;
+static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_CLEAR_MAX) ? 1 : 0; }
 
 // classifyDisc returns the FRONT/displayed color; LUV_BITMAP encodes the BACK
 // view the sensor sees (mirror of the front, matching the training convention),
@@ -246,7 +257,7 @@ void setup() {
   digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 
   delay(2000);
   while (Serial1.available()) Serial1.read();

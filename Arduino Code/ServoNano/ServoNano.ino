@@ -19,17 +19,35 @@
 //                            |
 //                           GND        -> 5.0 * 3.3/(1.8+3.3) = 3.24 V
 //
+// The 3.3k leg is now load-bearing in two ways: it sets the level AND it is
+// what parks the line LOW (= no ack) if this board goes away. The main MCU
+// adds INPUT_PULLDOWN, which drops the HIGH to ~3.15 V -- still well over the
+// ESP32-S3's 2.475 V V_IH. A 2k bottom leg would give 2.45 V and NOT work.
+//
 // (The other direction needs nothing: the RP2040's 3.3 V clears this AVR's
 // V_IH of 0.6*Vcc = 3.0 V, which is why the existing D9->D2 link works.)
 //
-// Protocol is a LEVEL, not a UART: idle HIGH, pulled LOW for ACK_HOLD_MS on
-// every accepted command. The RP2040 already knows what value it sent, so it
-// only needs "the command landed" -- no baud matching, no bit timing, and no
-// SoftwareSerial on the mbed core. The hold has to outlast the sender's whole
-// repeat burst (3 frames ~= 19 ms) because the RP2040 has interrupts disabled
-// while bit-banging and cannot watch the pin during it; a short pulse would be
-// missed. It must also be shorter than the smallest settle (100 ms) so one
-// command's ack can never be mistaken for the next one's.
+// Protocol is a LEVEL, not a UART: idle LOW, driven HIGH for ACK_HOLD_MS on
+// every accepted command. The main MCU already knows what value it sent, so it
+// only needs "the command landed" -- no baud matching and no bit timing. The
+// hold must outlast the sender's frame and stay shorter than the smallest
+// settle (100 ms), so one command's ack can never be read as the next one's.
+//
+// !! POLARITY IS ACTIVE-HIGH (inverted 2026-08-17). It was idle-HIGH /
+// !! pulse-LOW, with the main MCU using INPUT_PULLUP so a broken wire would
+// !! read HIGH = "no ack". That reasoning only held for a break at the MCU pin.
+// !! The divider's bottom-leg resistor sits between that node and GND, so a
+// !! break anywhere upstream -- this wire, or an unplugged/unpowered ServoNano
+// !! -- pinned the node LOW, which the old firmware read as a successful ack.
+// !! Every command then "succeeded" and the enforced retry protected nothing.
+// !!
+// !! Idle LOW makes the bottom-leg resistor the fail-safe instead: lose this
+// !! board and the line parks LOW = "no ack" = the main MCU retries forever
+// !! instead of driving the carriage on an unconfirmed arm position.
+// !!
+// !! FLASH BOTH SIDES TOGETHER. A main MCU on the old build reads idle-LOW as a
+// !! permanent ack; this build's idle HIGH would look the same to it. The main
+// !! sketches probe the line at boot and log loudly on a mismatch.
 #define ACK_PIN 3
 const unsigned long ACK_HOLD_MS = 40;
 
@@ -94,10 +112,13 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   pinMode(ACK_PIN, OUTPUT);
-  digitalWrite(ACK_PIN, HIGH); // idle high
+  digitalWrite(ACK_PIN, LOW);  // idle LOW (active-HIGH ack)
+  // 544/2400 is the LIBRARY pulse range (0-180 deg); the boot park is REST,
+  // which is 2 deg = 565us. Don't collapse the two -- the range must stay at
+  // the library floor or every commanded angle shifts.
   s.attach(SERVO_PIN, 544, 2400);
-  s.writeMicroseconds(544);
-  lastAppliedUs = 544;
+  s.writeMicroseconds(565);
+  lastAppliedUs = 565;
   Serial.println("ServoNano ready");
 }
 
@@ -109,7 +130,7 @@ void loop() {
     ledOffAtMs = 0;
   }
   if (ackReleaseAtMs && now >= ackReleaseAtMs) {
-    digitalWrite(ACK_PIN, HIGH);
+    digitalWrite(ACK_PIN, LOW);   // release: back to idle
     ackReleaseAtMs = 0;
   }
 
@@ -135,7 +156,7 @@ void loop() {
           // Assert the ack for EVERY accepted line, including the sender's
           // repeat copies -- the RP2040 only needs to see it once, and
           // re-asserting simply extends the hold.
-          digitalWrite(ACK_PIN, LOW);
+          digitalWrite(ACK_PIN, HIGH);  // assert ack
           ackReleaseAtMs = millis() + ACK_HOLD_MS;
           digitalWrite(LED_BUILTIN, HIGH);
           ledOffAtMs = millis() + LED_BLINK_MS;

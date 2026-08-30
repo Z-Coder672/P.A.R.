@@ -5,7 +5,7 @@
 //
 // WHY THIS EXISTS
 //   Two full-board ScanColorLidarTest passes over a PHYSICALLY UNIFORM board
-//   produced classifier FALSE POSITIVES (ambient-subtracted clear < 6000 on a
+//   produced classifier FALSE POSITIVES (ambient-subtracted BLUE < 6000 on a
 //   cell whose back is not black):
 //     pass 4 (top-first)    : 12 false positives, scattered; 155/666 cells in a
 //                             5000..9000 grey zone; clear min 3291.
@@ -42,7 +42,7 @@
 //   commanded to ENGAGE / RELEASE / SCAN, so the physical board pattern is left
 //   exactly as found. Nothing here writes to the queue or the gallery.
 //
-//   It does not change SCAN_ON_BLUE_MAX or the classification maths — the
+//   It does not change SCAN_ON_CLEAR_MAX or the classification maths — the
 //   threshold and classifyDisc() are copied from PARMain verbatim so the logged
 //   verdict is the production verdict. This sketch MEASURES; retuning is a
 //   separate decision made from its output.
@@ -55,8 +55,8 @@
 //   hypothesis and time is the axis it lives on.
 //
 //   Per cell, per flash i (i = 0..AMBIENT_FLASHES-1):
-//     o<i> <r>,<g>,<b>,<c> z<n> <cmin>,<cmax>   LEDs-OFF (ambient) 5-frame means
-//     l<i> <r>,<g>,<b>,<c> z<n> <cmin>,<cmax>   LEDs-ON  (lit)     5-frame means
+//     o<i> <r>,<g>,<b>,<c> z<n> <bmin>,<bmax>   LEDs-OFF (ambient) 5-frame means
+//     l<i> <r>,<g>,<b>,<c> z<n> <bmin>,<bmax>   LEDs-ON  (lit)     5-frame means
 //   `readAmbientSubtracted()` in PARMain returns ONLY the difference, which
 //   cannot distinguish "ambient term drifted up" from "lit term fell". Logging
 //   the two raw terms separately is the whole point of this sketch. Also:
@@ -65,22 +65,22 @@
 //                  drags the 5-frame mean down 20%, which is exactly the size
 //                  of the observed excursions. Non-zero z is the smoking gun
 //                  for the pulseIn-on-FreeRTOS hypothesis.
-//     cmin,cmax  = min/max of the 5 individual CLEAR frames in that state, so
+//     bmin,bmax  = min/max of the 5 individual BLUE frames in that state, so
 //                  per-frame spread is visible even when no frame times out. If
 //                  single frames differ by ~2x, pulseIn is missing edges (a
 //                  missed edge measures ~2x the true pulse width, i.e. ~0.5x the
 //                  frequency) rather than jittering slightly.
 //
-//   ALL FOUR CHANNELS are logged even though only clear is classified, because
+//   ALL FOUR CHANNELS are logged even though only BLUE is classified, because
 //   both existing full-board passes report GREEN ≈ 5-6x CLEAR (e.g. 70000 vs
 //   13000). Clear is the UNFILTERED channel, so it cannot be smaller than any
 //   filtered one — one of those two reads is already provably wrong, which means
 //   the read path itself is suspect and not just its noise level. Whichever
 //   channel is broken, the other three are the cross-check.
 //   Then per cell:
-//     = <r>,<g>,<b>,<c> cls<0|1> mar<c-SCAN_ON_BLUE_MAX>
+//     = <r>,<g>,<b>,<c> cls<0|1> mar<b-SCAN_ON_CLEAR_MAX>
 //   the production ambient-subtracted result, the production verdict
-//   (cls1 = "front is cyan/on", i.e. clear < threshold), and the signed margin
+//   (cls1 = "front is cyan/on", i.e. BLUE < threshold), and the signed margin
 //   to the threshold, so near-misses are visible without post-processing.
 //
 //   Two structural knobs make the run self-interpreting:
@@ -103,7 +103,7 @@
 //   stall watchdog (esp_restart), moveToYSafe / clampScanY, the scan offsets and
 //   the servo hardware-UART link are copied from PARMain.ino / the sibling scan
 //   sketches. tcsReadRGBC is PARMain's 5-frame version, extended ONLY to also
-//   report the timeout count and the clear-frame min/max (the returned means are
+//   report the timeout count and the BLUE-frame min/max (the returned means are
 //   bit-identical to PARMain's).
 // ---------------------------------------------------------------------------
 
@@ -118,8 +118,8 @@ const int GRID_H = 18;
 // ------------------------------------------------------------ experiment knobs
 // Rows under test. 16 and 17 are the bottom two bitmap rows (bitmap y=17 is the
 // bottom physical row — y is mirrored when computing coordinates).
-const int ROW_A = 16;
-const int ROW_B = 17;
+const int ROW_A = 3;
+const int ROW_B = 10;
 
 // How many times the SAME 74 cells are re-measured. This is the point of the
 // sketch: repeat-count turns one observation per cell into N, which is what
@@ -159,41 +159,27 @@ const int TCS_OUT = D8;
 const int LED_PIN = D10;
 const int LED_SETTLE_MS = 20;
 
-// S2/S3 select the photodiode filter bank.
-// !! THE S2/S3 LINES ARE PHYSICALLY CROSSED ON THIS RIG (measured 2026-08-09).
-// !! The labels below are the DATASHEET mapping and are therefore WRONG for what
-// !! each value actually selects here. Proven from a 6-pass two-class run: an
-// !! unfiltered channel must be ~ the sum of the filtered ones, and
-// !!     true R+G+B = 13276  vs  the value-2 channel = 1753   (ratio 0.07, absurd)
-// !!     true R+G+B = 13276  vs  the value-1 channel = 13888  (ratio 1.05, correct)
-// !! So on this rig:
-// !!     value 0 -> RED    (both select bits equal, unaffected by the crossing)
-// !!     value 1 -> CLEAR  <-- labelled TCS_BLUE below
-// !!     value 2 -> BLUE   <-- labelled TCS_CLEAR below
-// !!     value 3 -> GREEN  (both bits equal, unaffected)
-// !!
-// !! CONSEQUENCE: tcsReadRGBC's `b` output physically holds CLEAR and its `c`
-// !! output physically holds BLUE. classifyDisc() therefore thresholds BLUE.
-// !!
-// !! THIS IS DELIBERATE — DO NOT "FIX" IT. Blue discriminates the cyan disc face
-// !! from the black one far better than clear does, measured on the same run:
-// !!     blue  (value 2): black-back 828..1628, cyan-back 7677..14695 -> 10.21x
-// !!     clear (value 1): black-back 2075..2903, cyan-back 4462..7046 ->  2.22x
-// !! Clear collects broadband return from both faces and dilutes the colour
-// !! difference. Swapping the wires to make the labels honest would cut the
-// !! usable margin from 2.17x each way to 1.24x. The names are wrong; the
-// !! behaviour is correct and better than the alternative.
+// S2/S3 select the photodiode filter bank. Datasheet names; whether they
+// are physically right on this rig is unresolved and does not matter.
+//
+// !! CHANNEL: classifyDisc thresholds the `c` slot -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Reversed 2026-08-22 from the 2026-08-20 decision
+// !! to threshold `b`; slot `b`'s two populations OVERLAP and cannot be
+// !! separated by any cut. Measured on 666 cells of full-board ground truth:
+// !! best achievable errors r=7 g=6 b=14 c=6, and 40 earlier jobs (26,640
+// !! cells) thresholding `c` scored 0.33%. Threshold and rationale live in
+// !! PARMain.ino -- keep this file in sync with it, do not re-derive here.
 enum TcsFilter {
-  TCS_RED = 0,    // S2=L, S3=L
-  TCS_BLUE = 1,   // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates ~as well as value 2, unused
 };
 
 // Servo link: hardware Serial2 TX on D9 → 5V ServoNano RX, 9600 8N1, one-way.
 // The ONLY pulse width this sketch ever sends is SERVO_US_REST.
 const int SERVO_TX_PIN = D9;
-const int SERVO_US_REST = 544;  // ≈0°, arm parked — the only angle used here
+const int SERVO_US_REST = 565;  // ≈2°, arm parked — the only angle used here
 const int SERVO_90_DEG_SETTLE_MS = 300;
 
 // The link is one-way with no ack, so a dropped byte silently LOSES a command.
@@ -233,8 +219,8 @@ struct FlashRec {
   unsigned long ar, ag, ab, ac;  // LEDs-OFF (ambient) 5-frame means
   unsigned long lr, lg, lb, lc;  // LEDs-ON  (lit)     5-frame means
   int azeros, lzeros;            // pulseIn timeouts in each state
-  unsigned long acmn, acmx;      // clear-frame spread, LEDs off
-  unsigned long lcmn, lcmx;      // clear-frame spread, LEDs on
+  unsigned long abmn, abmx;      // BLUE-frame spread, LEDs off
+  unsigned long lbmn, lbmx;      // BLUE-frame spread, LEDs on
 };
 
 // grid[GRID_H-1][0] is bottom-left at the home-relative origin; physical y
@@ -526,7 +512,7 @@ void initColorSensor() {
   digitalWrite(LED_PIN, LOW);  // LEDs off when idle
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 }
 
 // Count of pulseIn() calls that hit the timeout and returned 0 since the last
@@ -550,24 +536,25 @@ unsigned long tcsReadFrequencyHz() {
 // PARMain's 5-frame average at the current illumination — the returned means are
 // bit-identical to production. Additionally reports, for THIS state only:
 //   zeros   : pulseIn timeouts across all 20 reads (5 frames × 4 channels)
-//   cmn/cmx : min and max of the 5 individual CLEAR frames
+//   bmn/bmx : min and max of the 5 individual BLUE frames — BLUE is the channel
+//             classifyDisc thresholds, so this is the spread that matters
 // so a single bad frame is visible instead of being hidden inside the mean.
 void tcsReadRGBC(unsigned long& r, unsigned long& g,
                  unsigned long& b, unsigned long& c,
-                 int& zeros, unsigned long& cmn, unsigned long& cmx) {
+                 int& zeros, unsigned long& bmn, unsigned long& bmx) {
   uint32_t sr = 0, sg = 0, sb = 0, sc = 0;
-  cmn = 0xFFFFFFFFUL;
-  cmx = 0;
+  bmn = 0xFFFFFFFFUL;
+  bmx = 0;
   tcsZeroReads = 0;
   for (int i = 0; i < 5; i++) {
     tcsSelect(TCS_RED);   delay(2); sr += tcsReadFrequencyHz();
     tcsSelect(TCS_GREEN); delay(2); sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
-    tcsSelect(TCS_CLEAR); delay(2);
-    unsigned long cf = tcsReadFrequencyHz();
-    sc += cf;
-    if (cf < cmn) cmn = cf;
-    if (cf > cmx) cmx = cf;
+    tcsSelect(TCS_CLEAR); delay(2); sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);  delay(2);
+    unsigned long bf = tcsReadFrequencyHz();
+    sb += bf;
+    if (bf < bmn) bmn = bf;
+    if (bf > bmx) bmx = bf;
   }
   r = sr / 5;
   g = sg / 5;
@@ -596,11 +583,11 @@ void readAmbientSubtractedVerbose(long& r, long& g, long& b, long& c) {
 
     digitalWrite(LED_PIN, LOW);
     delay(LED_SETTLE_MS);
-    tcsReadRGBC(f.ar, f.ag, f.ab, f.ac, f.azeros, f.acmn, f.acmx);
+    tcsReadRGBC(f.ar, f.ag, f.ab, f.ac, f.azeros, f.abmn, f.abmx);
 
     digitalWrite(LED_PIN, HIGH);
     delay(LED_SETTLE_MS);
-    tcsReadRGBC(f.lr, f.lg, f.lb, f.lc, f.lzeros, f.lcmn, f.lcmx);
+    tcsReadRGBC(f.lr, f.lg, f.lb, f.lc, f.lzeros, f.lbmn, f.lbmx);
 
     long dr = (long)f.lr - (long)f.ar; if (dr < 0) dr = 0;
     long dg = (long)f.lg - (long)f.ag; if (dg < 0) dg = 0;
@@ -628,8 +615,8 @@ void readAmbientSubtractedVerbose(long& r, long& g, long& b, long& c) {
 //             full-board false positives (which read 3291..5955) came from.
 //     3535 -> 2.17x margin in BOTH directions. 0/444 misclassified on the
 //             two-class validation run at either value.
-const long SCAN_ON_BLUE_MAX = 3535;
-static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+const long SCAN_ON_CLEAR_MAX = 900;
+static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_CLEAR_MAX) ? 1 : 0; }
 
 // Sensor head offset from the flip actuator, identical to PARMain.
 const float SCAN_OFFSET_X = -24.005f;
@@ -646,7 +633,7 @@ static inline float cellY(int y, int x) { return clampScanY(grid[y][x].y + SCAN_
 // ------------------------------------------------------------------- the scan
 // Write one cell's record: header, then per flash the LEDs-OFF (`o<i>`) and
 // LEDs-ON (`l<i>`) raw 5-frame means with that state's pulseIn-timeout count and
-// clear-frame min/max, then the production result + verdict + threshold margin.
+// BLUE-frame min/max, then the production result + verdict + threshold margin.
 // plog stamps every line with millis(), so the header line carries the cell's
 // timestamp and `t` is not repeated. Every line stays under PLOG_MAX_LINE (96).
 // `visit`: 0 = first row scanned this pass, 1 = second, -1 = stationary burst.
@@ -656,12 +643,12 @@ void logCellRecord(unsigned long pass, int visit, int y, int x,
   for (int i = 0; i < AMBIENT_FLASHES; i++) {
     const FlashRec& f = gFlash[i];
     plog::logf("o%d %lu,%lu,%lu,%lu z%d %lu,%lu",
-               i, f.ar, f.ag, f.ab, f.ac, f.azeros, f.acmn, f.acmx);
+               i, f.ar, f.ag, f.ab, f.ac, f.azeros, f.abmn, f.abmx);
     plog::logf("l%d %lu,%lu,%lu,%lu z%d %lu,%lu",
-               i, f.lr, f.lg, f.lb, f.lc, f.lzeros, f.lcmn, f.lcmx);
+               i, f.lr, f.lg, f.lb, f.lc, f.lzeros, f.lbmn, f.lbmx);
   }
   plog::logf("= %ld,%ld,%ld,%ld cls%u mar%ld",
-             r, g, b, c, (unsigned)classifyDisc(c), c - SCAN_ON_BLUE_MAX);
+             r, g, b, c, (unsigned)classifyDisc(c), c - SCAN_ON_CLEAR_MAX);
 }
 
 // Measure the cell the head is already parked over and log it (no motion).
@@ -746,7 +733,7 @@ void setup() {
   plog::begin();
   plog::log("ScanBottomRowsTest booting — logging to flash");
   plog::logf("# rows %d,%d passes %lu flashes %d thresh %ld alt %d burst %d",
-             ROW_A, ROW_B, N_PASSES, AMBIENT_FLASHES, SCAN_ON_BLUE_MAX,
+             ROW_A, ROW_B, N_PASSES, AMBIENT_FLASHES, SCAN_ON_CLEAR_MAX,
              (int)ALTERNATE_ROW_ORDER, STATIC_BURST);
 
   // Reset cause: a brownout/WDT mid-run changes how the log should be read.

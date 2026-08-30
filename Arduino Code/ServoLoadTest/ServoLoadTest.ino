@@ -28,7 +28,7 @@ const int SERVO_TX_PIN  = D9;   // Serial2 TX -> ServoNano RX (one-way, 9600 8N1
 const int SERVO_ACK_PIN = D2;   // ServoNano D3 via 1.8k/3.3k divider, idle HIGH
 
 // Production pulse widths, so the current draw matches a real flip.
-const int SERVO_US_A = 544;    // REST, arm parked
+const int SERVO_US_A = 565;    // REST, arm parked (2 deg)
 const int SERVO_US_B = 1317;   // ENGAGE, 75 deg — the largest excursion the rig uses
 
 const int DWELL_MS   = 250;    // per leg; ~10 reversals per 5 s burst

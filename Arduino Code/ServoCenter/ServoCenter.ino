@@ -9,7 +9,7 @@
 // powered on the ServoNano picks it up and holds center.
 
 const int SERVO_TX_PIN = D9;
-const int SERVO_US_CENTER = 544;  // REST / 0 deg (parked)
+const int SERVO_US_CENTER = 565;  // REST / 2 deg (parked)
 
 // PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
 // with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The

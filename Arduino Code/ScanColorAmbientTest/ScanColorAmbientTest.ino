@@ -60,21 +60,30 @@ const int LED_PIN = D10;
 // Settle after toggling the LEDs before reading (ambient-subtraction cadence).
 const int LED_SETTLE_MS = 20;
 
-// S2/S3 select the photodiode filter bank.
+// S2/S3 select the photodiode filter bank. Datasheet names; whether they
+// are physically right on this rig is unresolved and does not matter.
+//
+// !! CHANNEL: classifyDisc thresholds the `c` slot -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Reversed 2026-08-22 from the 2026-08-20 decision
+// !! to threshold `b`; slot `b`'s two populations OVERLAP and cannot be
+// !! separated by any cut. Measured on 666 cells of full-board ground truth:
+// !! best achievable errors r=7 g=6 b=14 c=6, and 40 earlier jobs (26,640
+// !! cells) thresholding `c` scored 0.33%. Threshold and rationale live in
+// !! PARMain.ino -- keep this file in sync with it, do not re-derive here.
 enum TcsFilter {
-  TCS_RED = 0,    // S2=L, S3=L
-  TCS_BLUE = 1,   // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates ~as well as value 2, unused
 };
 
 // Servo control offloaded to a dedicated 5V Arduino Nano over a bit-banged TX
-// line on Arduino D9 → 5V Nano D0 RX, shared GND, one-way. 9600-baud software
+// line on Arduino D9 → 5V Nano D2 RX (SoftwareSerial; D0 is its USB debug echo), shared GND, one-way. 9600-baud software
 // UART (mbed's UART class on an arbitrary PinName crashed the chip). See
 // PARMain.ino / ServoNano.ino for the full rationale.
 const int SERVO_TX_PIN = D9;
 
-const int SERVO_US_REST = 544;  // ≈0°, arm parked (the ONLY angle this test uses)
+const int SERVO_US_REST = 565;  // ≈2°, arm parked (the ONLY angle this test uses)
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 
@@ -451,7 +460,7 @@ void initColorSensor() {
   digitalWrite(LED_PIN, LOW);  // LEDs off when idle
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 }
 
 // OUT is a 50%-duty square wave whose frequency tracks light intensity for the
@@ -469,8 +478,8 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
                  unsigned long& b, unsigned long& c) {
   tcsSelect(TCS_RED);   delay(2); r = tcsReadFrequencyHz();
   tcsSelect(TCS_GREEN); delay(2); g = tcsReadFrequencyHz();
-  tcsSelect(TCS_BLUE);  delay(2); b = tcsReadFrequencyHz();
   tcsSelect(TCS_CLEAR); delay(2); c = tcsReadFrequencyHz();
+  tcsSelect(TCS_BLUE);  delay(2); b = tcsReadFrequencyHz();
 }
 
 // One ambient-subtracted RGBC sample:
