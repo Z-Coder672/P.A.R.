@@ -234,10 +234,16 @@ function par_notify_gallery_complete(int $galleryId): void
 }
 
 /**
- * The share blurb. Used verbatim as the SMS body and as the text/title
- * parameter of every social intent URL, so all channels read identically.
+ * The share blurb, shared by every channel so they all read identically.
+ * Both links are inline in the sentence because most share intents give us
+ * exactly one free-text field and no second slot for a URL.
  */
-const PAR_SHARE_BLURB = "Check out P.A.R.! It's an interactive pixel art robot, and you can submit art for free.";
+function par_share_blurb(string $galleryUrl, string $uploadUrl): string
+{
+    return 'Look what I made on P.A.R.: ' . $galleryUrl
+        . '. P.A.R. is an interactive pixel art robot, and you can submit art'
+        . ' for free here: ' . $uploadUrl;
+}
 
 /**
  * The social buttons in the completion email, in display order.
@@ -245,25 +251,32 @@ const PAR_SHARE_BLURB = "Check out P.A.R.! It's an interactive pixel art robot, 
  * (Content-ID) rather than hotlinked or inlined as a data: URI — Gmail strips
  * data: URIs outright, and remote images are blocked by default in most
  * clients, so CID is the only form that renders without the reader opting in.
- * `url` is a callable so it can close over the per-recipient gallery image.
+ *
+ * The blurb already carries the gallery link, so X gets `text` with no `url`
+ * (the intent would otherwise append the same link twice). The rest need a
+ * `url` param to build a link post at all.
+ *
+ * Facebook's sharer takes only `u` — it dropped support for prefilled text
+ * years ago, so that button shares the gallery link and nothing else. There
+ * is no parameter that would fix this.
  */
-function par_share_targets(string $siteUrl, string $imageUrl): array
+function par_share_targets(string $galleryUrl, string $uploadUrl, string $imageUrl): array
 {
-    $u = rawurlencode($siteUrl);
-    $t = rawurlencode(PAR_SHARE_BLURB);
+    $g = rawurlencode($galleryUrl);
+    $t = rawurlencode(par_share_blurb($galleryUrl, $uploadUrl));
 
     return [
         ['key' => 'x', 'label' => 'X', 'file' => 'x.png',
-         'url' => 'https://twitter.com/intent/tweet?url=' . $u . '&text=' . $t],
+         'url' => 'https://twitter.com/intent/tweet?text=' . $t],
         ['key' => 'facebook', 'label' => 'Facebook', 'file' => 'facebook.png',
-         'url' => 'https://www.facebook.com/sharer/sharer.php?u=' . $u],
+         'url' => 'https://www.facebook.com/sharer/sharer.php?u=' . $g],
         ['key' => 'pinterest', 'label' => 'Pinterest', 'file' => 'pinterest.png',
-         'url' => 'https://pinterest.com/pin/create/button/?url=' . $u
+         'url' => 'https://pinterest.com/pin/create/button/?url=' . $g
                   . '&media=' . rawurlencode($imageUrl) . '&description=' . $t],
         ['key' => 'linkedin', 'label' => 'LinkedIn', 'file' => 'linkedin.png',
-         'url' => 'https://www.linkedin.com/shareArticle?mini=true&url=' . $u . '&title=' . $t],
+         'url' => 'https://www.linkedin.com/shareArticle?mini=true&url=' . $g . '&title=' . $t],
         ['key' => 'reddit', 'label' => 'Reddit', 'file' => 'reddit.png',
-         'url' => 'https://www.reddit.com/submit?url=' . $u . '&title=' . $t],
+         'url' => 'https://www.reddit.com/submit?url=' . $g . '&title=' . $t],
     ];
 }
 
@@ -332,13 +345,17 @@ function par_send_completion_email(string $to, string $pieceName, int $galleryId
     $safeUrl = htmlspecialchars($galleryUrl, ENT_QUOTES, 'UTF-8');
     $safeUpload = htmlspecialchars($uploadUrl, ENT_QUOTES, 'UTF-8');
 
-    // No recipient number — the SMS app opens with the body prefilled and the
-    // sender picks who to send it to. `?&body=` is the form both iOS and
-    // Android accept; the bare `?body=`/`&body=` variants each miss one.
-    $smsUrl = 'sms:?&body=' . rawurlencode(PAR_SHARE_BLURB . ' ' . $base);
+    // MUST be an https URL, not a bare `sms:` href. Gmail sanitizes anchors
+    // down to http/https/mailto and silently drops everything else, which
+    // renders the button as unclickable styled text. share-sms.php is a thin
+    // https hop that hands off to the sms: URI from a real page instead.
+    $smsUrl = rtrim($base, '/') . '/share-sms.php';
+    if ($galleryId > 0) {
+        $smsUrl .= '?id=' . $galleryId;
+    }
     $safeSms = htmlspecialchars($smsUrl, ENT_QUOTES, 'UTF-8');
 
-    $targets = par_share_targets($base, par_gallery_image_url($base, $galleryId));
+    $targets = par_share_targets($galleryUrl, $uploadUrl, par_gallery_image_url($base, $galleryId));
 
     // Attach each logo, skipping any that is missing on disk so a deleted file
     // degrades to a text link rather than a broken image.
@@ -399,7 +416,7 @@ function par_send_completion_email(string $to, string $pieceName, int $galleryId
         '',
         'Submit more art: ' . $uploadUrl,
         '',
-        'Share P.A.R.: ' . PAR_SHARE_BLURB . ' ' . $base,
+        'Share P.A.R.: ' . par_share_blurb($galleryUrl, $uploadUrl),
     ];
     foreach ($targets as $t) {
         $textLines[] = '  ' . $t['label'] . ': ' . $t['url'];
