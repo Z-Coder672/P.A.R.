@@ -1674,7 +1674,9 @@ body.modal-open {
 }
 
 .name-modal-input {
-    background-color: #0d0d0d;
+    /* Lighter than the #1a1a1a modal surface so the fields read as raised
+       wells rather than holes punched in the panel. */
+    background-color: #222222;
     /* Near-white so the fields read as clearly editable against the modal's
        dark surface — deliberately not pure #fff, which fights the cyan focus. */
     border: 2px solid #d9d9d9;
@@ -1693,7 +1695,9 @@ body.modal-open {
 }
 
 .name-modal-input::placeholder {
-    color: #555555;
+    /* Lifted alongside the lighter field background — #555 was tuned against
+       the old #0d0d0d and loses contrast against #222. */
+    color: #7d7d7d;
 }
 
 .name-modal-input.input-error {
