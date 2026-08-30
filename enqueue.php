@@ -111,6 +111,14 @@ if (isset($data['name']) && is_string($data['name'])) {
     $name = mb_substr(trim($data['name']), 0, 100);
 }
 
+// Optional artist credit. Purely cosmetic ("by <artist>" in the gallery) and
+// blank-by-default, so an empty or whitespace-only value is simply dropped.
+// Moderated independently of the piece name -- see mod-next.php.
+$artist = '';
+if (isset($data['artist']) && is_string($data['artist'])) {
+    $artist = mb_substr(trim($data['artist']), 0, 100);
+}
+
 // Optional notification email. Validated here; the address is NEVER written to
 // the (web-served) mod/main queue files — only stored encrypted off-webroot,
 // keyed by this entry's id. The queue entry carries a boolean flag only.
@@ -197,6 +205,7 @@ $queueEntry = json_encode([
     'id'        => $entryId,
     'item'      => $data['item'],
     'name'      => $name,
+    'artist'    => $artist,
     'ts'        => time(),
     'status'    => 'pending',
     'status_ts' => time(),

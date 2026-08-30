@@ -234,10 +234,70 @@ function par_notify_gallery_complete(int $galleryId): void
 }
 
 /**
+ * The share blurb. Used verbatim as the SMS body and as the text/title
+ * parameter of every social intent URL, so all channels read identically.
+ */
+const PAR_SHARE_BLURB = "Check out P.A.R.! It's an interactive pixel art robot, and you can submit art for free.";
+
+/**
+ * The social buttons in the completion email, in display order.
+ * `file` is a transparent-background PNG under media/social/, attached inline
+ * (Content-ID) rather than hotlinked or inlined as a data: URI — Gmail strips
+ * data: URIs outright, and remote images are blocked by default in most
+ * clients, so CID is the only form that renders without the reader opting in.
+ * `url` is a callable so it can close over the per-recipient gallery image.
+ */
+function par_share_targets(string $siteUrl, string $imageUrl): array
+{
+    $u = rawurlencode($siteUrl);
+    $t = rawurlencode(PAR_SHARE_BLURB);
+
+    return [
+        ['key' => 'x', 'label' => 'X', 'file' => 'x.png',
+         'url' => 'https://twitter.com/intent/tweet?url=' . $u . '&text=' . $t],
+        ['key' => 'facebook', 'label' => 'Facebook', 'file' => 'facebook.png',
+         'url' => 'https://www.facebook.com/sharer/sharer.php?u=' . $u],
+        ['key' => 'pinterest', 'label' => 'Pinterest', 'file' => 'pinterest.png',
+         'url' => 'https://pinterest.com/pin/create/button/?url=' . $u
+                  . '&media=' . rawurlencode($imageUrl) . '&description=' . $t],
+        ['key' => 'linkedin', 'label' => 'LinkedIn', 'file' => 'linkedin.png',
+         'url' => 'https://www.linkedin.com/shareArticle?mini=true&url=' . $u . '&title=' . $t],
+        ['key' => 'reddit', 'label' => 'Reddit', 'file' => 'reddit.png',
+         'url' => 'https://www.reddit.com/submit?url=' . $u . '&title=' . $t],
+    ];
+}
+
+/**
+ * Best public URL for this entry's photo of the matrix, for Pinterest's
+ * required `media` parameter. Falls back to the site's own preview image when
+ * the print has no photo yet (the snapshot upload is asynchronous, so the
+ * completion email can genuinely beat it).
+ */
+function par_gallery_image_url(string $base, int $galleryId): string
+{
+    $root = dirname(__DIR__);
+    // This entry first; then walk back a short way, because the snapshot upload
+    // is asynchronous and can legitimately land after this email goes out. Any
+    // recent print is a better Pin than the site icon.
+    for ($id = $galleryId; $id > 0 && $id > $galleryId - 20; $id--) {
+        foreach (['jpg', 'png'] as $ext) {
+            $rel = '/gallery/' . $id . '/image.' . $ext;
+            if (is_file($root . $rel)) {
+                return rtrim($base, '/') . $rel . '?v=' . (string) @filemtime($root . $rel);
+            }
+        }
+    }
+    return rtrim($base, '/') . '/favicon.webp';
+}
+
+/**
  * Send the "your piece is done" notification. All header-bearing values are
  * stripped of CR/LF to prevent header injection; the recipient is re-validated
  * here as a last line of defense. Uses PHP mail() (local Exim on Site5); the
  * envelope sender is pinned so SPF/DKIM align to the site domain.
+ *
+ * Body is multipart/alternative { text/plain, multipart/related { html, PNGs } }
+ * so the logos travel with the message as inline attachments.
  */
 function par_send_completion_email(string $to, string $pieceName, int $galleryId = 0): bool
 {
@@ -259,6 +319,7 @@ function par_send_completion_email(string $to, string $pieceName, int $galleryId
     if ($galleryId > 0) {
         $galleryUrl .= '#' . $galleryId;
     }
+    $uploadUrl = rtrim($base, '/') . '/upload';
 
     $subjectText = $name !== ''
         ? sprintf('Your P.A.R. piece "%s" is done!', $name)
@@ -269,28 +330,121 @@ function par_send_completion_email(string $to, string $pieceName, int $galleryId
     $safeName = htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
     $piece = $safeName !== '' ? '&ldquo;' . $safeName . '&rdquo;' : 'your pixel art';
     $safeUrl = htmlspecialchars($galleryUrl, ENT_QUOTES, 'UTF-8');
+    $safeUpload = htmlspecialchars($uploadUrl, ENT_QUOTES, 'UTF-8');
+
+    // No recipient number — the SMS app opens with the body prefilled and the
+    // sender picks who to send it to. `?&body=` is the form both iOS and
+    // Android accept; the bare `?body=`/`&body=` variants each miss one.
+    $smsUrl = 'sms:?&body=' . rawurlencode(PAR_SHARE_BLURB . ' ' . $base);
+    $safeSms = htmlspecialchars($smsUrl, ENT_QUOTES, 'UTF-8');
+
+    $targets = par_share_targets($base, par_gallery_image_url($base, $galleryId));
+
+    // Attach each logo, skipping any that is missing on disk so a deleted file
+    // degrades to a text link rather than a broken image.
+    $socialDir = dirname(__DIR__) . '/media/social/';
+    $attachments = [];
+    $socialCells = '';
+    foreach ($targets as $t) {
+        $path = $socialDir . $t['file'];
+        $href = htmlspecialchars($t['url'], ENT_QUOTES, 'UTF-8');
+        $label = htmlspecialchars($t['label'], ENT_QUOTES, 'UTF-8');
+        $data = is_file($path) ? @file_get_contents($path) : false;
+
+        if ($data === false || $data === '') {
+            $socialCells .= '<td style="padding:0 8px"><a href="' . $href
+                . '" style="color:#02b2d9;font-size:0.9rem;text-decoration:none">'
+                . $label . '</a></td>';
+            continue;
+        }
+
+        $cid = 'par-' . $t['key'] . '@' . $host;
+        $attachments[] = ['cid' => $cid, 'name' => $t['file'], 'data' => $data];
+        $socialCells .= '<td style="padding:0 8px"><a href="' . $href
+            . '" title="' . $label . '"><img src="cid:' . $cid . '" alt="' . $label
+            . '" width="36" height="36" style="display:block;width:36px;height:36px;'
+            . 'border:0;outline:none;text-decoration:none"></a></td>';
+    }
+
+    $btn = 'display:inline-block;background:#02b2d9;color:#ffffff;padding:0.6rem 1.1rem;'
+        . 'border-radius:6px;text-decoration:none;font-weight:600';
+    $btnGhost = 'display:inline-block;background:#ffffff;color:#02b2d9;padding:0.6rem 1.1rem;'
+        . 'border:2px solid #02b2d9;border-radius:6px;text-decoration:none;font-weight:600';
 
     $html = '<!doctype html><html><body style="font-family:system-ui,-apple-system,sans-serif;'
         . 'max-width:34rem;margin:0 auto;color:#111">'
-        . '<h2 style="color:#02b2d9">Your P.A.R. piece is done! 🎉</h2>'
+        . '<h2 style="color:#02b2d9">Your P.A.R. piece is done! &#127881;</h2>'
         . '<p>The display just finished printing ' . $piece . '.</p>'
-        . '<p><a href="' . $safeUrl . '" style="display:inline-block;background:#02b2d9;color:#fff;'
-        . 'padding:0.6rem 1.1rem;border-radius:6px;text-decoration:none">View it in the gallery</a></p>'
+        . '<p><a href="' . $safeUrl . '" style="' . $btn . '">View it in the gallery</a></p>'
         . '<p style="color:#555;font-size:0.9rem">The recording of your print will appear on that '
         . 'page shortly after it finishes uploading.</p>'
+        . '<hr style="border:none;border-top:1px solid #ddd;margin:1.5rem 0">'
+        . '<p style="margin:0 0 0.9rem"><a href="' . $safeUpload . '" style="' . $btn . '">'
+        . 'Submit more art</a></p>'
+        . '<p style="margin:0 0 1.5rem"><a href="' . $safeSms . '" style="' . $btnGhost . '">'
+        . 'Text a friend about P.A.R.</a></p>'
+        . '<p style="margin:0 0 0.6rem;font-weight:600">Post on your socials:</p>'
+        . '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        . 'style="border-collapse:collapse"><tr>' . $socialCells . '</tr></table>'
         . '<hr style="border:none;border-top:1px solid #ddd;margin:1.5rem 0">'
         . '<p style="color:#888;font-size:0.8rem">You received this because you asked to be notified '
         . 'when your P.A.R. submission printed. This is a one-time, unmonitored message.</p>'
         . '</body></html>';
 
+    $textLines = [
+        $name !== '' ? 'Your P.A.R. piece "' . $name . '" is done!' : 'Your P.A.R. piece is done!',
+        '',
+        'View it in the gallery: ' . $galleryUrl,
+        'The recording of your print will appear there shortly after it uploads.',
+        '',
+        'Submit more art: ' . $uploadUrl,
+        '',
+        'Share P.A.R.: ' . PAR_SHARE_BLURB . ' ' . $base,
+    ];
+    foreach ($targets as $t) {
+        $textLines[] = '  ' . $t['label'] . ': ' . $t['url'];
+    }
+    $textLines[] = '';
+    $textLines[] = 'You received this because you asked to be notified when your '
+        . 'P.A.R. submission printed. This is a one-time, unmonitored message.';
+    $text = implode("\r\n", $textLines);
+
+    // Boundaries must not appear in any part; random hex can't collide with the
+    // base64/quoted-printable payloads below.
+    $altBoundary = '=_par_alt_' . bin2hex(random_bytes(12));
+    $relBoundary = '=_par_rel_' . bin2hex(random_bytes(12));
+
+    $body = "--$altBoundary\r\n"
+        . "Content-Type: text/plain; charset=UTF-8\r\n"
+        . "Content-Transfer-Encoding: base64\r\n\r\n"
+        . chunk_split(base64_encode($text)) . "\r\n"
+        . "--$altBoundary\r\n"
+        . "Content-Type: multipart/related; type=\"text/html\"; boundary=\"$relBoundary\"\r\n\r\n"
+        . "--$relBoundary\r\n"
+        . "Content-Type: text/html; charset=UTF-8\r\n"
+        . "Content-Transfer-Encoding: base64\r\n\r\n"
+        . chunk_split(base64_encode($html)) . "\r\n";
+
+    foreach ($attachments as $a) {
+        $body .= "--$relBoundary\r\n"
+            . "Content-Type: image/png; name=\"" . $a['name'] . "\"\r\n"
+            . "Content-Transfer-Encoding: base64\r\n"
+            . "Content-ID: <" . $a['cid'] . ">\r\n"
+            . "Content-Disposition: inline; filename=\"" . $a['name'] . "\"\r\n\r\n"
+            . chunk_split(base64_encode($a['data'])) . "\r\n";
+    }
+
+    $body .= "--$relBoundary--\r\n"
+        . "--$altBoundary--\r\n";
+
     $headers = implode("\r\n", [
         'MIME-Version: 1.0',
-        'Content-Type: text/html; charset=UTF-8',
+        'Content-Type: multipart/alternative; boundary="' . $altBoundary . '"',
         'From: P.A.R. <' . $from . '>',
         'Reply-To: ' . $from,
         'X-Mailer: PAR-Notifier',
     ]);
 
     // -f pins the envelope-from for SPF alignment.
-    return @mail($to, $subject, $html, $headers, '-f' . $from);
+    return @mail($to, $subject, $body, $headers, '-f' . $from);
 }

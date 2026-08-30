@@ -1562,6 +1562,20 @@ body.modal-open {
     margin: 0;
 }
 
+/* Optional artist credit under the piece name. Hidden (not blank) when the
+   submitter left the field empty — see setGalleryModalArtist. */
+.gallery-modal-artist {
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: #999999;
+    text-align: center;
+    margin: 0;
+}
+
+.gallery-modal-artist.hidden {
+    display: none;
+}
+
 .gallery-modal-image {
     width: 100%;
     display: block;
@@ -1642,7 +1656,9 @@ body.modal-open {
 
 .name-modal-input {
     background-color: #0d0d0d;
-    border: 2px solid #444444;
+    /* Near-white so the fields read as clearly editable against the modal's
+       dark surface — deliberately not pure #fff, which fights the cyan focus. */
+    border: 2px solid #d9d9d9;
     border-radius: 6px;
     color: #ffffff;
     font-size: 1rem;

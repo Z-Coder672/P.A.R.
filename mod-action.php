@@ -106,6 +106,7 @@ if ($verdict === 'approve') {
                 [
                     'item'   => $found['item'] ?? '',
                     'name'   => $found['name'] ?? '',
+                    'artist' => $found['artist'] ?? '',
                     'sub_id' => (string) ($found['id'] ?? ''),
                 ],
                 JSON_UNESCAPED_UNICODE
