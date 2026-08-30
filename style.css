@@ -1549,9 +1549,28 @@ body.modal-open {
     max-width: 500px;
     display: flex;
     flex-direction: column;
+    padding-top: 3rem;
+    /* Cap to the viewport so a tall entry (bitmap + photo + recording) scrolls
+       inside the modal instead of running off-screen with no way to reach it —
+       the overlay is position:fixed, so the page behind can't scroll to it. */
+    max-height: 90vh;
+    /* Small-viewport units account for mobile browser chrome; ignored by
+       browsers that don't support them, which keep the vh value above. */
+    max-height: 90dvh;
+}
+
+.gallery-modal-scroll {
+    display: flex;
+    flex-direction: column;
     align-items: center;
     gap: 1rem;
-    padding-top: 3rem;
+    width: 100%;
+    overflow-y: auto;
+    /* A flex child won't shrink below its content without this, which would
+       defeat the max-height above. */
+    min-height: 0;
+    /* Don't chain the scroll to the page once this box hits its end. */
+    overscroll-behavior: contain;
 }
 
 .gallery-modal-name {
