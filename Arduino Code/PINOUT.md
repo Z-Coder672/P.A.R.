@@ -224,43 +224,48 @@ on **D10** through an NPN (HIGH = on) for ambient-subtracted reads.
 | VCC / GND | — | — |
 | LED bank | D10 (via NPN base) | HIGH = LEDs on; `LED_SETTLE_MS = 20` after toggling |
 
-### S2/S3 are crossed on this rig — the enum encodes it
-Measured Aug 2026 over 888 samples. An unfiltered channel must ≈ the sum of the filtered
-ones; `true R+G+B = 13276` matches the value-1 channel (13888, ratio 1.05), not the
-value-2 channel (1753, ratio 0.07). A commanded (S2,S3) pair therefore selects the filter
-the datasheet assigns to the **swapped** pair. Values 0 and 3 are symmetric and land on
-their datasheet filter; 1 and 2 swap:
+### S2/S3 filter select — which commanded pair lands in which slot
 
-| Commanded S2,S3 | value | Datasheet says | **Actually selected** | `TcsFilter` label |
-|---|---|---|---|---|
-| L,L | 0 | RED | RED | `TCS_RED` |
-| L,H | 1 | BLUE | **CLEAR** | `TCS_CLEAR` |
-| H,L | 2 | CLEAR | **BLUE** | `TCS_BLUE` |
-| H,H | 3 | GREEN | GREEN | `TCS_GREEN` |
+This table is just the wiring-to-software map. It says nothing about which *physical* filter
+each pair selects; see the note below for why that question is unresolved and irrelevant.
 
-**The enum labels name the physical filter, not the datasheet's** (relabelled Aug 2026 —
-they previously carried the datasheet names and were wrong on values 1 and 2). So
-`tcsReadRGBC`'s `b` slot holds true BLUE and `c` holds true CLEAR, and `classifyDisc(long b)`
-thresholds **BLUE**, which is the right choice:
-
-| Channel | black-back range | cyan-back range | separation |
+| Commanded S2,S3 | value | `TcsFilter` label | `tcsReadRGBC` output slot |
 |---|---|---|---|
-| **blue** (value 2) | 828–1628 | 7677–14695 | **10.22×** |
-| clear (value 1) | 2075–2903 | 4462–7046 | 2.22× |
+| L,L | 0 | `TCS_RED` | `r` |
+| L,H | 1 | `TCS_BLUE` | `b` |
+| H,L | 2 | `TCS_CLEAR` | **`c` — the slot `classifyDisc` thresholds** |
+| H,H | 3 | `TCS_GREEN` | `g` |
 
-Clear collects broadband return from both faces and dilutes the colour difference. Reading
-CLEAR instead would cut usable margin from 2.17× each way to 1.24×.
+**The enum carries the datasheet names.** Whether they are also physically correct on this
+rig is **unresolved**, and it does not matter: what the code depends on is which commanded
+(S2,S3) pair discriminates the disc faces, and that has been measured directly.
 
-**The invariant is that `classifyDisc` thresholds BLUE.** The enum's two value assignments
-are the only place the wiring is encoded, so if S2/S3 are ever rewired straight, those
-values must move with it — otherwise the classifier silently ends up on CLEAR.
+**It is (S2=H, S3=L) — value 2, `TCS_CLEAR`, landing in `tcsReadRGBC`'s `c` slot.**
+`classifyDisc(long c)` thresholds that slot. Measured 2026-08-22 on 666 cells of full-board
+ground truth (a check-pass scan against its source bitmap), best achievable errors:
 
-One consequence for archived data: logs captured **before** the relabel were written when
-the `b` slot carried the clear channel and `c` carried blue, so their last two columns mean
-the opposite of what a current log's do. Check the capture date before comparing dumps.
+| slot | fed from | best achievable errors / 666 |
+|---|---|---|
+| `r` | value 0 (S2=L,S3=L) | 7 |
+| `g` | value 3 (S2=H,S3=H) | 6 |
+| `b` | value 1 (S2=L,S3=H) | **14 — populations overlap, unusable** |
+| **`c`** | **value 2 (S2=H,S3=L)** | **6** |
 
-Classification is `c < SCAN_ON_BLUE_MAX` (**3535**) → cell is displaying cyan. Not a
-distance, not a ratio, not a model (the ML classifier is retired).
+Corroborated on 40 earlier jobs (26,640 cells) whose firmware thresholded `c`: 0.33 % error.
+
+**Do not re-derive this from a sum test** (an unfiltered channel ≈ the sum of the filtered
+ones). That identity does not hold on this sensor at either supply voltage — at 3V3 the `g`
+slot reads ~5× the `c` slot, impossible for a filtered vs unfiltered pair — so it proves
+nothing in either direction. It produced the "S2/S3 are crossed" theory in the first place,
+and then the 2026-08-20 reversal of it, and both moved which channel was thresholded while
+claiming to be pure relabels. Measure against a known bitmap instead.
+
+One consequence for archived data: slot semantics have changed twice, so the last two
+columns of a dump mean different things depending on when it was captured. Check the date.
+
+Classification is `c < SCAN_ON_CLEAR_MAX` (**900**) -> cell is displaying cyan. Not a
+distance, not a ratio, not a model (the ML classifier is retired). Supply-dependent: the
+5 V -> 3V3 move on 2026-08-20 scaled every channel down, so re-derive if it changes again.
 
 **Polarity: the sensor views the disc's BACK.** A displayed-cyan disc shows its black back
 ⇒ reads LOW; a displayed-black disc reads HIGH. `classifyDisc` returns the **front /

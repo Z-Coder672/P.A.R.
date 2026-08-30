@@ -61,24 +61,21 @@ const int LED_PIN = D9;   // NPN base: HIGH = LEDs ON
 const int  AVG_CYCLES  = 5;    // cycles averaged per reported sample
 const int  LED_SETTLE_MS = 20; // settle after toggling the LEDs before reading
 
-// S2/S3 select the photodiode filter bank (MSB=S2, LSB=S3).
-// S2/S3 select the photodiode filter bank.
+// S2/S3 select the photodiode filter bank. Datasheet names; whether they
+// are physically right on this rig is unresolved and does not matter.
 //
-// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
-// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
-// for values 1 and 2 -- the value assignments below already account for that.
-// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
-// and classifyDisc thresholds `b`.
-//
-// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
-// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
-// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
-// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
+// !! CHANNEL: classifyDisc thresholds the `c` slot -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Reversed 2026-08-22 from the 2026-08-20 decision
+// !! to threshold `b`; slot `b`'s two populations OVERLAP and cannot be
+// !! separated by any cut. Measured on 666 cells of full-board ground truth:
+// !! best achievable errors r=7 g=6 b=14 c=6, and 40 earlier jobs (26,640
+// !! cells) thresholding `c` scored 0.33%. Threshold and rationale live in
+// !! PARMain.ino -- keep this file in sync with it, do not re-derive here.
 enum TcsFilter {
-  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
-  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
-  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
-  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates ~as well as value 2, unused
 };
 
 // ---- Recording state --------------------------------------------------------
@@ -200,7 +197,7 @@ void setup() {
   // S0=HIGH, S1=LOW → 20% output frequency scaling.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 
   Serial.println(F("# CollectColorAmbient ready — send 'b' (blue) or 'k' (black) to start, 's' to stop."));
 }

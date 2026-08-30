@@ -244,14 +244,14 @@ Fixes in the sketch: `SCAN_ROW_ORDER` reverses the visit order (every loop-order
 ### Display flow
 Each job in `loop()`: `scanGrid()` (re-home + re-read every cell to reseed `gridState[]` after the 10-min idle) → `displayBitmap(bitmap)` → **check pass** (`scanGrid()` + `displayBitmap()` again) → `onDisplayComplete()` → `delay(10 min)`. The check pass re-scans the board after the first draw — reseeding `gridState[]` so any disc that didn't flip cleanly or was misclassified is caught — then re-runs `displayBitmap`, whose diff-against-`gridState` logic re-flips only the cells still wrong. One pass, not a loop-until-clean. Boot runs `$H` then a full `scanGrid()`.
 
-Cell scanning uses the TCS3200 (offset `(-24.005, +8.0)` from the flip head) with an **LED ambient-subtracted read** and a **blue-channel threshold** — the ML classifier is retired. `readAmbientSubtracted()` averages `AMBIENT_FLASHES` (3) off/on flashes, each subtracting a 5-frame LEDs-OFF read from a 5-frame LEDs-ON read (`tcsReadRGBC` averages 5 frames), cancelling room light. `classifyDisc(b)` is then just `b < SCAN_ON_BLUE_MAX` (**1112**) → 1. The blue channel separates the faces by **4.6×** at the current 3V3 supply (on ~0.3k, off ~2.8k), so a fixed cut is robust. **Polarity: the sensor views the disc's BACK.** A displayed-cyan (on) disc shows its black back → reads LOW blue; a displayed-black (off) disc reads HIGH. `classifyDisc` returns the **FRONT/displayed** color, matching `gridState` and the target bitmap. Ambient subtraction fixed the room-lighting "blown regime" that used to garble prints.
+Cell scanning uses the TCS3200 (offset `(-24.005, +8.0)` from the flip head) with an **LED ambient-subtracted read** and a **single-channel threshold on the `c` slot** — the ML classifier is retired. `readAmbientSubtracted()` averages `AMBIENT_FLASHES` (3) off/on flashes, each subtracting a 5-frame LEDs-OFF read from a 5-frame LEDs-ON read (`tcsReadRGBC` averages 5 frames), cancelling room light. `classifyDisc(c)` is then just `c < SCAN_ON_CLEAR_MAX` (**900**) → 1. That channel separates the faces by **4.9×** at the current 3V3 supply (on ~0.25k, off ~2.2k), so a fixed cut is robust. **Polarity: the sensor views the disc's BACK.** A displayed-cyan (on) disc shows its black back → reads LOW; a displayed-black (off) disc reads HIGH. `classifyDisc` returns the **FRONT/displayed** color, matching `gridState` and the target bitmap. Ambient subtraction fixed the room-lighting "blown regime" that used to garble prints.
 
 `releaseSweep()` runs **once after `displayBitmap()`** so half-rotated discs settle before the snapshot photo. With the servo parked at `SERVO_US_REST` it does a serpentine top-to-bottom traverse — no Y-wiggle, no servo movement — routing inter-row Y travel through `moveToYSafe`. Same function in `FlipCheckerboardTest.ino`; keep them in sync.
 
-Sanity-check the live read with `Arduino Code/ColorSensorTest/ColorSensorTest.ino` (prints ambient-subtracted RGBC + the front cyan/black result). To adjust classification, tune `SCAN_ON_BLUE_MAX` against known ground truth (photograph the board, or use a bitmap you just printed); there's nothing to retrain. It is supply-dependent — see the classifier gotcha. `Arduino Code/CollectColorAmbient/` and `ScanColorAmbientTest/` log ambient-subtracted RGBC to re-check cluster separation on a new board/LED setup.
+Sanity-check the live read with `Arduino Code/ColorSensorTest/ColorSensorTest.ino` (prints ambient-subtracted RGBC + the front cyan/black result). To adjust classification, tune `SCAN_ON_CLEAR_MAX` against known ground truth — decode the target bitmap from `gallery.php` for the id in the log and compare it against that job's check-pass `px` lines; there's nothing to retrain. It is supply-dependent — see the classifier gotcha. `Arduino Code/CollectColorAmbient/` and `ScanColorAmbientTest/` log ambient-subtracted RGBC to re-check cluster separation on a new board/LED setup.
 
 ### Color Sensor ML pipeline (RETIRED)
-**The ML classifier is no longer used** — all sketches classify with the blue-channel threshold above. `classifier.h` / `model_weights.h` are unreferenced (left on disk); `classifier_is_blue`/`classifier_logit` are gone from every `.ino`. The PyTorch pipeline in `Color Sensor ML/` (`collect.py`, `collect_auto.py`, `train.py`, `export_header.py`, `evolve.py`, `verify_export.py`, `color_data.json`) is retained for historical reference only — you should not need it. If a future board/LED setup ever muddies the blue-channel gap, **re-tune `SCAN_ON_BLUE_MAX` rather than resurrecting the model.**
+**The ML classifier is no longer used** — all sketches classify with the single-channel threshold above. `classifier.h` / `model_weights.h` are unreferenced (left on disk); `classifier_is_blue`/`classifier_logit` are gone from every `.ino`. The PyTorch pipeline in `Color Sensor ML/` (`collect.py`, `collect_auto.py`, `train.py`, `export_header.py`, `evolve.py`, `verify_export.py`, `color_data.json`) is retained for historical reference only — you should not need it. If a future board/LED setup ever muddies the gap, **re-tune `SCAN_ON_CLEAR_MAX` rather than resurrecting the model.**
 
 ### Sketch conventions
 - **Pure-Y motion only at X soft-limits.** Any vertical travel outside `flipDisc` must happen with X pinned at `0` or `-X_TRAVEL`. Use `moveToYSafe(x, y)` (emits `G0 X<limit>` → `G0 Y<targetY>` → `G0 X<targetX>`) for phase entry and any cross-row transition. Row sweeps (`scanGrid`, `displayBitmap`, `verifyAndFix`, `releaseSweep`, the `FlipCheckerboardTest` flip loop) are serpentine — end-of-row X equals start-of-next-row X, so the inter-row leg lands a pure-Y move at the limit.
@@ -268,28 +268,47 @@ GRBL acks (`ok`) when a line is **parsed into the planner**, not when motion fin
 **Boot order:** when homing is required, GRBL boots into alarm state and rejects G-code with `error:9`. Always send `$H` **first**, then `G21`/`G90` after homing completes. No modal G-code before `$H`.
 
 ### Color classifier gotcha (do not re-litigate)
-Classification is a single threshold on the ambient-subtracted **BLUE** channel — `b < SCAN_ON_BLUE_MAX` (**1112**) → the cell is displaying cyan. Not a distance, not a ratio, not a model.
 
-**THE S2/S3 LINES ARE NOT CROSSED. The datasheet mapping holds** (`TCS_RED = 0`, `TCS_BLUE = 1`, `TCS_CLEAR = 2`, `TCS_GREEN = 3`), restored 2026-08-20 across all 14 sketches that carry the enum. The earlier "crossed" claim rested on a sum test (an unfiltered channel must be ≈ the sum of the filtered ones); that identity does **not** hold on this sensor at either supply voltage, so it proved nothing. Do not re-derive the mapping from it.
+Classification is a single threshold on **one ambient-subtracted channel: the `c` slot of
+`tcsReadRGBC`, fed from TcsFilter value 2, commanded (S2=H, S3=L)** — `c < SCAN_ON_CLEAR_MAX`
+(**900**) → the cell is displaying cyan. Not a distance, not a ratio, not a model.
 
-**The bug it concealed, which is the important part:** `classifyDisc` was thresholding **value 2 (CLEAR)** while `SCAN_ON_BLUE_MAX` had been derived from **value 1 (BLUE)** — two different channels. `geomean(1628, 7677) = 3535.3`, exactly the shipped constant, and those populations are value 1's. The Aug 2026 "honest labels" relabel was a genuine no-op (its own verification was correct) — it faithfully preserved a channel mismatch that already existed, and its documentation then asserted the mismatch away.
+**Reversed 2026-08-22. The 2026-08-20 decision to threshold `b` was wrong and cost ~11× the
+error rate.** Slot `b` (value 1) has *overlapping* populations — no cut separates them.
+Ground truth, 666 cells of one check-pass scan against its source bitmap decoded from
+`gallery.php`, best achievable errors per slot: r = 7, g = 6, **b = 14**, **c = 6**. Live on
+`b` at 1112 the same scan scored **24**. Corroborated across 40 earlier jobs (ids 26–66,
+26,640 cells) whose firmware thresholded `c`: 89 errors = **0.33 %**, median 2/666. On job
+42 that firmware scored 0 errors while the best possible score on `b` was 17 — proof by
+contradiction that `b` was never the channel being read, whatever the labels claimed.
 
-**Measured 2026-08-20** against 222 cells of known ground truth (rows 0–5 checked against the source bitmap), ambient-subtracted, TCS3200 at **3V3**:
+**How to settle a channel question: decode the target bitmap from `gallery.php` for the id
+in the log (`snapshot-request start id=N`) and compare it against that job's check-pass `px`
+lines.** Every check pass logs all 666 cells and the board is supposed to match the target,
+so every completed job is a free labelled dataset. Do this instead of reasoning from labels.
 
-| channel | cyan-front | black-front | separation |
-|---|---|---|---|
-| **BLUE (value 1)** | 176–518 | 2387–3266 | **4.61×** |
-| CLEAR (value 2) | 617–896 | 1438–1778 | 1.60× |
+**Do NOT re-derive the mapping from a sum test** (an unfiltered channel ≈ the sum of the
+filtered ones). That identity does not hold on this sensor at either supply — at 3V3 the `g`
+slot reads ~5× the `c` slot, impossible for a filtered/unfiltered pair. It produced the
+"S2/S3 are crossed" theory, then the 2026-08-20 reversal of it, and **both of those moved
+which channel was thresholded while documenting themselves as pure relabels.** The enum
+names are the datasheet table; whether they are physically right is unresolved and does not
+matter.
 
-Same ordering on 28,447 cells of 5 V history: 9.11× vs 2.11×. Clear collects broadband return from both faces and dilutes the colour difference — which is why the *physics* argument for thresholding blue was always right even while the code read clear. Validation: the new setting scores **0/222** on the trusted rows where the old one scored 28/222.
+**`SCAN_ON_CLEAR_MAX` IS SUPPLY-DEPENDENT.** The sensor moved 5 V → 3V3 on 2026-08-20, which
+scaled every channel down ~3.5×. 900 is the geometric mean of the clean cluster edges at
+3V3 (cyan p95 = 494, black p05 = 1651); the error count is flat at 6–7 anywhere from ~700 to
+~1400, so it sits mid-plateau. Separation is **4.93×** (black p05 / cyan p95) against a
+5 V-era median of 5.52× — the supply drop cost ~10 % of the margin, not the accuracy.
 
-**`SCAN_ON_BLUE_MAX` IS SUPPLY-DEPENDENT.** The sensor moved from 5 V to 3V3 on 2026-08-20, which scaled every channel down ~3.5×. That left the old 3535 above *both* populations of the channel actually being read, so **every cell classified as cyan** and the check pass went blind — it reported "0–5 wrong" on 39 of 41 jobs (and `CHECK_FIX_MAX_SKIP = 5` then skipped the fix) while the board was visibly wrong. If the supply ever changes again, re-derive. 1112 is the geometric mean of the blue populations (√(518 × 2387)), giving 2.15× clear of each cluster — the same margin quality as the historical 5 V calibration.
+**Old logs are not column-comparable.** Slot semantics have changed twice; check the capture
+date before comparing dumps.
 
-**Old logs are not column-comparable.** Slot semantics have now changed twice. Captures **before 2026-08-20** have `b` carrying CLEAR and `c` carrying BLUE; captures after have `b` = BLUE. Check the capture date before comparing dumps.
+Don't reintroduce squared-Euclidean distance over raw RGBC: at 20% TCS3200 scaling the
+filter pulse can hit ~125 kHz, `b*b` overflows 32-bit `long`, and you get garbage. Also
+don't drop the **ambient subtraction** (LED off/on): without it, room-light shifts move both
+clusters and collapse the separation.
 
-**This retires the "unresolved full-board false positives" item.** Those were 12 of 666 on one pass reading 3291–5955 against a 3535 cut — i.e. a classifier running on a 2.1× channel with ~1.2× margin, which the two-row test could never reproduce because it was never a read-path fault. Blue's 4.6× separation is the fix.
-
-Don't reintroduce squared-Euclidean distance over raw RGBC: at 20% TCS3200 scaling the B-filter pulse can hit ~125 kHz, `b*b` overflows 32-bit `long`, and you get garbage. Also don't drop the **ambient subtraction** (LED off/on): without it, room-light shifts move both clusters and collapse the separation.
 
 ### HTTPS gotchas (do not re-litigate)
 The poll path uses raw `WiFiSSLClient` with a hand-written HTTP request, not `ArduinoHttpClient`. Reasons, all hit during prior debugging:

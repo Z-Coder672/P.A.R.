@@ -42,7 +42,7 @@
 //   commanded to ENGAGE / RELEASE / SCAN, so the physical board pattern is left
 //   exactly as found. Nothing here writes to the queue or the gallery.
 //
-//   It does not change SCAN_ON_BLUE_MAX or the classification maths — the
+//   It does not change SCAN_ON_CLEAR_MAX or the classification maths — the
 //   threshold and classifyDisc() are copied from PARMain verbatim so the logged
 //   verdict is the production verdict. This sketch MEASURES; retuning is a
 //   separate decision made from its output.
@@ -78,7 +78,7 @@
 //   the read path itself is suspect and not just its noise level. Whichever
 //   channel is broken, the other three are the cross-check.
 //   Then per cell:
-//     = <r>,<g>,<b>,<c> cls<0|1> mar<b-SCAN_ON_BLUE_MAX>
+//     = <r>,<g>,<b>,<c> cls<0|1> mar<b-SCAN_ON_CLEAR_MAX>
 //   the production ambient-subtracted result, the production verdict
 //   (cls1 = "front is cyan/on", i.e. BLUE < threshold), and the signed margin
 //   to the threshold, so near-misses are visible without post-processing.
@@ -118,8 +118,8 @@ const int GRID_H = 18;
 // ------------------------------------------------------------ experiment knobs
 // Rows under test. 16 and 17 are the bottom two bitmap rows (bitmap y=17 is the
 // bottom physical row — y is mirrored when computing coordinates).
-const int ROW_A = 16;
-const int ROW_B = 17;
+const int ROW_A = 3;
+const int ROW_B = 10;
 
 // How many times the SAME 74 cells are re-measured. This is the point of the
 // sketch: repeat-count turns one observation per cell into N, which is what
@@ -159,23 +159,21 @@ const int TCS_OUT = D8;
 const int LED_PIN = D10;
 const int LED_SETTLE_MS = 20;
 
-// S2/S3 select the photodiode filter bank.
+// S2/S3 select the photodiode filter bank. Datasheet names; whether they
+// are physically right on this rig is unresolved and does not matter.
 //
-// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
-// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
-// for values 1 and 2 -- the value assignments below already account for that.
-// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
-// and classifyDisc thresholds `b`.
-//
-// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
-// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
-// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
-// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
+// !! CHANNEL: classifyDisc thresholds the `c` slot -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Reversed 2026-08-22 from the 2026-08-20 decision
+// !! to threshold `b`; slot `b`'s two populations OVERLAP and cannot be
+// !! separated by any cut. Measured on 666 cells of full-board ground truth:
+// !! best achievable errors r=7 g=6 b=14 c=6, and 40 earlier jobs (26,640
+// !! cells) thresholding `c` scored 0.33%. Threshold and rationale live in
+// !! PARMain.ino -- keep this file in sync with it, do not re-derive here.
 enum TcsFilter {
-  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
-  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
-  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
-  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates ~as well as value 2, unused
 };
 
 // Servo link: hardware Serial2 TX on D9 → 5V ServoNano RX, 9600 8N1, one-way.
@@ -514,7 +512,7 @@ void initColorSensor() {
   digitalWrite(LED_PIN, LOW);  // LEDs off when idle
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 }
 
 // Count of pulseIn() calls that hit the timeout and returned 0 since the last
@@ -617,8 +615,8 @@ void readAmbientSubtractedVerbose(long& r, long& g, long& b, long& c) {
 //             full-board false positives (which read 3291..5955) came from.
 //     3535 -> 2.17x margin in BOTH directions. 0/444 misclassified on the
 //             two-class validation run at either value.
-const long SCAN_ON_BLUE_MAX = 3535;
-static inline uint8_t classifyDisc(long b) { return (b < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+const long SCAN_ON_CLEAR_MAX = 900;
+static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_CLEAR_MAX) ? 1 : 0; }
 
 // Sensor head offset from the flip actuator, identical to PARMain.
 const float SCAN_OFFSET_X = -24.005f;
@@ -650,7 +648,7 @@ void logCellRecord(unsigned long pass, int visit, int y, int x,
                i, f.lr, f.lg, f.lb, f.lc, f.lzeros, f.lbmn, f.lbmx);
   }
   plog::logf("= %ld,%ld,%ld,%ld cls%u mar%ld",
-             r, g, b, c, (unsigned)classifyDisc(b), b - SCAN_ON_BLUE_MAX);
+             r, g, b, c, (unsigned)classifyDisc(c), c - SCAN_ON_CLEAR_MAX);
 }
 
 // Measure the cell the head is already parked over and log it (no motion).
@@ -735,7 +733,7 @@ void setup() {
   plog::begin();
   plog::log("ScanBottomRowsTest booting — logging to flash");
   plog::logf("# rows %d,%d passes %lu flashes %d thresh %ld alt %d burst %d",
-             ROW_A, ROW_B, N_PASSES, AMBIENT_FLASHES, SCAN_ON_BLUE_MAX,
+             ROW_A, ROW_B, N_PASSES, AMBIENT_FLASHES, SCAN_ON_CLEAR_MAX,
              (int)ALTERNATE_ROW_ORDER, STATIC_BURST);
 
   // Reset cause: a brownout/WDT mid-run changes how the log should be read.

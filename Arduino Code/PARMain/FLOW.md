@@ -81,7 +81,7 @@ servo → ENGAGE (75°)   → settle 300ms  # rotates squisk 90°; NOT compensat
 G91; X -unload; G90                    # arm unload, still at ENGAGE (1.5 mm, 4.0 mm on the off-board edge cell)
 servo → REST (2°)      → settle 300ms
 G91; X (dx + unload); G90              # clearing slide — lands at cell + dx regardless of the unload
-servo → RELEASE (compensatedUs, ~793..921µs) → settle 100ms
+servo → RELEASE (compensatedUs, ~845..983µs) → settle 100ms
 G91; X (-dx ∓ FLIP_CATCH_EXTRA_X); G90 # catch stroke — sweeps 3.5 mm PAST the cell origin
 #ifdef FLIP_SECOND_CATCH               # default OFF — commented-out //#define near FLIP_OFFSET_X
   servo → RELEASE2 (compensated)→ settle 100ms  # second catch: arm a further ~10° lower
@@ -97,7 +97,7 @@ G91; X (-dx ∓ FLIP_CATCH_EXTRA_X); G90 # catch stroke — sweeps 3.5 mm PAST t
 
 **Catch stroke.** The return travels `−dx` **plus `FLIP_CATCH_EXTRA_X` (3.5 mm) further in the same direction**, so the arm sweeps past the cell origin instead of stopping on it — that is what completes the second 90° consistently. Only the return is lengthened; the clearing slide stays at `FLIP_OFFSET_X`. Each cell re-establishes absolute X with `moveTo(fx)`, so the extra travel cannot accumulate.
 
-**Lidar standoff compensation** (`LIDAR_COMP_MODE 1` — every cell). The arm is a lever that lies flat on the platform at `ARM_FLAT_DEG` (23°), so its perpendicular reach is `ARM_LEN_MM·sin(θ − FLAT)`; a cell whose standoff exceeds `LIDAR_REF_MM` (37.69) by *d* needs *d* more reach, giving `θ' = FLAT + asin(sin(θ − FLAT) + d/ARM_LEN_MM)`. `compensatedUs(baseUs, gx, gy)` applies that to `SERVO_US_RELEASE` per cell from the `LIDAR_FIT_CMM[18][37]` rod-bend table, and adds two terms **outside** the comp gate: `RELEASE_EXTRA_REACH_MM` (+2.0 mm global — shortened pusher pin, capped by rod compliance) and `RELEASE_EDGE_ROW_TRIM_MM` (−0.5 mm on the **top and bottom rows only**, whose rods sit closest to their mounts, are stiffest, and over-push at the interior's reach). Result over the board: **793..921 µs, mean 853**; nothing clamps at `SERVO_US_MIN`. `ARM_LEN_MM` is the arm's length — the pin trim is a linear reach demand and belongs in `RELEASE_EXTRA_REACH_MM`, not in the lever arm. `LIDAR_COMP_MODE 2` (masked paired trial) exists only in `FlipAllMaskedTest`; PARMain `#error`s on it.
+**Lidar standoff compensation** (`LIDAR_COMP_MODE 1` — every cell). The arm is a lever that lies flat on the platform at `ARM_FLAT_DEG` (23°), so its perpendicular reach is `ARM_LEN_MM·sin(θ − FLAT)`; a cell whose standoff exceeds `LIDAR_REF_MM` (37.69) by *d* needs *d* more reach, giving `θ' = FLAT + asin(sin(θ − FLAT) + d/ARM_LEN_MM)`. `compensatedUs(baseUs, gx, gy)` applies that to `SERVO_US_RELEASE` per cell from the `LIDAR_FIT_CMM[18][37]` rod-bend table, and adds two terms **outside** the comp gate: `RELEASE_EXTRA_REACH_MM` (+4.496 mm global — shortened pusher pin, plus the +60 µs that holds the top rows steady under the 2026-08-20 re-tilt) and `RELEASE_EDGE_ROW_TRIM_MM` (−0.5 mm on the **top and bottom rows only**, whose rods sit closest to their mounts, are stiffest, and over-push at the interior's reach). Result over the board: **845..983 µs, mean 913**; nothing clamps at `SERVO_US_MIN`. The `LIDAR_FIT_CMM` vertical gradient was **re-tilted 2026-08-20** (+0.2972 mm/row, mean-preserving) — the pass-4 table had it inverted, having subtracted a fictitious drift measured on calibration squares that move when the board does not. Four independent full-board scans put bottom−top at **+1.67 mm [+1.35, +1.98]** where the old table said −1.24 mm. `ARM_LEN_MM` is the arm's length — the pin trim is a linear reach demand and belongs in `RELEASE_EXTRA_REACH_MM`, not in the lever arm. `LIDAR_COMP_MODE 2` (masked paired trial) exists only in `FlipAllMaskedTest`; PARMain `#error`s on it.
 
 `dx = ±FLIP_OFFSET_X (16.8 mm)` — **− on inverted (LTR) rows, + on RTL rows** — and every stroke (clearing, unload, catch-with-extra) is capped so it never commands past `X=0` or `−X_TRAVEL`; the unload is *skipped* rather than clamped if it would breach. Simulated over all 666 cells × both row directions × all strokes: worst-case margins **12.775 mm at `X=0`** (col 36, row 17, RTL clearing slide) and **19.700 mm at `−X_TRAVEL`** (col 0, row 0, LTR clearing slide), zero breaches — so the caps never bind today; they're the net for future offset/pitch/skew changes.
 
@@ -127,7 +127,9 @@ Motion obeys the same conventions `scanGrid()` does, for the same reasons: **fli
 
 If the ranger never initialises, `lidarEnsure()` gives up after 10 attempts (re-initing I²C between them) and — **unlike `ScanColorLidarTest`, which halts** — the rig carries on printing. The day is recorded with `sensorOk = 0` and no cells, so a dead ranger costs one day of data instead of putting the rig in a loop that re-attempts a 50-minute sweep all day.
 
-**Flash record.** One fixed-layout `LidarScanRecord` at `/cadence.bin` on the **same LittleFS mount plog uses** — the factory `ffat` partition (`LittleFS.begin(true, "/littlefs", 10, "ffat")`; see `persistent_log.cpp` for why it is not `spiffs`). plog mounts it at boot; `cadenceFsReady()` re-calls `begin()` only as a guard for the case where that mount *failed*, which returns true immediately when the label is already mounted, so plog's files are never touched or reformatted. The struct holds magic / version / grid geometry / `sensorOk` / local `(tm_year, tm_yday)` / unix epoch / OK-cell count / `uint16_t dist10[666]` / an FNV-1a checksum over everything preceding it. Written temp-then-rename, same crash policy as plog's rotation. Anything unexpected on load — missing, wrong size, wrong magic/version/geometry, bad checksum — is treated as "no scan on record", so the failure direction is *re-scan*, never *skip*. **The stored `(year, yday)` is the authority for "has today's scan run"**, so a reboot at any hour resumes the schedule correctly. **If the flash write fails, the in-RAM record still counts** (`cadenceSaveRecord` marks it valid up front): a broken FS runs the schedule RAM-only until the next reboot — costing one extra scan after that reboot — instead of re-running the 50-minute sweep on every gate pass all day.
+**Flash record.** One fixed-layout `LidarScanRecord` at `/cadence.bin` on the **same LittleFS mount plog uses** — the factory `ffat` partition (`LittleFS.begin(true, "/littlefs", 10, "ffat")`; see `persistent_log.cpp` for why it is not `spiffs`). plog mounts it at boot; `cadenceFsReady()` re-calls `begin()` only as a guard for the case where that mount *failed*, which returns true immediately when the label is already mounted, so plog's files are never touched or reformatted. The struct (**version 2** since 2026-08-25) holds magic / version / grid geometry / `sensorOk` / local `(tm_year, tm_yday)` / unix epoch / OK-cell count / **the `rowsDone` + `(progYear, progYday)` checkpoint** / `uint16_t dist10[666]` / an FNV-1a checksum over everything preceding it. Written temp-then-rename, same crash policy as plog's rotation. Anything unexpected on load — missing, wrong size, wrong magic/version/geometry, bad checksum — is treated as "no scan on record", so the failure direction is *re-scan*, never *skip*. **The stored `(year, yday)` is the authority for "has today's scan run"**, so a reboot at any hour resumes the schedule correctly.
+
+**The sweep checkpoints every row.** `runDailyLidarScan()` writes the record at each row boundary with `rowsDone` and the `(progYear, progYday)` of the day in progress — deliberately *separate* fields from the `(year, yday)` done-stamp, which is still written only on completion, so a partial record can never read as done. On entry, a checkpoint from **the same local day** with `0 < rowsDone < GRID_H` resumes at visit-row `rowsDone` and keeps the cells already measured; anything else starts fresh. Before this, the record was stamped only at the end, so a mid-sweep MCU reset threw the whole pass away: on 2026-08-25 a serial-noise stall (see `grblIsOk`) reset the rig 7 times between 10:00 and 12:13, each boot restarting at cell 0 and never getting past row 8 of 18 — and since `cadenceGate()` only returns once the scan is done, the rig did not poll or print for three hours. A restart now costs at most one row. **If the flash write fails, the in-RAM record still counts** (`cadenceSaveRecord` marks it valid up front): a broken FS runs the schedule RAM-only until the next reboot — costing one extra scan after that reboot — instead of re-running the 50-minute sweep on every gate pass all day.
 
 `LidarScanRecord` is declared near the **top** of the .ino, next to `GRID_W`/`GRID_H` and far from the code that uses it, for the same reason `TcsFilter` is: the Arduino IDE injects its auto-generated forward declarations immediately above the first function in the file, so any type named in a function signature must be complete by that point.
 
@@ -137,7 +139,7 @@ It is a plain `delay()` loop, **not** light or deep sleep, on purpose: `delay()`
 
 Ordering in `cadenceGate()` is sleep **first**, then scan, so the morning wake always lands on the scan check and the day's first print draws against fresh standoff data.
 
-Log lines: `ntp start`/`ntp synced`/`ntp NOT synced`, `cadence: record …`, `cadence: lidar scan begin|end`, per-cell `ld y<y>c<x> <mm.t> n<samples> mn<min> mx<max>`, `cadence: sleep at HH:MM until 10:00`, `cadence: sleeping HH:MM`, `cadence: wake`, `cadence: no trusted clock - holding parked (no motion, no polling)`.
+Log lines: `ntp start`/`ntp synced`/`ntp NOT synced`, `cadence: record …`, `cadence: lidar scan begin|end`, `cadence: resuming lidar scan at row N/18`, `cadence: record saved … rowsN`, per-cell `ld y<y>c<x> <mm.t> n<samples> mn<min> mx<max>`, `cadence: sleep at HH:MM until 10:00`, `cadence: sleeping HH:MM`, `cadence: wake`, `cadence: no trusted clock - holding parked (no motion, no polling)`.
 
 ---
 
@@ -146,17 +148,35 @@ Log lines: `ntp start`/`ntp synced`/`ntp NOT synced`, `cadence: record …`, `ca
 TCS3200 measures R/G/B/Clear light frequencies, read with **LED ambient-subtraction**: `readAmbientSubtracted()` averages `AMBIENT_FLASHES` (3) off/on flashes, each subtracting a 5-frame LEDs-off (ambient) read from a 5-frame LEDs-on (lit) read. This cancels room light so the value depends only on the disc + our own LEDs.
 
 ```
-if blue <  SCAN_ON_BLUE_MAX (3535)  →  cyan/on (1)
-else                                →  black/off (0)
+if c <  SCAN_ON_CLEAR_MAX (900)  ->  cyan/on (1)
+else                             ->  black/off (0)
 ```
 
-Single threshold on the ambient-subtracted **BLUE** channel — the slot `tcsReadRGBC` returns as `b`, and the argument `classifyDisc(long b)` takes. The two faces separate by ~10×, so no model is needed (the ternary classifier was retired).
+Single threshold on one ambient-subtracted channel: the `c` slot of `tcsReadRGBC`, fed from
+TcsFilter value 2, commanded (S2=H, S3=L). No model (the ternary classifier is retired).
 
-**The TCS3200 S2/S3 select lines are crossed on this rig**, so a commanded (S2,S3) pair selects the filter the datasheet assigns to the *swapped* pair: values 0/3 land on RED/GREEN as printed, but value 1 is CLEAR (datasheet says BLUE) and value 2 is BLUE (datasheet says CLEAR). The `TcsFilter` labels name the **physical** filter — `TCS_CLEAR = 1`, `TCS_BLUE = 2` — so `b` really does hold blue and `c` really does hold clear. (They carried the datasheet names until Aug 2026 and were wrong on those two values; the relabel changed no commanded pin sequence and no verdict.) The invariant is that **`classifyDisc` thresholds BLUE** — it discriminates the two disc faces 10.22× where true clear manages only 2.22×. The enum's two value assignments are the only place the wiring is encoded, so if S2/S3 are ever rewired straight they must move with it.
+**Reversed 2026-08-22.** From 2026-08-20 the code thresholded the `b` slot (value 1) at
+1112. That is the wrong channel: its two populations overlap and no cut separates them.
+Ground truth, 666 cells of one check-pass scan compared against the source bitmap decoded
+from `gallery.php`, best achievable errors per slot: r = 7, g = 6, **b = 14**, **c = 6**.
+Live on `b` at 1112 the same scan scored **24**. Corroborated across 40 earlier jobs
+(ids 26–66, 26,640 cells) whose firmware thresholded `c`: 89 errors, **0.33 %**. On job 42
+that firmware scored 0 errors while the best possible score on `b` was 17 — `b` was never
+the channel being read, whatever the labels said.
 
-3535 is the geometric mean of the measured populations (black-back ceiling 1628, cyan-back floor 7677), replacing a historical 6000 that was lopsided toward the failing side. Full measurements are in `PARMain.ino` at `SCAN_ON_BLUE_MAX`; the wiring itself is documented in `Arduino Code/PINOUT.md`.
+Do **not** re-derive the channel from a sum test (unfiltered ≈ sum of filtered). That
+identity does not hold on this sensor at either supply — at 3V3 the `g` slot reads ~5× the
+`c` slot — and it is what produced both the "S2/S3 are crossed" theory and the 2026-08-20
+reversal of it. Measure against a known bitmap; the check pass gives you one for free.
 
-**The sensor views the disc BACK**: a displayed-on (cyan-front) disc shows its black back → reads LOW blue; displayed-off shows its cyan back → reads HIGH. `classifyDisc` returns the FRONT/displayed color (`on = blue below threshold`), matching `gridState`'s convention. Ambient subtraction removed the old "blown regime" (bright ambient made every cell read the same → garbled draw), so the former `SCAN_C_CEILING` guard / re-init recovery is gone.
+900 is the geometric mean of the clean cluster edges (cyan p95 = 494, black p05 = 1651).
+The error count is flat at 6–7 anywhere from ~700 to ~1400, so it sits mid-plateau.
+Separation at 3V3 is 4.93× (black p05 / cyan p95) against a 5 V-era median of 5.52×.
+**It is supply-dependent** — re-derive if the TCS3200 moves off 3V3. Old logs are not
+column-comparable: slot semantics have changed twice. Full measurements are in
+`PARMain.ino` at `SCAN_ON_CLEAR_MAX`; wiring is in `Arduino Code/PINOUT.md`.
+
+**The sensor views the disc BACK**: a displayed-on (cyan-front) disc shows its black back → reads LOW; displayed-off shows its cyan back → reads HIGH. `classifyDisc` returns the FRONT/displayed color (`on = channel below threshold`), matching `gridState`'s convention. Ambient subtraction removed the old "blown regime" (bright ambient made every cell read the same → garbled draw), so the former `SCAN_C_CEILING` guard / re-init recovery is gone.
 
 ---
 
@@ -166,6 +186,8 @@ GRBL's RX buffer = 128 bytes. Code tracks how many bytes are in-flight:
 
 - `sendGcode()` — blocks if buffer would overflow, then sends + tracks length
 - `drainResponses()` — reads GRBL replies; each `ok` frees the bytes for that command
+- **Response matching is tolerant, not exact.** `grblScrub()` drops non-printable bytes, then `grblIsOk()` / `grblHasError()` / `grblHasAlarm()` match on *substring*, not equality. Line noise arrives as junk glued to the front of a reply — `\xffok` (2026-08-23), then `Dok` / `Pok` / `Tok` / `Vok` / `}S?xok` (2026-08-25) — and an exact `resp == "ok"` treats each one as a lost ack: the queue slot is never dequeued, `bufferFill` never drains, and 60 s later the stall watchdog resets the MCU. `grblIsOk` accepts a line ≤ `GRBL_OK_MAX_JUNK_LEN` (8) chars containing `ok` and neither `error` nor `ALARM`; no legitimate GRBL response contains the substring `ok`, so nothing real can be swallowed. Recoveries are counted (`gRxCorruptOks`) and logged, because this masks a hardware fault
+- `grblDropIdleNoise()` — called at the top of `sendGcode()`. Whenever nothing is outstanding (`bufferFill == 0` and the queue is empty), anything already in the RX buffer is either a complete unsolicited line (logged as `GRBL idle line:`) or an orphan fragment with no newline, which is dropped before the next genuine `ok` can complete the line around it. That fragment *is* the corruption mechanism above
 - `waitForMotion()` — sends `G4 P0` (dwell) + `waitForIdle()` so `ok` means motion *actually finished*, not just "parsed into planner"
 
 ---
@@ -177,6 +199,7 @@ GRBL's RX buffer = 128 bytes. Code tracks how many bytes are in-flight:
 | GRBL `error:N` | Re-send the same command, up to `MAX_ERROR_RETRIES` (10) at 3 s spacing per same-command run; a clean `ok` resets the counter. Exhausted → park servo → `esp_restart()` |
 | GRBL `ALARM` | `grblAlarmRecover()` — Ctrl-X soft reset → `$H` → reassert modals → clear the queue → force a re-scan next job. Any sub-step failing → `esp_restart()` |
 | GRBL comms wedged (60 s no progress) | `grblStallReset()` — park servo → `esp_restart()` |
+| Reply corrupted by line noise | `grblScrub()` drops non-printables; `grblIsOk`/`grblHasError`/`grblHasAlarm` match by substring so a surviving printable junk byte can't lose the ack. Counted in `gRxCorruptOks` / `gRxIdleDropped` |
 | Servo command unacked (`SERVO_ACK_MODE 2`) | Re-send and **retry forever**. Blocking is the safe failure: every call site is reached with GRBL idle. Deliberately does *not* reset — a reset re-homes, and homing with the arm possibly at ENGAGE is how the arm broke |
 | WiFi down > 60 s | Park servo → `esp_restart()` |
 | WiFi/HTTP failure | Log, wait 10s, retry |
