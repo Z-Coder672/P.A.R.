@@ -237,12 +237,16 @@ function par_notify_gallery_complete(int $galleryId): void
  * The share blurb, shared by every channel so they all read identically.
  * Both links are inline in the sentence because most share intents give us
  * exactly one free-text field and no second slot for a URL.
+ *
+ * The sentence ends with a period, as specified. Note that some autolinkers
+ * greedily absorb punctuation directly following a URL at end-of-text; if the
+ * upload link ever arrives 404ing with a trailing '.', that is the cause.
  */
 function par_share_blurb(string $galleryUrl, string $uploadUrl): string
 {
     return 'Look what I made on P.A.R.: ' . $galleryUrl
         . '. P.A.R. is an interactive pixel art robot, and you can submit art'
-        . ' for free here: ' . $uploadUrl;
+        . ' for free here: ' . $uploadUrl . '.';
 }
 
 /**
