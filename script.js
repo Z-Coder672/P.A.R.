@@ -184,6 +184,44 @@ function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError } = {
     });
 }
 
+// Prints-done counter. Fed from the same gallery.php payload the latest
+// recording uses, so it costs no extra request. A print counts as done once
+// gallery.php reports pending=false (which it derives from the pending->info
+// rename OR the presence of a real photo).
+let printsDoneShown = null;
+
+function updatePrintsDone(items) {
+    const stat = document.getElementById('printsDoneStat');
+    const valueEl = document.getElementById('printsDoneValue');
+    const labelEl = document.getElementById('printsDoneLabel');
+    if (!stat || !valueEl || !labelEl) return;
+
+    const total = (items || []).filter(it => it && !it.pending).length;
+    labelEl.textContent = total === 1 ? 'print done' : 'prints done';
+    stat.classList.remove('hidden');
+
+    if (printsDoneShown === total) return;
+
+    // Count up on the first fill; jump straight to the value afterwards so a
+    // poll-driven refresh doesn't re-run the animation.
+    const from = printsDoneShown === null ? 0 : total;
+    printsDoneShown = total;
+    if (from === total) {
+        valueEl.textContent = String(total);
+        return;
+    }
+
+    const durationMs = 700;
+    const start = performance.now();
+    const step = (now) => {
+        const t = Math.min(1, (now - start) / durationMs);
+        const eased = 1 - Math.pow(1 - t, 3);
+        valueEl.textContent = String(Math.round(from + (total - from) * eased));
+        if (t < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+}
+
 // Latest recording: pull the gallery list (newest-first) and embed the most
 // recent entry that has a playable YouTube recording. No separate latest-video
 // store — the gallery is the single source of truth.
@@ -229,6 +267,7 @@ async function loadLatestRecording() {
         const resp = await fetch('/gallery.php');
         if (!resp.ok) throw new Error('gallery.php ' + resp.status);
         data = await resp.json();
+        updatePrintsDone(data.items);
     } catch (err) {
         console.error('Error loading latest recording:', err);
         if (token !== latestVideoToken) return;
@@ -1348,16 +1387,46 @@ let gridStateBeforeUpload = [];
 // Store processed image data
 let currentProcessedImage = null;
 
-// Crop state
+// ---------------------------------------------------------------------------
+// Photo crop: pan / zoom / rotate viewport
+//
+// Model: the view is center-based. `centerX/centerY` is where the image's own
+// center sits in canvas CSS pixels, `scale` is CSS-pixels-per-image-pixel, and
+// `rotation` is a quarter turn (0/90/180/270). Drawing is therefore
+// translate(center) -> rotate -> scale -> drawImage(-w/2, -h/2), which keeps
+// rotation independent of pan and zoom. Every input (mouse, touch, pen, wheel,
+// keyboard, buttons) funnels through setCropScale/panCrop/clampCropOffsets, and
+// painting is rAF-coalesced, so no handler ever draws more than once a frame.
+// ---------------------------------------------------------------------------
+
+const CROP_OUTPUT_SCALE = 20;      // crop is rasterized at 20x the 37x18 grid
+const CROP_MAX_ZOOM_FACTOR = 16;   // max zoom, relative to the fit-whole-image scale
+const CROP_MIN_ZOOM_FACTOR = 0.2;  // min zoom, relative to fit — lets you shrink into black margins
+const CROP_KEEP_VISIBLE = 0.25;    // fraction of the overlap that must stay on screen while panning
+const CROP_WHEEL_SENSITIVITY = 0.0025;
+
 let cropState = {
-    offsetX: 0,
-    offsetY: 0,
+    image: null,
     scale: 1,
-    isDragging: false,
-    dragStartX: 0,
-    dragStartY: 0,
-    image: null
+    minScale: 1,
+    maxScale: 1,
+    rotation: 0,
+    centerX: 0,
+    centerY: 0,
+    viewW: 0,
+    viewH: 0
 };
+
+let cropCtx = null;
+let cropDrawQueued = false;
+let cropListenersBound = false;
+let cropResizeObserver = null;
+const cropPointers = new Map();   // pointerId -> {x, y}
+let cropPinch = null;             // {dist, centroid} carried between move events
+
+function cropCanvasEl() {
+    return document.getElementById('cropCanvas');
+}
 
 // Save current grid state
 function saveGridState() {
@@ -1381,157 +1450,440 @@ function restoreGridState() {
     persistGridState(gridStateBeforeUpload);
 }
 
-// Get cropped image as canvas
+// Image dimensions as they appear on screen at scale 1 — width and height swap
+// on the quarter turns, which is what makes a portrait photo fit a landscape
+// frame after a rotate.
+function cropBaseSize() {
+    const quarterTurned = cropState.rotation === 90 || cropState.rotation === 270;
+    return {
+        w: quarterTurned ? cropState.image.height : cropState.image.width,
+        h: quarterTurned ? cropState.image.width : cropState.image.height
+    };
+}
+
+// Fit = whole image inside the frame; cover = image fills the frame. Zooming
+// out past `fit` is allowed (down to CROP_MIN_ZOOM_FACTOR) so a photo can be
+// shrunk into black margins — the black is part of the crop and prints as off
+// pixels, which is a legitimate composition, not a mistake.
+function cropScaleBounds() {
+    const base = cropBaseSize();
+    const fit = Math.min(cropState.viewW / base.w, cropState.viewH / base.h);
+    const cover = Math.max(cropState.viewW / base.w, cropState.viewH / base.h);
+    return {
+        fit,
+        cover,
+        min: fit * CROP_MIN_ZOOM_FACTOR,
+        max: Math.max(fit * CROP_MAX_ZOOM_FACTOR, cover * 4)
+    };
+}
+
+// The image may be dragged out past the frame edges — you often want a subject
+// pushed to one side with black filling the rest. The only rule is that a
+// sliver stays on screen, so it can never be flung out of reach.
+function clampCropOffsets() {
+    if (!cropState.image) return;
+
+    const base = cropBaseSize();
+    const dispW = base.w * cropState.scale;
+    const dispH = base.h * cropState.scale;
+
+    const keepX = Math.max(16, Math.min(dispW, cropState.viewW) * CROP_KEEP_VISIBLE);
+    const keepY = Math.max(16, Math.min(dispH, cropState.viewH) * CROP_KEEP_VISIBLE);
+
+    cropState.centerX = Math.min(
+        Math.max(cropState.centerX, keepX - dispW / 2),
+        cropState.viewW - keepX + dispW / 2
+    );
+    cropState.centerY = Math.min(
+        Math.max(cropState.centerY, keepY - dispH / 2),
+        cropState.viewH - keepY + dispH / 2
+    );
+}
+
+// Zoom about a fixed point in canvas space, so the pixel under the cursor /
+// pinch centroid stays put.
+function setCropScale(nextScale, anchorX, anchorY) {
+    if (!cropState.image) return;
+
+    const clamped = Math.min(Math.max(nextScale, cropState.minScale), cropState.maxScale);
+    if (clamped === cropState.scale) return;
+
+    const ratio = clamped / cropState.scale;
+    cropState.centerX = anchorX + (cropState.centerX - anchorX) * ratio;
+    cropState.centerY = anchorY + (cropState.centerY - anchorY) * ratio;
+    cropState.scale = clamped;
+
+    clampCropOffsets();
+    requestCropDraw();
+}
+
+function panCrop(dx, dy) {
+    cropState.centerX += dx;
+    cropState.centerY += dy;
+    clampCropOffsets();
+    requestCropDraw();
+}
+
+// Quarter-turn the view about the frame center, so whatever is framed stays
+// framed. `dir` is +1 for clockwise, -1 for counter-clockwise.
+function rotateCrop(dir) {
+    if (!cropState.image) return;
+
+    cropState.rotation = (cropState.rotation + (dir > 0 ? 90 : 270)) % 360;
+
+    // Carry the image center around the same turn about the frame center.
+    const fx = cropState.viewW / 2;
+    const fy = cropState.viewH / 2;
+    const vx = cropState.centerX - fx;
+    const vy = cropState.centerY - fy;
+    cropState.centerX = fx + (dir > 0 ? -vy : vy);
+    cropState.centerY = fy + (dir > 0 ? vx : -vx);
+
+    // Swapping width and height moves the zoom limits, so re-derive them and
+    // pull the current zoom back into range.
+    const b = cropScaleBounds();
+    cropState.minScale = b.min;
+    cropState.maxScale = b.max;
+    cropState.scale = Math.min(Math.max(cropState.scale, b.min), b.max);
+
+    clampCropOffsets();
+    requestCropDraw();
+}
+
+// Fit the whole image inside the frame, centered. Keeps the current rotation.
+function resetCropView() {
+    if (!cropState.image || !cropState.viewW || !cropState.viewH) return;
+
+    const b = cropScaleBounds();
+
+    cropState.minScale = b.min;
+    cropState.maxScale = b.max;
+    cropState.scale = b.fit;
+    cropState.centerX = cropState.viewW / 2;
+    cropState.centerY = cropState.viewH / 2;
+
+    requestCropDraw();
+}
+
+// Match the backing store to the CSS box (and DPR) without reallocating it on
+// every frame. Preserves whatever the user is looking at across a resize or a
+// device rotation by scaling the view about the frame center.
+function syncCropCanvasSize() {
+    const canvas = cropCanvasEl();
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const cssW = Math.max(1, Math.round(rect.width));
+    const cssH = Math.max(1, Math.round(rect.height));
+    const dpr = window.devicePixelRatio || 1;
+    const bw = Math.round(cssW * dpr);
+    const bh = Math.round(cssH * dpr);
+
+    const prevW = cropState.viewW;
+    const prevH = cropState.viewH;
+
+    if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+        cropCtx = canvas.getContext('2d');
+    } else if (!cropCtx) {
+        cropCtx = canvas.getContext('2d');
+    }
+
+    cropState.viewW = cssW;
+    cropState.viewH = cssH;
+    cropCtx.setTransform(bw / cssW, 0, 0, bh / cssH, 0, 0);
+
+    if (!cropState.image) return;
+
+    if (prevW && prevH) {
+        const k = cssW / prevW;
+        cropState.centerX = cssW / 2 + (cropState.centerX - prevW / 2) * k;
+        cropState.centerY = cssH / 2 + (cropState.centerY - prevH / 2) * (cssH / prevH);
+
+        const b = cropScaleBounds();
+        cropState.minScale = b.min;
+        cropState.maxScale = b.max;
+        cropState.scale = Math.min(Math.max(cropState.scale * k, b.min), b.max);
+        clampCropOffsets();
+    } else {
+        resetCropView();
+    }
+
+    requestCropDraw();
+}
+
+function requestCropDraw() {
+    if (cropDrawQueued) return;
+    cropDrawQueued = true;
+    requestAnimationFrame(() => {
+        cropDrawQueued = false;
+        drawCrop();
+    });
+}
+
+// Shared by the on-screen preview and the exported crop, so what you see is
+// exactly what gets pixelated.
+function paintCrop(ctx) {
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.translate(cropState.centerX, cropState.centerY);
+    ctx.rotate(cropState.rotation * Math.PI / 180);
+    ctx.scale(cropState.scale, cropState.scale);
+    ctx.drawImage(cropState.image, -cropState.image.width / 2, -cropState.image.height / 2);
+    ctx.restore();
+}
+
+function drawCrop() {
+    const canvas = cropCanvasEl();
+    if (!canvas || !cropCtx) return;
+
+    cropCtx.fillStyle = '#000000';
+    cropCtx.fillRect(0, 0, cropState.viewW, cropState.viewH);
+
+    if (!cropState.image) return;
+    paintCrop(cropCtx);
+}
+
+// Rasterize the visible frame at 20x the LED grid, so processImage() has real
+// detail to downsample from instead of a screen-resolution thumbnail.
 function getCroppedImage() {
-    const canvas = document.getElementById('cropCanvas');
-    const displayWidth = canvas.offsetWidth;
-    const displayHeight = canvas.offsetHeight;
+    const outW = GRID_WIDTH * CROP_OUTPUT_SCALE;
+    const outH = GRID_HEIGHT * CROP_OUTPUT_SCALE;
 
     const resultCanvas = document.createElement('canvas');
-    resultCanvas.width = displayWidth;
-    resultCanvas.height = displayHeight;
+    resultCanvas.width = outW;
+    resultCanvas.height = outH;
     const ctx = resultCanvas.getContext('2d');
 
     ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, displayWidth, displayHeight);
+    ctx.fillRect(0, 0, outW, outH);
 
-    if (cropState.image) {
+    if (cropState.image && cropState.viewW && cropState.viewH) {
         ctx.save();
-        ctx.translate(cropState.offsetX, cropState.offsetY);
-        ctx.scale(cropState.scale, cropState.scale);
-        ctx.drawImage(cropState.image, 0, 0);
+        ctx.scale(outW / cropState.viewW, outH / cropState.viewH);
+        paintCrop(ctx);
         ctx.restore();
     }
 
     return resultCanvas;
 }
 
-// Update crop image display
-function updateCropDisplay() {
-    const canvas = document.getElementById('cropCanvas');
-    if (!canvas || !cropState.image) return;
+function cropPointerPos(e) {
+    const rect = cropCanvasEl().getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
 
-    const ctx = canvas.getContext('2d');
-    const displayWidth = canvas.offsetWidth;
-    const displayHeight = canvas.offsetHeight;
+function cropPointerCentroid() {
+    let sx = 0, sy = 0;
+    cropPointers.forEach(p => { sx += p.x; sy += p.y; });
+    return { x: sx / cropPointers.size, y: sy / cropPointers.size };
+}
 
-    canvas.width = displayWidth;
-    canvas.height = displayHeight;
+function cropPointerSpread() {
+    const pts = Array.from(cropPointers.values());
+    if (pts.length < 2) return 0;
+    return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+}
 
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, displayWidth, displayHeight);
+function onCropPointerDown(e) {
+    const canvas = cropCanvasEl();
+    if (!cropState.image) return;
 
-    ctx.save();
-    ctx.translate(cropState.offsetX, cropState.offsetY);
-    ctx.scale(cropState.scale, cropState.scale);
-    ctx.drawImage(cropState.image, 0, 0);
-    ctx.restore();
+    canvas.setPointerCapture(e.pointerId);
+    cropPointers.set(e.pointerId, cropPointerPos(e));
+    cropPinch = cropPointers.size >= 2
+        ? { dist: cropPointerSpread(), centroid: cropPointerCentroid() }
+        : { dist: 0, centroid: cropPointerCentroid() };
+    canvas.classList.add('is-grabbing');
+    e.preventDefault();
+}
+
+function onCropPointerMove(e) {
+    if (!cropPointers.has(e.pointerId) || !cropState.image) return;
+    e.preventDefault();
+
+    cropPointers.set(e.pointerId, cropPointerPos(e));
+
+    const centroid = cropPointerCentroid();
+    const spread = cropPointerSpread();
+
+    if (cropPointers.size >= 2 && cropPinch && cropPinch.dist > 0 && spread > 0) {
+        // Pinch: zoom about the centroid, and let the centroid drag too.
+        setCropScale(cropState.scale * (spread / cropPinch.dist), centroid.x, centroid.y);
+    }
+
+    if (cropPinch) {
+        panCrop(centroid.x - cropPinch.centroid.x, centroid.y - cropPinch.centroid.y);
+    }
+
+    cropPinch = { dist: spread, centroid };
+}
+
+function onCropPointerUp(e) {
+    const canvas = cropCanvasEl();
+    if (!cropPointers.has(e.pointerId)) return;
+
+    cropPointers.delete(e.pointerId);
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+
+    // Re-baseline so lifting one finger of a pinch doesn't jump the image.
+    cropPinch = cropPointers.size
+        ? { dist: cropPointerSpread(), centroid: cropPointerCentroid() }
+        : null;
+
+    if (!cropPointers.size) canvas.classList.remove('is-grabbing');
+}
+
+function onCropWheel(e) {
+    if (!cropState.image) return;
+    e.preventDefault();
+
+    // Normalize across deltaMode so a trackpad glides and a wheel notch steps.
+    let delta = e.deltaY;
+    if (e.deltaMode === 1) delta *= 16;
+    else if (e.deltaMode === 2) delta *= cropState.viewH;
+
+    const pos = cropPointerPos(e);
+    setCropScale(cropState.scale * Math.exp(-delta * CROP_WHEEL_SENSITIVITY), pos.x, pos.y);
+}
+
+function onCropDoubleClick(e) {
+    if (!cropState.image) return;
+    e.preventDefault();
+
+    const pos = cropPointerPos(e);
+    const b = cropScaleBounds();
+
+    if (cropState.scale > b.cover * 1.01) {
+        resetCropView();
+    } else {
+        setCropScale(b.cover, pos.x, pos.y);
+    }
+}
+
+function onCropKeyDown(e) {
+    if (!cropState.image) return;
+
+    const step = e.shiftKey ? 40 : 10;
+    const cx = cropState.viewW / 2;
+    const cy = cropState.viewH / 2;
+
+    switch (e.key) {
+        case 'ArrowLeft':  panCrop(step, 0); break;
+        case 'ArrowRight': panCrop(-step, 0); break;
+        case 'ArrowUp':    panCrop(0, step); break;
+        case 'ArrowDown':  panCrop(0, -step); break;
+        case '+':
+        case '=':          setCropScale(cropState.scale * 1.2, cx, cy); break;
+        case '-':
+        case '_':          setCropScale(cropState.scale / 1.2, cx, cy); break;
+        case '0':          resetCropView(); break;
+        case 'r':          rotateCrop(1); break;
+        case 'R':          rotateCrop(-1); break;
+        default: return;
+    }
+    e.preventDefault();
+}
+
+// Bound exactly once for the lifetime of the page. The old code re-bound on
+// every modal open, stacking a fresh document-level mousemove handler per photo.
+function bindCropListeners() {
+    if (cropListenersBound) return;
+    const canvas = cropCanvasEl();
+    if (!canvas) return;
+
+    canvas.addEventListener('pointerdown', onCropPointerDown);
+    canvas.addEventListener('pointermove', onCropPointerMove);
+    canvas.addEventListener('pointerup', onCropPointerUp);
+    canvas.addEventListener('pointercancel', onCropPointerUp);
+    canvas.addEventListener('lostpointercapture', onCropPointerUp);
+    canvas.addEventListener('wheel', onCropWheel, { passive: false });
+    canvas.addEventListener('dblclick', onCropDoubleClick);
+    canvas.addEventListener('keydown', onCropKeyDown);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    canvas.addEventListener('dragstart', e => e.preventDefault());
+
+    const on = (id, fn) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('click', fn);
+    };
+    on('cropZoomIn', () => setCropScale(cropState.scale * 1.25, cropState.viewW / 2, cropState.viewH / 2));
+    on('cropZoomOut', () => setCropScale(cropState.scale / 1.25, cropState.viewW / 2, cropState.viewH / 2));
+    on('cropReset', resetCropView);
+    on('cropRotateLeft', () => rotateCrop(-1));
+    on('cropRotateRight', () => rotateCrop(1));
+
+    if (window.ResizeObserver) {
+        cropResizeObserver = new ResizeObserver(() => {
+            if (!document.getElementById('cropModal').classList.contains('hidden')) {
+                syncCropCanvasSize();
+            }
+        });
+        cropResizeObserver.observe(canvas);
+    } else {
+        window.addEventListener('resize', syncCropCanvasSize);
+    }
+
+    cropListenersBound = true;
+}
+
+function closeCropModal() {
+    document.getElementById('cropModal').classList.add('hidden');
+    document.body.classList.remove('modal-open');
+    cropPointers.clear();
+    cropPinch = null;
+
+    if (cropState.image && typeof cropState.image.close === 'function') {
+        cropState.image.close();
+    }
+    cropState.image = null;
 }
 
 // Initialize crop modal
-function initializeCropModal(imageUrl) {
+function initializeCropModal(imageSrc) {
     const cropModal = document.getElementById('cropModal');
-    const canvas = document.getElementById('cropCanvas');
-
-    cropModal.classList.remove('hidden');
-
-    const img = new Image();
-    img.onload = function() {
-        createImageBitmap(img).then(bitmap => {
-            cropState.image = bitmap;
-
-            const displayWidth = canvas.offsetWidth;
-            const displayHeight = canvas.offsetHeight;
-            const frameAspect = displayWidth / displayHeight;
-            const imageAspect = img.width / img.height;
-
-            if (imageAspect > frameAspect) {
-                cropState.scale = displayHeight / img.height;
-            } else {
-                cropState.scale = displayWidth / img.width;
-            }
-
-            const scaledWidth = img.width * cropState.scale;
-            const scaledHeight = img.height * cropState.scale;
-            cropState.offsetX = (displayWidth - scaledWidth) / 2;
-            cropState.offsetY = (displayHeight - scaledHeight) / 2;
-
-            updateCropDisplay();
-            setTimeout(setupCropFrameListeners, 100);
-        });
-    };
-    img.crossOrigin = 'anonymous';
-    img.src = imageUrl;
-}
-
-// Set up crop frame event listeners
-function setupCropFrameListeners() {
-    const canvas = document.getElementById('cropCanvas');
+    const canvas = cropCanvasEl();
     if (!canvas) return;
 
-    canvas.addEventListener('mousedown', function(e) {
-        cropState.isDragging = true;
-        cropState.dragStartX = e.clientX - cropState.offsetX;
-        cropState.dragStartY = e.clientY - cropState.offsetY;
-    });
+    const img = new Image();
+    img.decoding = 'async';
 
-    document.addEventListener('mousemove', function(e) {
-        if (!cropState.isDragging || !cropState.image) return;
-
-        const canvas = document.getElementById('cropCanvas');
-        if (!canvas) return;
-
-        cropState.offsetX = e.clientX - cropState.dragStartX;
-        cropState.offsetY = e.clientY - cropState.dragStartY;
-
-        const scaledWidth = cropState.image.width * cropState.scale;
-        const scaledHeight = cropState.image.height * cropState.scale;
-        const displayWidth = canvas.offsetWidth;
-        const displayHeight = canvas.offsetHeight;
-
-        if (scaledWidth >= displayWidth) {
-            cropState.offsetX = Math.min(0, Math.max(cropState.offsetX, displayWidth - scaledWidth));
-        } else {
-            cropState.offsetX = Math.max(displayWidth - scaledWidth, Math.min(0, cropState.offsetX));
+    img.onload = async function() {
+        let source = img;
+        try {
+            source = await createImageBitmap(img);
+        } catch (err) {
+            // Safari can refuse createImageBitmap on some sources; the <img>
+            // draws identically, it just costs a bit more per frame.
+            console.warn('createImageBitmap failed, drawing from <img>', err);
         }
 
-        if (scaledHeight >= displayHeight) {
-            cropState.offsetY = Math.min(0, Math.max(cropState.offsetY, displayHeight - scaledHeight));
-        } else {
-            cropState.offsetY = Math.max(displayHeight - scaledHeight, Math.min(0, cropState.offsetY));
+        if (cropState.image && typeof cropState.image.close === 'function') {
+            cropState.image.close();
         }
 
-        updateCropDisplay();
-    });
+        cropState.image = source;
+        cropState.rotation = 0;
+        cropState.viewW = 0;
+        cropState.viewH = 0;
 
-    document.addEventListener('mouseup', function() {
-        cropState.isDragging = false;
-    });
+        cropModal.classList.remove('hidden');
+        document.body.classList.add('modal-open');
 
-    canvas.addEventListener('wheel', function(e) {
-        e.preventDefault();
-        if (!cropState.image) return;
+        bindCropListeners();
+        // The modal must be visible before the canvas has a measurable box.
+        syncCropCanvasSize();
+        resetCropView();
+    };
 
-        const rect = canvas.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        const displayWidth = canvas.offsetWidth;
-        const displayHeight = canvas.offsetHeight;
+    img.onerror = function() {
+        setQueueStatus('Could not read that image.', true);
+        fileInput.value = '';
+    };
 
-        const zoomSpeed = 0.03;
-        const oldScale = cropState.scale;
-
-        const minScaleX = displayWidth / cropState.image.width;
-        const minScaleY = displayHeight / cropState.image.height;
-        const minScale = Math.min(minScaleX, minScaleY);
-
-        cropState.scale = Math.max(minScale, Math.min(3, cropState.scale * (e.deltaY > 0 ? (1 - zoomSpeed) : (1 + zoomSpeed))));
-
-        cropState.offsetX = mouseX - (mouseX - cropState.offsetX) * (cropState.scale / oldScale);
-        cropState.offsetY = mouseY - (mouseY - cropState.offsetY) * (cropState.scale / oldScale);
-
-        updateCropDisplay();
-    }, { passive: false });
+    img.src = imageSrc;
 }
 
 // Process image: downscale to 37x18, convert to black/white based on threshold
@@ -1539,8 +1891,10 @@ function processImage(canvas, blackPoint) {
     const processCanvas = document.createElement('canvas');
     processCanvas.width = GRID_WIDTH;
     processCanvas.height = GRID_HEIGHT;
-    const ctx = processCanvas.getContext('2d');
+    const ctx = processCanvas.getContext('2d', { willReadFrequently: true });
 
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(canvas, 0, 0, GRID_WIDTH, GRID_HEIGHT);
 
     const imageData = ctx.getImageData(0, 0, GRID_WIDTH, GRID_HEIGHT);
@@ -1636,7 +1990,7 @@ document.getElementById('confirmCrop').addEventListener('click', function() {
     const croppedCanvas = getCroppedImage();
     currentProcessedImage = croppedCanvas;
 
-    document.getElementById('cropModal').classList.add('hidden');
+    closeCropModal();
 
     const uploadModal = document.getElementById('uploadModal');
     uploadModal.classList.remove('hidden');
@@ -1658,9 +2012,8 @@ document.getElementById('confirmCrop').addEventListener('click', function() {
 // Handle cancel crop
 document.getElementById('cancelCrop').addEventListener('click', function() {
     restoreGridState();
-    document.getElementById('cropModal').classList.add('hidden');
+    closeCropModal();
     fileInput.value = '';
-    cropState.image = null;
     currentProcessedImage = null;
 });
 
