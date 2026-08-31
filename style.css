@@ -1823,3 +1823,23 @@ body.modal-open {
         padding-bottom: 1rem;
     }
 }
+
+/* Global site footer (Privacy / Terms) — matches the legal pages */
+.site-footer {
+    border-top: 1px solid #2a2a2a;
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 1.5rem;
+    color: #888888;
+    font-size: 0.85rem;
+    text-align: center;
+}
+
+.site-footer a {
+    color: #888888;
+    text-decoration: none;
+}
+
+.site-footer a:hover {
+    color: #02b2d9;
+}
