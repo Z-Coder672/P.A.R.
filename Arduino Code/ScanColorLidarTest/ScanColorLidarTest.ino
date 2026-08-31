@@ -19,7 +19,7 @@
 //     The calibration offset is COLOR-DEPENDENT — that's one reason the color
 //     scan runs at all: both sensors view the disc's BACK, and the ToF reading
 //     lands differently on the two back colors. The same-row color read
-//     classifies each cell's back (clear < SCAN_ON_BLUE_MAX → black back).
+//     classifies each cell's back (BLUE < SCAN_ON_CLEAR_MAX → black back).
 //     The class is logged on every lidar cell marker.
 //
 // RAW MODE (LIDAR_APPLY_CALIBRATION 0, the current setting): the firmware
@@ -55,6 +55,13 @@
 // A per-cell color→lidar ordering would need a mid-field 6 mm Y move at every
 // cell, which that convention forbids.
 //
+// TOP ROW (y=0) IS COLOR-SCANNED BUT NOT LIDAR-SCANNED (LIDAR_SKIP_TOP_ROW).
+// At the lidar Y the head sits +14 mm above the cell, and up there it JAMS
+// against the frame across the right-hand side of the row. The color sub-sweep
+// (+8 mm) still runs on row 0, so the row's colour data is unaffected; its
+// standoff comes from projecting the offline per-column cubic fit onto y=0
+// instead of from a measurement.
+//
 // The flip arm is parked at SERVO_US_REST for the ENTIRE scan and never
 // dropped, so the physical board pattern is left undisturbed (set a known
 // pattern and compare the logged samples against it).
@@ -78,7 +85,8 @@
 //     # y=<y> x=<x>                         (cell marker)
 //     <r>,<g>,<b>,<c>                       (ONE 3-flash ambient-subtracted read)
 //     ...37 cells...
-//     # row <y> lidar
+//     # row <y> lidar                       (or `# row 0 lidar SKIPPED ...` — the
+//                                            top row has no lidar cells at all)
 //     # y=<y> x=<x> back=<black|cyan>       (cell marker, R→L order; back color
 //                                            from this row's color sweep → which
 //                                            distance offset was applied)
@@ -160,21 +168,30 @@ const int LIDAR_MAX_SAMPLES = 100;  // cap; 4 s / 50 ms ≈ 80 + slack
 
 VL53L4CD lidar;
 
-// S2/S3 select the photodiode filter bank.
+// S2/S3 select the photodiode filter bank. Datasheet names; whether they
+// are physically right on this rig is unresolved and does not matter.
+//
+// !! CHANNEL: classifyDisc thresholds the `c` slot -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Reversed 2026-08-22 from the 2026-08-20 decision
+// !! to threshold `b`; slot `b`'s two populations OVERLAP and cannot be
+// !! separated by any cut. Measured on 666 cells of full-board ground truth:
+// !! best achievable errors r=7 g=6 b=14 c=6, and 40 earlier jobs (26,640
+// !! cells) thresholding `c` scored 0.33%. Threshold and rationale live in
+// !! PARMain.ino -- keep this file in sync with it, do not re-derive here.
 enum TcsFilter {
-  TCS_RED = 0,    // S2=L, S3=L
-  TCS_BLUE = 1,   // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates ~as well as value 2, unused
 };
 
 // Servo control offloaded to a dedicated 5V Arduino Nano over a bit-banged TX
-// line on Arduino D9 → 5V Nano D0 RX, shared GND, one-way. 9600-baud software
+// line on Arduino D9 → 5V Nano D2 RX (SoftwareSerial; D0 is its USB debug echo), shared GND, one-way. 9600-baud software
 // UART (mbed's UART class on an arbitrary PinName crashed the chip). See
 // PARMain.ino / ServoNano.ino for the full rationale.
 const int SERVO_TX_PIN = D9;
 
-const int SERVO_US_REST = 544;  // ≈0°, arm parked (the ONLY angle this test uses)
+const int SERVO_US_REST = 565;  // ≈2°, arm parked (the ONLY angle this test uses)
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 
@@ -551,7 +568,7 @@ void initColorSensor() {
   digitalWrite(LED_PIN, LOW);  // LEDs off when idle
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 }
 
 // OUT is a 50%-duty square wave whose frequency tracks light intensity for the
@@ -577,12 +594,12 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
     tcsSelect(TCS_GREEN);
     delay(2);
     sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);
-    delay(2);
-    sb += tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR);
     delay(2);
     sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);
+    delay(2);
+    sb += tcsReadFrequencyHz();
   }
   r = sr / 5;
   g = sg / 5;
@@ -613,17 +630,18 @@ void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
   b = sb / AMBIENT_FLASHES; c = sc / AMBIENT_FLASHES;
 }
 
-// Back-color classification cut on the ambient-subtracted clear channel
+// Back-color classification cut on the ambient-subtracted BLUE channel
 // (PARMain's production threshold). POLARITY: the sensor views the disc's
 // BACK — clear BELOW the cut means it's looking at a black back (displayed
 // front = cyan/on); clear above means a cyan back (displayed front = off).
 // Classification threshold. Physically the BLUE channel, not clear — the S2/S3
-// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// select lines are crossed on this rig; the enum labels name the PHYSICAL
+// filter, so tcsReadRGBC's `b` output holds true BLUE and `c` holds true CLEAR.
 // That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
 // Full explanation and the measurements are in PARMain.ino at this constant.
 // 3535 = geometric mean of the measured populations; was 6000, which was
 // lopsided (3.69x / 1.28x) toward the failure side.
-const long SCAN_ON_BLUE_MAX = 3535;
+const long SCAN_ON_CLEAR_MAX = 900;
 
 // One per-cell distance estimate. Collects blocking reads of the free-running
 // ranger for LIDAR_WINDOW_MS (window starts fresh here — the caller invokes
@@ -797,6 +815,22 @@ static inline int rowAt(int i) {
 #endif
 }
 
+// The top row's lidar sub-sweep is SKIPPED. The lidar rides +14 mm above the
+// cell (vs the color sensor's +8 mm), and at that height the head jams against
+// the frame over the right-hand end of row 0. Row 0 is still COLOR-scanned at
+// the color Y, where there is clearance; its standoff is filled in offline by
+// projecting the per-column cubic fit onto y=0. Set to 0 to restore the
+// measurement if that interference is ever removed.
+#define LIDAR_SKIP_TOP_ROW 1
+static inline bool lidarRowSkipped(int y) {
+#if LIDAR_SKIP_TOP_ROW
+  return y == 0;
+#else
+  (void)y;
+  return false;
+#endif
+}
+
 // One full scan sweep. The flip arm stays parked at SERVO_US_REST the entire
 // time, so the physical board pattern is undisturbed. Each row is covered
 // twice: a COLOR sub-sweep L→R at the color-sensor Y, then a LIDAR sub-sweep
@@ -847,15 +881,17 @@ void doScan() {
     for (int x = 0; x < GRID_W; x++) {
       long r, g, b, c;
       readAmbientSubtracted(r, g, b, c);
-      rowBackBlack[x] = (c < SCAN_ON_BLUE_MAX);
+      rowBackBlack[x] = (c < SCAN_ON_CLEAR_MAX);
 
       if (x < GRID_W - 1) {
         moveTo(colorX(y, x + 1), colorY(y, x + 1));  // intra-row (pure X)
-      } else {
+      } else if (!lidarRowSkipped(y)) {
         // Cross to this row's lidar sweep start: the +3 mm Y hop rides the
         // X=0 edge leg (nearest limit — we're at the row's right end).
         moveToYSafe(lidarX(y, GRID_W - 1), lidarY(y, GRID_W - 1));
       }
+      // else: no lidar sweep on this row — the skip block below owns the
+      // cross-row leg (and the mid-scan rehome), so start nothing here.
 
       plog::logf("# y=%d x=%d", y, x);
       plog::logf("%ld,%ld,%ld,%ld", r, g, b, c);
@@ -864,6 +900,19 @@ void doScan() {
     }
 
     // ---- LIDAR sub-sweep, R→L at the lidar Y ----
+    if (lidarRowSkipped(y)) {
+      // No lidar cells for this row at all — the head would jam at the lidar Y.
+      // Mirror the lidar sweep's tail: rehome if this is the midpoint of the
+      // visit order, then take the safe edge leg to the next row's color start.
+      plog::logf("# row %d lidar SKIPPED (jams at lidar Y; standoff from the projected cubic fit)", y);
+      if (yNext >= 0) {
+        if (i == 8) rehome();
+        moveToYSafe(colorX(yNext, 0), colorY(yNext, 0));
+        waitForMotion();
+      }
+      continue;
+    }
+
     plog::logf("# row %d lidar", y);
     for (int x = GRID_W - 1; x >= 0; x--) {
 #if LIDAR_APPLY_CALIBRATION

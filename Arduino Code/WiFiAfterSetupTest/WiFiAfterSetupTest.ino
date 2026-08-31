@@ -89,7 +89,7 @@ const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 // arm to a random angle — that already snapped the arm once.
 const int SERVO_TX_PIN = D9;
 
-const int SERVO_US_REST   = 544;
+const int SERVO_US_REST   = 565;
 
 // PORT (Arduino Nano ESP32): the RP2040 bit-banged this 9600-baud frame on D9
 // with interrupts disabled (servoTxByte + SERVO_TX_BIT_US, both deleted). The
@@ -433,8 +433,8 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
   for (int i = 0; i < 5; i++) {
     tcsSelect(0, 0); delay(2); sr += tcsHz();
     tcsSelect(1, 1); delay(2); sg += tcsHz();
-    tcsSelect(0, 1); delay(2); sb += tcsHz();
-    tcsSelect(1, 0); delay(2); sc += tcsHz();
+    tcsSelect(0, 1); delay(2); sc += tcsHz();  // value 1 = CLEAR
+    tcsSelect(1, 0); delay(2); sb += tcsHz();  // value 2 = BLUE
   }
   r = sr/5; g = sg/5; b = sb/5; c = sc/5;
 }
@@ -534,7 +534,7 @@ void setup() {
   digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  digitalWrite(TCS_S2, HIGH);  // TCS_CLEAR
+  digitalWrite(TCS_S2, HIGH);  // S2=H,S3=L -> BLUE (S2/S3 are crossed on this rig)
   digitalWrite(TCS_S3, LOW);
   Serial.println("TCS pins configured.");
 #endif

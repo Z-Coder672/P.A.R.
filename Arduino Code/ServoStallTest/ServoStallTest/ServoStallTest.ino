@@ -14,7 +14,7 @@
 // D9 is a UART TX line to the ServoNano, NOT a PWM servo output. Driving
 // Servo.h PWM here would be decoded as garbage UART frames.
 const int SERVO_TX_PIN = D9;
-const int SERVO_US_REST = 544;  // 0° park, matches PARMain
+const int SERVO_US_REST = 565;  // 2° park, matches PARMain
 
 const int SENSE_PIN = A0;
 
@@ -63,9 +63,12 @@ void writeServoUs(int us, int settle_ms) {
 }
 
 // Standard Servo-library mapping: 544us at 0° to 2400us at 180° (~10.31 us/deg).
-// Replaces the retired servo.write(deg) call.
+// Replaces the retired servo.write(deg) call. The 0° base is the LIBRARY floor,
+// not SERVO_US_REST -- REST is 2°, and deriving the mapping from it would skew
+// every commanded angle by 2°.
+const int SERVO_US_0DEG = 544;
 int angleToMicros(int deg) {
-  long us = (long)SERVO_US_REST + (long)deg * (2400L - SERVO_US_REST) / 180L;
+  long us = (long)SERVO_US_0DEG + (long)deg * (2400L - SERVO_US_0DEG) / 180L;
   return (int)us;
 }
 

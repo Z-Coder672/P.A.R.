@@ -1,31 +1,41 @@
-// Live blue-vs-black classifier for the TCS3200 using the tiny ternary
-// transformer trained by ../train.py. Same pin assignments as the project's
-// other TCS3200 sketches (P.A.R.Main, ColorSensorStream).
+// Live cyan-vs-black disc classifier for the TCS3200 using LED ambient
+// subtraction + a simple BLUE-channel threshold — the same read the P.A.R.
+// scan now uses (see ../../Arduino Code/PARMain/PARMain.ino). The old tiny
+// ternary transformer model is gone: with the LED illumination bank the two
+// faces separate by ~10x on the BLUE channel, so a fixed cut is all that's
+// needed. classifier.h / model_weights.h remain on disk but are unreferenced.
 //
-// Each loop captures one R,G,B,C reading (~8 ms), pushes it into a 5-frame
-// running buffer, classifies the windowed mean, and prints timing +
-// prediction. The model was trained on 5-step averaged inputs, so the same
-// averaging must happen at inference (otherwise accuracy drops).
-//
-// Inference is float32 on the RP2040's Cortex-M0+ — no FPU, but the model
-// is small enough that one forward pass takes well under a millisecond.
-
-#include "classifier.h"
+// Each loop does one ambient-subtracted read: a 5-frame RGBC average with the
+// LEDs OFF (ambient) subtracted from a 5-frame average with the LEDs ON (lit),
+// so room light cancels and the reading depends only on the disc + our LEDs.
+// It thresholds the BLUE channel and prints timing + the FRONT/displayed color.
 
 const unsigned long CYCLE_US = 30000UL;  // ~33 Hz reporting
-const int AVG_WINDOW = 5;                // must match train-time averaging
 
 const int TCS_S0  = 4;
 const int TCS_S1  = 5;
 const int TCS_S2  = 6;
 const int TCS_S3  = 7;
 const int TCS_OUT = 8;
+const int TCS_LED = 10;  // illumination bank (NPN base); HIGH = on
 
+// S2/S3 select the photodiode filter bank.
+//
+// These labels name the filter that is PHYSICALLY selected. The S2/S3 lines are
+// crossed on this rig, so the datasheet's (S2,S3) -> filter table does not hold
+// for values 1 and 2 -- the value assignments below already account for that.
+// Everything downstream then reads straight: `b` holds blue, `c` holds clear,
+// and classifyDisc thresholds `b`.
+//
+// !! classifyDisc MUST THRESHOLD BLUE. Blue separates the cyan disc face from
+// !! the black one by 10.22x; CLEAR manages only 2.22x, so reading CLEAR would
+// !! cut usable margin from 2.17x each way to 1.24x. These two values encode the
+// !! wiring, so if S2/S3 are ever rewired straight they must move with it.
 enum TcsFilter {
-  TCS_RED   = 0,
-  TCS_BLUE  = 1,
-  TCS_CLEAR = 2,
-  TCS_GREEN = 3
+  TCS_RED = 0,    // commanded S2=L,S3=L -> RED
+  TCS_CLEAR = 1,  // commanded S2=L,S3=H -> CLEAR (datasheet says BLUE)
+  TCS_BLUE = 2,   // commanded S2=H,S3=L -> BLUE  (datasheet says CLEAR)
+  TCS_GREEN = 3   // commanded S2=H,S3=H -> GREEN
 };
 
 static inline void tcsSelect(TcsFilter f) {
@@ -34,17 +44,56 @@ static inline void tcsSelect(TcsFilter f) {
 }
 
 static inline unsigned long tcsReadFrequencyHz() {
-  unsigned long halfUs = pulseIn(TCS_OUT, HIGH, 20000UL);
+  unsigned long halfUs = pulseIn(TCS_OUT, HIGH, 100000UL);
   if (halfUs == 0) return 0;
   return 500000UL / halfUs;
 }
 
-static void readRGBC(unsigned long &r, unsigned long &g, unsigned long &b, unsigned long &c) {
-  tcsSelect(TCS_RED);   delay(2); r = tcsReadFrequencyHz();
-  tcsSelect(TCS_GREEN); delay(2); g = tcsReadFrequencyHz();
-  tcsSelect(TCS_BLUE);  delay(2); b = tcsReadFrequencyHz();
-  tcsSelect(TCS_CLEAR); delay(2); c = tcsReadFrequencyHz();
+// Average 5 consecutive RGBC frames (2ms-paced) at the current head position and
+// current illumination. Called twice per read by readAmbientSubtracted() — once
+// LEDs-off, once LEDs-on.
+void tcsReadRGBC(unsigned long& r, unsigned long& g,
+                 unsigned long& b, unsigned long& c) {
+  uint32_t sr = 0, sg = 0, sb = 0, sc = 0;
+  for (int i = 0; i < 5; i++) {
+    tcsSelect(TCS_RED);   delay(2); sr += tcsReadFrequencyHz();
+    tcsSelect(TCS_GREEN); delay(2); sg += tcsReadFrequencyHz();
+    tcsSelect(TCS_CLEAR); delay(2); sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
+  }
+  r = sr / 5;
+  g = sg / 5;
+  b = sb / 5;
+  c = sc / 5;
 }
+
+// LED settle after toggling the illumination bank before reading.
+const int LED_SETTLE_MS = 20;
+
+// One ambient-subtracted RGBC read: LEDs-off average subtracted from LEDs-on
+// average. Room light shows up in both and cancels. Negatives clamped to 0.
+// Verbatim from PARMain.ino. LEDs left off after.
+void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
+  unsigned long ar, ag, ab, ac, lr, lg, lb, lc;
+  digitalWrite(TCS_LED, LOW);  delay(LED_SETTLE_MS); tcsReadRGBC(ar, ag, ab, ac);
+  digitalWrite(TCS_LED, HIGH); delay(LED_SETTLE_MS); tcsReadRGBC(lr, lg, lb, lc);
+  digitalWrite(TCS_LED, LOW);
+  r = (long)lr - (long)ar; if (r < 0) r = 0;
+  g = (long)lg - (long)ag; if (g < 0) g = 0;
+  b = (long)lb - (long)ab; if (b < 0) b = 0;
+  c = (long)lc - (long)ac; if (c < 0) c = 0;
+}
+
+// Disc classification by a SIMPLE THRESHOLD on the ambient-subtracted BLUE
+// channel. The result is the FRONT/displayed color (1 = cyan/on, 0 = black/off).
+// The sensor views the BACK of each disc: an ON disc (cyan front) shows its BLACK
+// back and reads LOW blue; an OFF disc (black front) shows its cyan back and
+// reads HIGH blue. So on = BLUE below the threshold. Value sits in the wide gap
+// between the on-cluster (~1.8k) and off-cluster (~16k).
+// Thresholds the BLUE channel (S2/S3 are crossed -- see the enum). RETIRED
+// sketch: the live rig uses SCAN_ON_BLUE_MAX = 3535, not 6000.
+const long SCAN_ON_BLUE_MAX = 6000;   // ambient-sub BLUE < this => cyan/on (front)
+static inline uint8_t classifyDisc(long b) { return (b < SCAN_ON_BLUE_MAX) ? 1 : 0; }
 
 void setup() {
   Serial.begin(115200);
@@ -55,71 +104,33 @@ void setup() {
   pinMode(TCS_S2, OUTPUT);
   pinMode(TCS_S3, OUTPUT);
   pinMode(TCS_OUT, INPUT);
+  pinMode(TCS_LED, OUTPUT);
+  digitalWrite(TCS_LED, LOW);
 
-  // 20% output-frequency scaling, matching ColorSensorStream/P.A.R.Main.
+  // 20% output-frequency scaling, matching ColorSensorStream/PARMain.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_BLUE);  // idle on the channel classifyDisc reads
 
-  Serial.println(F("ColorClassifier ready (d_model=4, d_ff=8, ternary weights)"));
-  Serial.println(F("r,g,b,c   logit   label   us_inference"));
+  Serial.println(F("ColorClassifier ready (LED ambient-subtract + BLUE-channel threshold)"));
+  Serial.println(F("r,g,b,c   label   us_read"));
 }
-
-// Ring buffer of the last AVG_WINDOW raw RGBC frames + the running sum,
-// so the windowed mean is one int divide per channel (no per-frame loop).
-static uint32_t ring[AVG_WINDOW][4];
-static uint32_t ringSum[4] = {0, 0, 0, 0};
-static uint8_t  ringIdx = 0;
-static uint8_t  ringFilled = 0;
 
 void loop() {
   unsigned long cycleStart = micros();
 
-  unsigned long ru, gu, bu, cu;
-  readRGBC(ru, gu, bu, cu);
-
-  // Slide the ring forward: subtract the slot we're about to overwrite,
-  // write the new sample, add it to the running sum.
-  if (ringFilled == AVG_WINDOW) {
-    ringSum[0] -= ring[ringIdx][0];
-    ringSum[1] -= ring[ringIdx][1];
-    ringSum[2] -= ring[ringIdx][2];
-    ringSum[3] -= ring[ringIdx][3];
-  } else {
-    ringFilled++;
-  }
-  ring[ringIdx][0] = ru;  ringSum[0] += ru;
-  ring[ringIdx][1] = gu;  ringSum[1] += gu;
-  ring[ringIdx][2] = bu;  ringSum[2] += bu;
-  ring[ringIdx][3] = cu;  ringSum[3] += cu;
-  ringIdx = (ringIdx + 1) % AVG_WINDOW;
-
-  // Skip classification until the buffer is primed.
-  if (ringFilled < AVG_WINDOW) {
-    unsigned long el = micros() - cycleStart;
-    if (el < CYCLE_US) delayMicroseconds(CYCLE_US - el);
-    return;
-  }
-
-  float rgbc[4] = {
-    (float)ringSum[0] / (float)AVG_WINDOW,
-    (float)ringSum[1] / (float)AVG_WINDOW,
-    (float)ringSum[2] / (float)AVG_WINDOW,
-    (float)ringSum[3] / (float)AVG_WINDOW,
-  };
-
   unsigned long t0 = micros();
-  float logit = classifier_logit(rgbc);
+  long r, g, b, c;
+  readAmbientSubtracted(r, g, b, c);
   unsigned long t1 = micros();
 
-  bool blue = logit > 0.0f;
+  bool cyan = classifyDisc(b);  // FRONT/displayed color
 
-  Serial.print(rgbc[0], 0); Serial.print(',');
-  Serial.print(rgbc[1], 0); Serial.print(',');
-  Serial.print(rgbc[2], 0); Serial.print(',');
-  Serial.print(rgbc[3], 0); Serial.print('\t');
-  Serial.print(logit, 4);   Serial.print('\t');
-  Serial.print(blue ? F("BLUE ") : F("BLACK")); Serial.print('\t');
+  Serial.print(r); Serial.print(',');
+  Serial.print(g); Serial.print(',');
+  Serial.print(b); Serial.print(',');
+  Serial.print(c); Serial.print('\t');
+  Serial.print(cyan ? F("CYAN ") : F("BLACK")); Serial.print('\t');
   Serial.println(t1 - t0);
 
   unsigned long elapsed = micros() - cycleStart;

@@ -30,6 +30,7 @@ if (file_exists($queueFile)) {
             'position' => $i + 1,
             'bitmap'   => $bitmap,
             'name'     => (string)($decoded['name'] ?? ''),
+            'artist'   => (string)($decoded['artist'] ?? ''),
         ];
     }
 }

@@ -23,7 +23,7 @@
 #define RX_PIN 2
 #define TX_PIN 3
 
-const int SERVO_US_PARK = 544;   // the only value ever written. Never changes.
+const int SERVO_US_PARK = 565;   // REST (2 deg). The only value ever written. Never changes.
 
 Servo s;
 SoftwareSerial link(RX_PIN, TX_PIN);

@@ -49,6 +49,17 @@ const int GRID_H = 18;
 // no cross-compiler portability requirement, only self-consistency, which the
 // magic/version/geometry/checksum fields enforce. The stored (year, yday) is
 // the authority for "has today's scan already run".
+// Declared up here for the same reason as LidarScanRecord below: the Arduino
+// preprocessor hoists auto-generated prototypes to the top of the file, so any
+// type used in a function signature must already be visible.
+struct ClearCutRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t pad;
+  int32_t  cut;
+  uint32_t checksum;
+};
+
 struct LidarScanRecord {
   uint32_t magic;
   uint16_t version;
@@ -59,6 +70,13 @@ struct LidarScanRecord {
   int32_t  yday;                        // tm_yday (0..365), local
   uint32_t epoch;                       // unix seconds at completion
   uint32_t cellsOk;                     // cells that returned >=1 sample
+  // Mid-sweep checkpoint, written at every row boundary. DISTINCT from
+  // (year, yday) above, which still mean "a full sweep finished" and are still
+  // stamped only at the end -- so a partial record can never read as done.
+  uint16_t rowsDone;                    // visit-rows completed, 0..GRID_H
+  uint16_t pad2;
+  int32_t  progYear;                    // day the partial sweep belongs to
+  int32_t  progYday;
   uint16_t dist10[GRID_H * GRID_W];     // trimmed mean, tenths of a mm; 0 = none
   uint32_t checksum;                    // over every byte before this field
 };
@@ -84,16 +102,63 @@ const int TCS_OUT = D8;
 const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 
 // S2/S3 select the photodiode filter bank.
+//
+// !! The names below are the plain datasheet table. Whether they are also
+// !! PHYSICALLY right on this rig is UNRESOLVED and does not matter: what the
+// !! code depends on is which commanded (S2,S3) pair discriminates the disc
+// !! faces, and that has been measured directly. It is (S2=H, S3=L) -- value 2,
+// !! named TCS_CLEAR here, landing in tcsReadRGBC's `c` output slot. That is
+// !! the slot classifyDisc thresholds. See the comment on classifyDisc for the
+// !! ground-truth measurements.
+// !!
+// !! Do NOT re-derive this mapping from a sum test (an unfiltered channel must
+// !! be ~ the sum of the filtered ones). That identity does not hold on this
+// !! sensor at either supply voltage -- at 3V3 the `g` slot reads ~5x the `c`
+// !! slot, which is physically impossible for a filtered vs unfiltered pair --
+// !! so the test proves nothing in either direction. It is what produced the
+// !! "S2/S3 are crossed" theory, and then the 2026-08-20 reversal of it, and
+// !! both of those moved which channel was thresholded while claiming not to.
+// !! Measure against a known bitmap instead; the check pass gives you one free.
 enum TcsFilter {
-  TCS_RED = 0,    // S2=L, S3=L
-  TCS_BLUE = 1,   // S2=L, S3=H
-  TCS_CLEAR = 2,  // S2=H, S3=L
-  TCS_GREEN = 3   // S2=H, S3=H
+  TCS_RED = 0,    // S2=L,S3=L
+  TCS_BLUE = 1,   // S2=L,S3=H -- populations OVERLAP, unusable for classifying
+  TCS_CLEAR = 2,  // S2=H,S3=L <- the channel classifyDisc reads (slot `c`)
+  TCS_GREEN = 3   // S2=H,S3=H -- separates as well as value 2 (~9x), unused
 };
+
+// ---- Shield peripheral power (D11 -> TPS22919 ON) --------------------------
+// The shield PCB gates a switched 5V rail (5VSWED) behind a load switch whose
+// ON pin is this GPIO. That rail feeds the Mega/GRBL, the ServoNano, the lidar
+// and the TCS3200 -- everything except this MCU and the servo motor itself
+// (which sits on unswitched +5V, deliberately: see PCBnSCHs/REVIEW.md C1).
+//
+// The part has an internal 530k pull-down, so the rail is OFF until this pin is
+// driven HIGH. That is the intended behaviour, not a defect: it gives a
+// deterministic power-on order -- this MCU boots first, then brings everything
+// else up -- rather than every board racing at power-on.
+//
+// !! CONSEQUENCES, all of which are load-bearing:
+// !! 1. This must be driven HIGH before ANY peripheral is addressed. The boot
+// !!    servo-park below is sent over a UART to a board that is unpowered until
+// !!    this happens, so the park would be silently lost.
+// !! 2. SHIELD_PWR_SETTLE_MS must cover the ServoNano's bootloader (~2 s on a
+// !!    CH340 Nano) before the park command is sent, not just the rail's rise.
+// !! 3. Every sketch run ON THE SHIELD needs these two lines. A sketch without
+// !!    them presents as a completely dead board -- no GRBL, no sensors, no
+// !!    servo response -- which looks like a wiring fault. See PINOUT.md S10.
+// !! 4. The rail is all-or-nothing. It cannot power-cycle the lidar for
+// !!    recovery without also resetting GRBL and the ServoNano.
+// !! 5. On esp_restart() (the 60 s stall watchdog, grblAlarmRecover's fallback)
+// !!    this pin tri-states and the whole rail drops -- so a watchdog reset now
+// !!    power-cycles GRBL too. That is a STRONGER recovery than the soft reset
+// !!    it replaces, and PARMain re-homes on boot anyway.
+// !! On a hand-wired rig with no shield, D11 is unconnected and this is a no-op.
+const int SHIELD_PWR_PIN = D11;
+const unsigned long SHIELD_PWR_SETTLE_MS = 2500;
 
 const int SERVO_PIN = D9;
 // Pulse widths match the standard Servo lib mapping
-// (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈0° (parked),
+// (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°): REST≈2° (parked),
 // RELEASE≈25.5° (pushes the half-rotated squisk during the X slide-back),
 // ENGAGE=75° (initial 90° squisk rotation).
 //
@@ -106,7 +171,7 @@ const int SERVO_PIN = D9;
 // !! FLIP_CATCH_EXTRA_X, the unload). Porting the base angles without the trims,
 // !! or the trims without the base angles, leaves the flip wrong by tens of
 // !! degrees — which is exactly how the arm gets driven into the board.
-const int SERVO_US_REST = 544;
+const int SERVO_US_REST = 565;
 // RELEASE is a BASE angle that lidar compensation then shifts per cell; it is
 // never commanded raw. Uncompensated it is 25.51°. Through compensatedUs() the
 // board spans 793..921µs (24.15°..36.56°), mean 853µs — so nothing clamps at
@@ -149,7 +214,7 @@ const int SERVO_US_RELEASE2 = SERVO_US_RELEASE - SERVO_US_10_DEG;
 //     why — restore a value above REST rather than re-deriving from RELEASE.
 // Kept as its own constant (rather than replacing the call sites) so the BOOT
 // line still reports the scan angle a run actually used.
-const int SERVO_US_SCAN = SERVO_US_REST;   // 544µs, arm parked
+const int SERVO_US_SCAN = SERVO_US_REST;   // 565µs, arm parked
 const int SERVO_10_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;
 // Extra travel on the CATCH stroke — the one that runs with the arm down at
@@ -302,7 +367,18 @@ const float ARM_FLAT_DEG = 23.0f;
 //      even though the lidar table commands it the SMALLEST angle on the whole
 //      board (837 us vs 893 at the top). So this is NOT a standoff problem and
 //      no change to LIDAR_FIT_CMM fixes it; do not go looking there again.
-const float RELEASE_EXTRA_REACH_MM = 2.0f;
+// 2026-08-20: 2.0 -> 4.496. See the LIDAR_FIT_CMM header for the re-tilt this
+// pairs with. The re-tilt is mean-preserving, so on its own it would have taken
+// up to 60 us AWAY from the top rows, which currently flip correctly. This term
+// puts that back: +60 us on the board mean, chosen so row 0 lands within 1 us
+// of what it commands today. Net effect is "hold the top, give the bottom what
+// the lidar says it needs" -- row 17 goes 825 -> 946 us, row 0 stays at 881.
+//
+// !! This DOES push the bottom rows past the level the note above records as
+// !! over-rotating (~270 deg at 837 us). Those two observations cannot both
+// !! describe the same board, and the four 2026-08-17..20 lidar scans are the
+// !! newer evidence, but WATCH THE BOTTOM TWO ROWS on the first full run.
+const float RELEASE_EXTRA_REACH_MM = 4.496f;
 // Reach trim applied ONLY to the two extreme rows (top and bottom). Both sit
 // nearest their rod mounts, where the rod is stiffest and deflects least, so they
 // need slightly less reach than the interior to avoid over-pushing. Rows 1..16
@@ -335,9 +411,11 @@ static inline float edgeRowReachTrim(int gy) {
 // !! Applying the cal squares' 10.03 mm cyan-vs-black bias to them (which IS
 // !! real, for the flat reference squares) pushed them +3.7..+8.9 mm off their
 // !! columns and inflated the fit rms from 0.51 to 1.28 mm.
-// !! Their clear-channel readings were 3291..5955 against the then-current threshold of 6000 (now SCAN_ON_BLUE_MAX=3535),
-// !! and 155 of 666 cells sit in a 5000-9000 grey zone — the ~10x separation the
-// !! threshold assumes has degraded badly. Re-tuned: SCAN_ON_BLUE_MAX is now 3535.
+// !! Their readings were 3291..5955 against the then-current threshold of 6000
+// !! (both figures are on the pre-2026-08-20 channel/supply -- see classifyDisc),
+// !! and 155 of 666 cells sit in a 5000-9000 grey zone — the separation the
+// !! threshold assumes had degraded badly -- consistent with the classifier
+// !! having been on CLEAR (1.6-2.1x) rather than BLUE the whole time.
 //
 // CAVEAT (unchanged from pass 3): with no genuinely black-back cell on the board,
 // this scan still cannot measure the black-back disc offset. A mixed-colour board
@@ -367,25 +445,54 @@ const int   SERVO_US_MAX = 2400;
 // 9.20 mm (cyan reads that much farther than black at identical standoff), so a
 // mixed-colour board would need that re-derived before its geometry could be
 // trusted.
+// !! RE-TILTED 2026-08-20. The pass-4 vertical gradient was FICTITIOUS. That
+// !! scan subtracted an apparent drift measured on two fixed calibration
+// !! squares, and the squares move when the board does not -- so the correction
+// !! was ~20-32x too large and it inverted the vertical axis. Because the scan
+// !! walks rows monotonically, row index and elapsed time are the same variable
+// !! (r = 0.999987), so ALL of that error landed on the vertical gradient.
+// !!
+// !! Corrected against four independent full-board scans (2026-08-17..20) read
+// !! off the flash log. Every one of them says the bottom sits FARTHER from the
+// !! arm than the top, on 128 of 148 column-passes:
+// !!     scan 08-17 +1.24   08-18 +2.12   08-19 +1.04   08-20 +2.26 mm
+// !!     pooled bottom-half - top-half = +1.67 mm, 95% CI [+1.35, +1.98]
+// !!     this table (pre-fix) said                    -1.24 mm  (0/37 columns)
+// !!
+// !! The difference is a clean linear tilt: fitting (measured - table) against
+// !! row index gives +0.2972 mm/row, residual sd 0.69 mm, no significant
+// !! higher-order term. So the fix applied here is exactly
+// !!     cell[y][x] += 0.2972 * (y - 8.5)   mm
+// !! and NOTHING else -- the per-column/horizontal shape from pass 4 is kept
+// !! untouched, because that axis was always separable from drift (only
+// !! ~0.185 mm accrues within a row against a 0.921 mm horizontal sd).
+// !!
+// !! DO NOT rebuild this table cell-by-cell from the daily cadence scans. Their
+// !! per-cell noise is sd 2.88 mm (SEM 1.44 mm even after averaging all four),
+// !! against only 2.05 mm of real cell-to-cell structure -- an SNR near 1. The
+// !! daily scans can measure a one-parameter tilt across 666 cells; they cannot
+// !! measure 666 independent cells. The transform above is mean-preserving, so
+// !! LIDAR_REF_MM is unchanged at 37.69 and the global push level is set purely
+// !! by RELEASE_EXTRA_REACH_MM.
 const int16_t LIDAR_FIT_CMM[GRID_H][GRID_W] = {
-  { 4003, 3943, 4061, 3967, 3990, 4015, 3904, 3904, 3972, 3938, 3967, 3814, 3974, 4008, 3915, 4037, 3970, 3936, 4069, 4024, 3920, 3945, 3881, 3903, 3790, 3916, 3957, 3857, 3909, 3789, 3860, 3911, 3941, 3850, 3885, 3782, 3949 },
-  { 3963, 3913, 4018, 3929, 3936, 3959, 3869, 3859, 3949, 3946, 3937, 3787, 3961, 3988, 3874, 4007, 3930, 3920, 4025, 3994, 3890, 3913, 3844, 3873, 3787, 3892, 3921, 3827, 3885, 3780, 3820, 3894, 3910, 3843, 3885, 3739, 3973 },
-  { 3924, 3883, 3976, 3892, 3883, 3905, 3834, 3815, 3928, 3953, 3908, 3760, 3949, 3969, 3834, 3978, 3892, 3903, 3982, 3963, 3861, 3882, 3807, 3843, 3784, 3870, 3887, 3797, 3862, 3772, 3780, 3876, 3879, 3836, 3885, 3697, 3994 },
-  { 3886, 3853, 3935, 3856, 3833, 3853, 3801, 3773, 3906, 3959, 3879, 3735, 3936, 3949, 3796, 3949, 3855, 3886, 3941, 3934, 3834, 3852, 3772, 3814, 3780, 3848, 3854, 3770, 3840, 3763, 3743, 3860, 3850, 3828, 3884, 3658, 4014 },
-  { 3849, 3825, 3897, 3821, 3786, 3804, 3770, 3734, 3885, 3962, 3852, 3712, 3923, 3931, 3760, 3921, 3820, 3869, 3902, 3905, 3809, 3824, 3740, 3788, 3777, 3827, 3824, 3744, 3820, 3754, 3710, 3843, 3822, 3820, 3882, 3623, 4029 },
-  { 3815, 3798, 3862, 3788, 3743, 3759, 3742, 3700, 3866, 3963, 3826, 3692, 3910, 3913, 3728, 3894, 3788, 3852, 3866, 3878, 3787, 3798, 3710, 3764, 3773, 3808, 3797, 3723, 3800, 3746, 3680, 3827, 3796, 3811, 3879, 3593, 4040 },
-  { 3782, 3772, 3830, 3757, 3705, 3720, 3717, 3671, 3847, 3960, 3803, 3674, 3895, 3897, 3699, 3867, 3759, 3834, 3834, 3852, 3769, 3774, 3684, 3743, 3770, 3792, 3774, 3705, 3783, 3738, 3656, 3812, 3773, 3800, 3875, 3569, 4046 },
-  { 3751, 3748, 3802, 3728, 3674, 3686, 3695, 3648, 3830, 3953, 3781, 3660, 3880, 3881, 3675, 3842, 3734, 3815, 3806, 3829, 3755, 3753, 3663, 3726, 3766, 3777, 3756, 3691, 3768, 3730, 3638, 3797, 3753, 3788, 3869, 3552, 4045 },
-  { 3723, 3726, 3778, 3701, 3648, 3658, 3678, 3632, 3814, 3942, 3763, 3650, 3863, 3867, 3656, 3817, 3713, 3795, 3782, 3808, 3745, 3735, 3646, 3712, 3761, 3764, 3742, 3682, 3755, 3723, 3625, 3782, 3735, 3774, 3861, 3543, 4038 },
-  { 3697, 3706, 3759, 3677, 3628, 3636, 3664, 3622, 3799, 3927, 3746, 3644, 3846, 3855, 3641, 3794, 3696, 3775, 3763, 3788, 3739, 3721, 3633, 3702, 3757, 3754, 3733, 3678, 3745, 3716, 3619, 3769, 3721, 3760, 3852, 3541, 4024 },
-  { 3674, 3688, 3743, 3656, 3616, 3621, 3655, 3619, 3786, 3908, 3732, 3642, 3828, 3843, 3631, 3772, 3683, 3754, 3749, 3771, 3738, 3710, 3625, 3697, 3752, 3747, 3729, 3678, 3737, 3709, 3619, 3756, 3710, 3743, 3840, 3546, 4002 },
-  { 3654, 3671, 3732, 3637, 3609, 3612, 3649, 3622, 3774, 3884, 3721, 3644, 3808, 3833, 3626, 3752, 3674, 3733, 3738, 3756, 3741, 3701, 3621, 3694, 3748, 3742, 3730, 3684, 3732, 3703, 3626, 3743, 3701, 3725, 3828, 3560, 3975 },
-  { 3636, 3656, 3725, 3620, 3608, 3608, 3647, 3630, 3764, 3856, 3712, 3649, 3788, 3824, 3625, 3732, 3669, 3711, 3732, 3743, 3748, 3696, 3622, 3696, 3742, 3739, 3735, 3693, 3728, 3697, 3638, 3732, 3696, 3706, 3813, 3579, 3941 },
-  { 3620, 3643, 3721, 3606, 3612, 3609, 3648, 3645, 3754, 3826, 3705, 3657, 3768, 3816, 3628, 3713, 3668, 3688, 3730, 3732, 3759, 3693, 3626, 3700, 3737, 3738, 3745, 3706, 3727, 3691, 3655, 3720, 3693, 3686, 3798, 3606, 3901 },
-  { 3606, 3631, 3720, 3593, 3620, 3615, 3652, 3663, 3746, 3792, 3699, 3668, 3746, 3810, 3635, 3695, 3669, 3665, 3730, 3722, 3773, 3692, 3634, 3707, 3732, 3739, 3757, 3723, 3728, 3686, 3676, 3710, 3692, 3664, 3781, 3637, 3857 },
-  { 3593, 3620, 3721, 3581, 3632, 3624, 3658, 3685, 3738, 3756, 3695, 3681, 3724, 3803, 3644, 3678, 3672, 3641, 3734, 3712, 3789, 3693, 3644, 3716, 3726, 3741, 3772, 3742, 3729, 3681, 3701, 3699, 3692, 3642, 3763, 3672, 3809 },
-  { 3581, 3609, 3724, 3570, 3646, 3635, 3665, 3710, 3731, 3718, 3692, 3695, 3702, 3798, 3654, 3661, 3676, 3617, 3738, 3704, 3807, 3696, 3655, 3726, 3721, 3744, 3789, 3763, 3732, 3676, 3728, 3689, 3694, 3619, 3744, 3710, 3759 },
-  { 3569, 3599, 3727, 3560, 3661, 3647, 3673, 3735, 3724, 3680, 3689, 3710, 3680, 3792, 3666, 3644, 3682, 3593, 3744, 3697, 3825, 3698, 3667, 3737, 3715, 3747, 3807, 3785, 3734, 3671, 3756, 3679, 3696, 3596, 3726, 3750, 3707 },
+  { 3750, 3690, 3808, 3714, 3737, 3762, 3651, 3651, 3719, 3685, 3714, 3561, 3721, 3755, 3662, 3784, 3717, 3683, 3816, 3771, 3667, 3692, 3628, 3650, 3537, 3663, 3704, 3604, 3656, 3536, 3607, 3658, 3688, 3597, 3632, 3529, 3696 },
+  { 3740, 3690, 3795, 3706, 3713, 3736, 3646, 3636, 3726, 3723, 3714, 3564, 3738, 3765, 3651, 3784, 3707, 3697, 3802, 3771, 3667, 3690, 3621, 3650, 3564, 3669, 3698, 3604, 3662, 3557, 3597, 3671, 3687, 3620, 3662, 3516, 3750 },
+  { 3731, 3690, 3783, 3699, 3690, 3712, 3641, 3622, 3735, 3760, 3715, 3567, 3756, 3776, 3641, 3785, 3699, 3710, 3789, 3770, 3668, 3689, 3614, 3650, 3591, 3677, 3694, 3604, 3669, 3579, 3587, 3683, 3686, 3643, 3692, 3504, 3801 },
+  { 3723, 3690, 3772, 3693, 3670, 3690, 3638, 3610, 3743, 3796, 3716, 3572, 3773, 3786, 3633, 3786, 3692, 3723, 3778, 3771, 3671, 3689, 3609, 3651, 3617, 3685, 3691, 3607, 3677, 3600, 3580, 3697, 3687, 3665, 3721, 3495, 3851 },
+  { 3715, 3691, 3763, 3687, 3652, 3670, 3636, 3600, 3751, 3828, 3718, 3578, 3789, 3797, 3626, 3787, 3686, 3735, 3768, 3771, 3675, 3690, 3606, 3654, 3643, 3693, 3690, 3610, 3686, 3620, 3576, 3709, 3688, 3686, 3748, 3489, 3895 },
+  { 3711, 3694, 3758, 3684, 3639, 3655, 3638, 3596, 3762, 3859, 3722, 3588, 3806, 3809, 3624, 3790, 3684, 3748, 3762, 3774, 3683, 3694, 3606, 3660, 3669, 3704, 3693, 3619, 3696, 3642, 3576, 3723, 3692, 3707, 3775, 3489, 3936 },
+  { 3708, 3698, 3756, 3683, 3631, 3646, 3643, 3597, 3773, 3886, 3729, 3600, 3821, 3823, 3625, 3793, 3685, 3760, 3760, 3778, 3695, 3700, 3610, 3669, 3696, 3718, 3700, 3631, 3709, 3664, 3582, 3738, 3699, 3726, 3801, 3495, 3972 },
+  { 3706, 3703, 3757, 3683, 3629, 3641, 3650, 3603, 3785, 3908, 3736, 3615, 3835, 3836, 3630, 3797, 3689, 3770, 3761, 3784, 3710, 3708, 3618, 3681, 3721, 3732, 3711, 3646, 3723, 3685, 3593, 3752, 3708, 3743, 3824, 3507, 4000 },
+  { 3708, 3711, 3763, 3686, 3633, 3643, 3663, 3617, 3799, 3927, 3748, 3635, 3848, 3852, 3641, 3802, 3698, 3780, 3767, 3793, 3730, 3720, 3631, 3697, 3746, 3749, 3727, 3667, 3740, 3708, 3610, 3767, 3720, 3759, 3846, 3528, 4023 },
+  { 3712, 3721, 3774, 3692, 3643, 3651, 3679, 3637, 3814, 3942, 3761, 3659, 3861, 3870, 3656, 3809, 3711, 3790, 3778, 3803, 3754, 3736, 3648, 3717, 3772, 3769, 3748, 3693, 3760, 3731, 3634, 3784, 3736, 3775, 3867, 3556, 4039 },
+  { 3719, 3733, 3788, 3701, 3661, 3666, 3700, 3664, 3831, 3953, 3777, 3687, 3873, 3888, 3676, 3817, 3728, 3799, 3794, 3816, 3783, 3755, 3670, 3742, 3797, 3792, 3774, 3723, 3782, 3754, 3664, 3801, 3755, 3788, 3885, 3591, 4047 },
+  { 3728, 3745, 3806, 3711, 3683, 3686, 3723, 3696, 3848, 3958, 3795, 3718, 3882, 3907, 3700, 3826, 3748, 3807, 3812, 3830, 3815, 3775, 3695, 3768, 3822, 3816, 3804, 3758, 3806, 3777, 3700, 3817, 3775, 3799, 3902, 3634, 4049 },
+  { 3740, 3760, 3829, 3724, 3712, 3712, 3751, 3734, 3868, 3960, 3816, 3753, 3892, 3928, 3729, 3836, 3773, 3815, 3836, 3847, 3852, 3800, 3726, 3800, 3846, 3843, 3839, 3797, 3832, 3801, 3742, 3836, 3800, 3810, 3917, 3683, 4045 },
+  { 3754, 3777, 3855, 3740, 3746, 3743, 3782, 3779, 3888, 3960, 3839, 3791, 3902, 3950, 3762, 3847, 3802, 3822, 3864, 3866, 3893, 3827, 3760, 3834, 3871, 3872, 3879, 3840, 3861, 3825, 3789, 3854, 3827, 3820, 3932, 3740, 4035 },
+  { 3769, 3794, 3883, 3756, 3783, 3778, 3815, 3826, 3909, 3955, 3862, 3831, 3909, 3973, 3798, 3858, 3832, 3828, 3893, 3885, 3936, 3855, 3797, 3870, 3895, 3902, 3920, 3886, 3891, 3849, 3839, 3873, 3855, 3827, 3944, 3800, 4020 },
+  { 3786, 3813, 3914, 3774, 3825, 3817, 3851, 3878, 3931, 3949, 3888, 3874, 3917, 3996, 3837, 3871, 3865, 3834, 3927, 3905, 3982, 3886, 3837, 3909, 3919, 3934, 3965, 3935, 3922, 3874, 3894, 3892, 3885, 3835, 3956, 3865, 4002 },
+  { 3804, 3832, 3947, 3793, 3869, 3858, 3888, 3933, 3954, 3941, 3915, 3918, 3925, 4021, 3877, 3884, 3899, 3840, 3961, 3927, 4030, 3919, 3878, 3949, 3944, 3967, 4012, 3986, 3955, 3899, 3951, 3912, 3917, 3842, 3967, 3933, 3982 },
+  { 3822, 3852, 3980, 3813, 3914, 3900, 3926, 3988, 3977, 3933, 3942, 3963, 3933, 4045, 3919, 3897, 3935, 3846, 3997, 3950, 4078, 3951, 3920, 3990, 3968, 4000, 4060, 4038, 3987, 3924, 4009, 3932, 3949, 3849, 3979, 4003, 3960 },
 };
 
 // Compensated pulse width for a contact position at cell (gx,gy).
@@ -418,7 +525,7 @@ int compensatedUs(int baseUs, int gx, int gy) {
 
 // Servo control offloaded to a dedicated 5V Arduino Nano over a one-way 9600
 // baud serial line on Arduino D9 (the old SERVO_PIN, freed once the SG90 moved
-// to the 5V Nano) → 5V Nano D0 RX, shared GND. The companion sketch
+// to the 5V Nano) → 5V Nano D2 RX (SoftwareSerial; D0 is its USB debug echo), shared GND. The companion sketch
 // (ServoNano.ino) listens on its hardware UART at the same baud and parses an
 // integer µs value per line.
 //
@@ -487,10 +594,34 @@ void servoTxLine(int us) {
 // (D9 -> ServoNano) needs nothing, since 3.3 V clears the AVR's V_IH of
 // 0.6*Vcc = 3.0 V.
 //
-// The line is a LEVEL, not a UART: idle HIGH, held LOW for ~40 ms on every
+// The line is a LEVEL, not a UART: idle LOW, driven HIGH for ~40 ms on every
 // command the ServoNano accepts. We already know what we sent, so all we need
-// is "it landed". INPUT_PULLUP so a broken or unfitted wire reads HIGH, i.e.
-// "no ack" -- it fails loud rather than silently reporting success.
+// is "it landed".
+//
+// !! POLARITY IS ACTIVE-HIGH (inverted 2026-08-17). It used to be idle-HIGH /
+// !! pulse-LOW with INPUT_PULLUP, on the theory that a broken wire would read
+// !! HIGH = "no ack" = fail loud. That is only true if the break is at THIS
+// !! pin. The divider's bottom-leg resistor sits between this node and GND, so
+// !! a break ANYWHERE UPSTREAM -- the ack wire, an unplugged or unpowered
+// !! ServoNano -- pinned the node LOW through it, which the old code read as
+// !! "acked". Every command then reported success and SERVO_ACK_MODE 2's
+// !! retry-until-confirmed guarantee became vacuous. No divider ratio fixes
+// !! that; the polarity has to be the other way round.
+// !!
+// !! Now the bottom-leg resistor IS the fail-safe: any upstream break parks the
+// !! node LOW = "no ack" = the enforced retry actually fires. INPUT_PULLDOWN
+// !! covers the remaining case where the divider itself is absent.
+// !!
+// !! REQUIRES A 3.3k BOTTOM LEG. INPUT_PULLDOWN (~45k) sits in parallel with
+// !! it, so with 1.8k/3.3k the HIGH level is 5*(3.3||45)/(1.8+(3.3||45)) =
+// !! 3.15 V, comfortably over the ESP32-S3's V_IH of 0.75*VDD = 2.475 V. With a
+// !! 2k bottom leg it collapses to 2.45 V and the ack stops working. Do NOT
+// !! flash this onto a rig whose divider is 2k/2k.
+// !!
+// !! BOTH SIDES MUST BE FLASHED TOGETHER. A ServoNano running the old
+// !! active-LOW build idles HIGH, which this code would read as a permanent
+// !! ack -- the exact failure the change removes. servoAckProbeIdle() below
+// !! detects that at boot and says so loudly.
 //
 // SERVO_ACK_MODE  0 = off      (no wire fitted; original open-loop behaviour)
 //                 1 = observe  (log every missing ack, keep running)
@@ -500,17 +631,68 @@ void servoTxLine(int us) {
 const int SERVO_ACK_PIN = D2;
 const unsigned long SERVO_ACK_TIMEOUT_MS = 80;   // must exceed the ~6 ms frame
 unsigned long servoAckMisses = 0;
+unsigned long servoAckStuck  = 0;   // line stuck asserted -> unverifiable
+// Idle-wait budget. Must exceed ACK_HOLD_MS (40) so a legitimate hold from the
+// PREVIOUS command is never mistaken for a stuck line.
+const unsigned long SERVO_ACK_IDLE_TIMEOUT_MS = 100;
 
 #if SERVO_ACK_MODE > 0
+// Read the ack as an ANALOG level, not a digital one.
+//
+// !! WHY: the divider feeds a 5 V swing into a 3.3 V pin, so the asserted level
+// !! depends entirely on the divider ratio, and digitalRead compares it against
+// !! the ESP32-S3's V_IH of 0.75*VDD = 2.475 V. The rig is physically wired
+// !! 2k/2k, which puts the asserted level at 2.45-2.50 V -- straddling V_IH, so
+// !! digitalRead is a coin flip (and with INPUT_PULLDOWN it reads LOW outright,
+// !! which would hang SERVO_ACK_MODE 2 forever on the first command). The shield
+// !! PCB uses 2k/3.3k and would be fine, but the two must run one firmware.
+// !!
+// !! Comparing against a threshold far below BOTH divider ratios' asserted level
+// !! removes the dependency on V_IH entirely: idle is 0 V (the divider's bottom
+// !! leg IS the pulldown), asserted is 2.45 V at worst. 1.20 V sits >1.2 V from
+// !! either state. This is strictly more robust than digitalRead ever was here,
+// !! and it works unchanged on 2k/2k, 2k/3.3k and 1.8k/3.3k.
+// !!
+// !! SERVO_ACK_PIN = D2 = GPIO5 = ADC1_CH4. ADC1 is mandatory: ADC2 is unusable
+// !! while WiFi is running, and PARMain always has WiFi up.
+const int SERVO_ACK_THRESHOLD_MV = 1200;
+static inline bool servoAckHigh() {
+  return analogReadMilliVolts(SERVO_ACK_PIN) > SERVO_ACK_THRESHOLD_MV;
+}
+
 // Let the previous command's 40 ms hold expire so it cannot be mistaken for ours.
-static void servoAckWaitIdle() {
+// Returns FALSE if the line never returned to idle -- i.e. it is stuck asserted.
+//
+// !! THIS RETURN VALUE IS SAFETY-CRITICAL, DO NOT IGNORE IT. Under the
+// !! active-HIGH protocol a line stuck HIGH (ServoNano wedged mid-ack, a short
+// !! to the divider's top leg, or a ServoNano still running the old active-LOW
+// !! build) makes servoAckSeen() return true instantly and unconditionally.
+// !! The ack would then confirm every command without any command having
+// !! landed, and SERVO_ACK_MODE 2's retry-until-confirmed guarantee -- the one
+// !! thing stopping the carriage from moving on an unconfirmed arm position --
+// !! becomes vacuous. A stuck line must be treated as a FAULT, never as an ack.
+static bool servoAckWaitIdle() {
   unsigned long t0 = millis();
-  while (digitalRead(SERVO_ACK_PIN) == LOW && millis() - t0 < 100) {}
+  while (servoAckHigh()) {
+    if (millis() - t0 >= SERVO_ACK_IDLE_TIMEOUT_MS) return false;
+  }
+  return true;
 }
 static bool servoAckSeen() {
   unsigned long t0 = millis();
   while (millis() - t0 < SERVO_ACK_TIMEOUT_MS)
-    if (digitalRead(SERVO_ACK_PIN) == LOW) return true;
+    if (servoAckHigh()) return true;
+  return false;
+}
+
+// Boot-time firmware-match check. Under the active-HIGH protocol the line must
+// IDLE LOW; a ServoNano still running the old active-LOW build idles HIGH, and
+// this code would then read every command as instantly acked. Returns false if
+// the line never goes LOW -- stale ServoNano firmware, or a short to 5 V.
+static bool servoAckProbeIdle() {
+  unsigned long t0 = millis();
+  while (millis() - t0 < 250)
+    if (!servoAckHigh()) return true;
   return false;
 }
 // Mode 2 RETRIES FOREVER rather than giving up. Blocking here is the safe
@@ -527,12 +709,26 @@ void writeServoUs(int us, int settle_ms) {
   servoTxLine(us);
   delay(settle_ms);
 #else
-  servoAckWaitIdle();
   unsigned long t0 = millis();
   unsigned long attempt = 0;
   bool acked = false;
   do {
     attempt++;
+    // Stuck-asserted line: an ack read now would be meaningless. Treat exactly
+    // like a missing ack -- block and retry -- rather than believing it.
+    if (!servoAckWaitIdle()) {
+      servoAckStuck++;
+      if (attempt <= 5 || (attempt % 100) == 0) {
+        Serial.print("!! servo ack STUCK ASSERTED - cannot verify, blocking. us=");
+        Serial.print(us); Serial.print(" attempt="); Serial.println(attempt);
+      }
+#if SERVO_ACK_MODE == 1
+      break;                    // observe-only: record it and carry on
+#else
+      delay(50);
+      continue;                 // mode 2: never accept an unverifiable ack
+#endif
+    }
     servoTxLine(us);
     acked = servoAckSeen();
     if (!acked) {
@@ -595,6 +791,10 @@ const int QUEUE_SIZE = 32;
 // and force an MCU reset so the device recovers on its own. 60s is well above
 // any legitimate motion or homing time we issue at this granularity.
 const unsigned long GRBL_STALL_TIMEOUT_MS = 60000;
+
+// Ceiling on grblBringup's escalating retry backoff when GRBL will not answer
+// `$H`. See the restart_grbl block for why the retry loop exists at all.
+const unsigned long GRBL_RETRY_BACKOFF_MAX_MS = 60000;
 
 // We also keep the command text per slot so error:N can be retried (re-sent)
 // without the caller knowing. 40 bytes matches the largest snprintf buffer
@@ -741,6 +941,169 @@ void rawSerial1Line(const char* s) {
   Serial1.write('\n');
 }
 
+// ---- GRBL response hygiene -------------------------------------------------
+// A SINGLE noise byte on the Serial1 RX line used to cost an entire print.
+//
+// 2026-08-23: a 0xFF glitch arrived glued to an ack — the line read `\xffok`.
+// drainResponses tests `resp == "ok"` exactly, and String::trim() strips only
+// ASCII whitespace, never 0xFF, so the ack fell through to the catch-all "GRBL
+// other" branch. The queue slot was never dequeued, bufferFill never drained,
+// and 60 s later the stall watchdog reset the MCU mid-job. It happened twice in
+// twelve minutes and killed two jobs: gallery 79 stopped after row y=7 with its
+// top 7 rows undrawn, and gallery 80 was popped off the queue and lost outright
+// (next.php had already consumed it; the reset meant nothing ever drew it).
+//
+// A start-bit glitch on an idle-high UART reads as exactly 0xFF, so that is the
+// shape line noise takes here. GRBL's entire response vocabulary — `ok`,
+// `error:N`, `ALARM:N`, `<...>` status, `[MSG:...]`, `$N=...`, the banner — is
+// printable ASCII, so dropping every byte outside 0x20..0x7E cannot corrupt a
+// legitimate response. It can only rescue a corrupted one.
+//
+// This MASKS THE SYMPTOM OF A HARDWARE FAULT (cable, connector, or Mega power),
+// so the scrubbing is counted and logged rather than silent — a rising
+// gRxScrubbed is the evidence that the underlying fault is still present.
+const size_t GRBL_RESP_MAX = 96;
+unsigned long gRxScrubbed = 0;       // total non-printable bytes dropped
+unsigned long gRxScrubbedLines = 0;  // responses that needed scrubbing
+
+// Drop non-printable bytes in place. Only reassigns the String when something
+// was actually dropped, so the healthy path costs one stack buffer and no heap
+// traffic. Runs BEFORE trim() — 0x0D is non-printable and goes here, spaces
+// (0x20) are printable and are left for trim() to handle.
+static void grblScrub(String& s) {
+  char buf[GRBL_RESP_MAX];
+  size_t n = 0;
+  unsigned long dropped = 0;
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s.charAt(i);
+    if (c >= 0x20 && c <= 0x7E) {
+      if (n < sizeof(buf) - 1) buf[n++] = (char)c;
+    } else {
+      dropped++;
+    }
+  }
+  if (!dropped) return;
+  buf[n] = '\0';
+  gRxScrubbed += dropped;
+  gRxScrubbedLines++;
+  // Throttled like the servo-ack miss log: loud at first, then periodic, so a
+  // permanently noisy line cannot flood the flash log.
+  if (gRxScrubbedLines <= 5 || (gRxScrubbedLines % 100) == 0) {
+    plog::logf("GRBL rx scrubbed %lu byte(s) -> '%.20s' (line %lu, total %lu)",
+               dropped, buf, gRxScrubbedLines, gRxScrubbed);
+  }
+  s = buf;
+}
+
+// Read one GRBL response line, scrubbed and trimmed. Returns an empty String
+// on a blank/timed-out line, which every caller already skips.
+static String grblReadLine() {
+  String r = Serial1.readStringUntil('\n');
+  grblScrub(r);
+  r.trim();
+  return r;
+}
+
+// ---- tolerant response matching --------------------------------------------
+// grblScrub above drops only NON-printable bytes, and that turned out to be
+// exactly half a fix. On 2026-08-25 the noise arrived as PRINTABLE characters
+// glued to the front of an ack -- `Dok`, `Pok`, `Tok`, `Vok`, `}S?xok` -- which
+// sailed through the scrubber, failed `resp == "ok"`, and fell into the
+// catch-all "GRBL other" branch. Every one of those was a LOST ACK: the queue
+// slot was never dequeued, bufferFill never drained, and 60 s later the stall
+// watchdog reset the MCU. It fired 7 times between 10:00 and 12:13, and because
+// runDailyLidarScan restarted from cell 0 on every boot (see its resume note),
+// the rig spent three hours re-running the first third of the sweep and never
+// polled for a print at all.
+//
+// So match on CONTENT, not equality. GRBL's vocabulary makes that safe: the
+// only response containing the substring "ok" is `ok` itself. `error:N`,
+// `ALARM:N`, `<...>` status reports, `[MSG:...]`, `$N=...` and the
+// `Grbl 1.1f ['$' for help]` banner all lack it -- including
+// `[MSG:'$H'|'$X' to unlock]`, whose "unlock" is u-n-l-o-c-k with no "ok".
+// The length bound is the second half of the guard: a long line that merely
+// happens to contain "ok" can never be mistaken for an ack, so only a short
+// line that is an ack plus a few junk bytes qualifies.
+//
+// This still MASKS A HARDWARE FAULT, so recoveries are counted and logged for
+// the same reason gRxScrubbed is -- see the note above grblScrub.
+const size_t GRBL_OK_MAX_JUNK_LEN = 8;   // the worst seen, `}S?xok`, is 6
+unsigned long gRxCorruptOks = 0;         // acks recovered from a corrupted line
+
+static bool grblIsOk(const String& r) {
+  if (r == "ok") return true;                        // the overwhelmingly common case
+  if (r.length() > GRBL_OK_MAX_JUNK_LEN) return false;
+  if (r.indexOf("ok") < 0) return false;
+  // Never swallow a response the branches below know how to handle properly.
+  if (r.indexOf("error") >= 0 || r.indexOf("ALARM") >= 0) return false;
+  gRxCorruptOks++;
+  if (gRxCorruptOks <= 5 || (gRxCorruptOks % 20) == 0) {
+    plog::logf("GRBL ok recovered from '%.12s' (total %lu)", r.c_str(), gRxCorruptOks);
+  }
+  return true;
+}
+
+// Same reasoning for the two responses we must never miss. `startsWith` fails
+// on a leading junk byte exactly as `== "ok"` did, and a dropped `error:N`
+// leaks a queue slot while a dropped `ALARM` lets the sweep keep streaming into
+// a GRBL that is no longer executing anything.
+static inline bool grblHasAlarm(const String& r) { return r.indexOf("ALARM") >= 0; }
+static inline bool grblHasError(const String& r) { return r.indexOf("error") >= 0; }
+
+// ---- idle-line noise --------------------------------------------------------
+// Every corrupted ack on record was junk PREFIXED to a real `ok`, never junk
+// alone. That is the signature of a byte that arrives while the RX line is
+// idle: it carries no newline, so readStringUntil() cannot terminate on it and
+// it simply waits in the UART buffer until the NEXT genuine response completes
+// the line -- turning `ok` into `Dok`.
+//
+// The window is widest during the daily lidar sweep, which parks the carriage
+// for ~4.95 s per cell while the ranger takes ~83 I2C samples. Measured over
+// the 2026-08-25 logs, stray bytes per 1000 GRBL lines: draw 0.0, colour scan
+// 0.4, lidar scan 63.4. Roughly 160x, and confined to the phase where the
+// ranger is active -- so the ranger (I2C at 400 kHz on A4/A5, or supply
+// transients from its emitter) is implicated, not merely the longer idle gap.
+// THIS IS A SOFTWARE GUARD AGAINST A HARDWARE PROBLEM. It stops the fragment
+// from corrupting an ack; it does not stop the fragment.
+//
+// Called wherever nothing is outstanding, so anything already buffered is
+// either a complete unsolicited line (logged -- a bare `Grbl ` banner here
+// means the MEGA reset itself) or exactly such an orphan fragment.
+unsigned long gRxIdleDropped = 0;
+unsigned long gRxIdleEvents  = 0;
+
+static void grblDropIdleNoise() {
+  if (bufferFill != 0 || qHead != qTail) return;   // a real ack may still be owed
+  if (!Serial1.available()) return;
+
+  char pend[GRBL_RESP_MAX];
+  size_t n = 0;
+  while (Serial1.available() && n < sizeof(pend)) pend[n++] = (char)Serial1.read();
+
+  // Everything up to the LAST newline is complete line(s); the tail after it is
+  // the fragment. Reading the bytes ourselves keeps this off readStringUntil(),
+  // whose 1 s timeout would otherwise be paid on every fragment.
+  int nl = -1;
+  for (size_t i = 0; i < n; i++) if (pend[i] == '\n') nl = (int)i;
+
+  if (nl >= 0) {
+    pend[nl] = '\0';
+    String line(pend);
+    grblScrub(line);       // also flattens any embedded \r\n of earlier lines
+    line.trim();
+    if (line.length()) plog::logf("GRBL idle line: %.40s", line.c_str());
+  }
+
+  size_t frag = n - (size_t)(nl + 1);
+  if (frag == 0) return;
+  gRxIdleDropped += frag;
+  gRxIdleEvents++;
+  if (gRxIdleEvents <= 5 || (gRxIdleEvents % 50) == 0) {
+    plog::logf("GRBL dropped %u idle-noise byte(s) (event %lu, total %lu)",
+               (unsigned)frag, gRxIdleEvents, gRxIdleDropped);
+  }
+}
+
 // Synchronous "send + wait for ok" used during ALARM recovery. Does not use
 // the queue — recovery runs with bufferFill=0 and we want one ack at a time.
 // Returns true on ok, false on timeout/error/ALARM (caller will MCU-reset).
@@ -750,11 +1113,10 @@ bool recoverySendAndWait(const char* cmd, unsigned long timeout_ms) {
   unsigned long t0 = millis();
   while (millis() - t0 < timeout_ms) {
     if (Serial1.available()) {
-      String r = Serial1.readStringUntil('\n');
-      r.trim();
+      String r = grblReadLine();
       if (r.length() == 0) continue;
-      if (r == "ok") return true;
-      if (r.startsWith("error") || r.startsWith("ALARM")) {
+      if (grblIsOk(r)) return true;
+      if (grblHasError(r) || grblHasAlarm(r)) {
         plog::logf("recovery '%s' got %.40s", cmd, r.c_str());
         return false;
       }
@@ -808,11 +1170,10 @@ void grblAlarmRecover() {
 
 void drainResponses() {
   while (Serial1.available()) {
-    String resp = Serial1.readStringUntil('\n');
-    resp.trim();
+    String resp = grblReadLine();
     if (resp.length() == 0) continue;
 
-    if (resp == "ok") {
+    if (grblIsOk(resp)) {
       // grbl-Mega can emit a duplicate `ok` after $H (one when alarm clears,
       // one when homing completes). Without this guard the spurious ack
       // dequeues a stale slot, desyncing bufferFill so waitForIdle hangs.
@@ -830,7 +1191,7 @@ void drainResponses() {
         // the accounting desync that lets later sends overrun GRBL's RX buffer.
         plog::log("GRBL ok but queue empty (spurious ack)");
       }
-    } else if (resp.startsWith("ALARM")) {
+    } else if (grblHasAlarm(resp)) {
       // Log the command GRBL was processing when it alarmed — for ALARM:2
       // (soft-limit) this is the move whose target left the envelope, which is
       // exactly what we need to pinpoint the offending coordinate.
@@ -847,7 +1208,7 @@ void drainResponses() {
       // After recovery the queue is empty. The caller's send-buffer-wait or
       // waitForIdle loop will see bufferFill==0 and exit cleanly.
       return;
-    } else if (resp.startsWith("error")) {
+    } else if (grblHasError(resp)) {
       if (inStartupPhase) {
         plog::logf("GRBL startup error: %.40s", resp.c_str());
         grblStartupFault = true;
@@ -918,6 +1279,11 @@ void drainResponses() {
 void sendGcode(const char* cmd) {
   int cmdLen = strlen(cmd) + 1;  // +1 for the newline GRBL counts
 
+  // Nothing is owed to us at the top of a fresh command run, so clear out any
+  // orphan fragment the idle line collected before it can glue itself to this
+  // command's ack. Costs one available() check on the hot path.
+  grblDropIdleNoise();
+
   // Reset the stall timer every time the buffer actually drains so a
   // long-but-progressing motion sequence doesn't trip the watchdog.
   unsigned long stallT0 = millis();
@@ -929,7 +1295,15 @@ void sendGcode(const char* cmd) {
       lastFill = bufferFill;
       stallT0 = millis();
     }
-    if (millis() - stallT0 > GRBL_STALL_TIMEOUT_MS) grblStallReset("sendGcode");
+    if (millis() - stallT0 > GRBL_STALL_TIMEOUT_MS) {
+      // During bring-up a stall is recoverable in place — see waitForIdle.
+      if (inStartupPhase) {
+        plog::log("GRBL stall in sendGcode (startup) -> bounce + retry");
+        grblStartupFault = true;
+        return;
+      }
+      grblStallReset("sendGcode");
+    }
   }
 
   // Send `\n` only, not `\r\n` — grbl-Mega treats `\r` as a line end then
@@ -952,7 +1326,27 @@ void waitForIdle() {
       lastFill = bufferFill;
       stallT0 = millis();
     }
-    if (millis() - stallT0 > GRBL_STALL_TIMEOUT_MS) grblStallReset("waitForIdle");
+    if (millis() - stallT0 > GRBL_STALL_TIMEOUT_MS) {
+      // A stall during bring-up must NOT reset the MCU. grblBringup already
+      // has a recovery path for a GRBL that won't answer — bounce Serial1 and
+      // retry homing — but until 2026-08-23 the watchdog fired first and
+      // rebooted the SoC, so that path was unreachable and the rig degenerated
+      // into an 80-second reboot loop instead: 12 boots in 17 minutes, each one
+      // re-running WiFi association, NTP sync and lidar init, and each one
+      // discarding the accumulated in-RAM state for nothing. A dead Mega is not
+      // something the ESP32 can fix by restarting itself.
+      //
+      // Signalling grblStartupFault instead hands control back to grblBringup,
+      // which bounces the UART, backs off, and keeps trying — WiFi stays up,
+      // the log stays continuous, and the rig recovers on its own the moment
+      // GRBL starts answering again.
+      if (inStartupPhase) {
+        plog::log("GRBL stall in waitForIdle (startup) -> bounce + retry");
+        grblStartupFault = true;
+        return;
+      }
+      grblStallReset("waitForIdle");
+    }
   }
 }
 
@@ -996,7 +1390,7 @@ void initColorSensor() {
   digitalWrite(TCS_LED, LOW);
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
-  tcsSelect(TCS_CLEAR);
+  tcsSelect(TCS_CLEAR);  // idle on the channel classifyDisc reads
 }
 
 // OUT is a 50%-duty square wave whose frequency tracks light intensity for
@@ -1021,12 +1415,12 @@ void tcsReadRGBC(unsigned long& r, unsigned long& g,
     tcsSelect(TCS_GREEN);
     delay(2);
     sg += tcsReadFrequencyHz();
-    tcsSelect(TCS_BLUE);
-    delay(2);
-    sb += tcsReadFrequencyHz();
     tcsSelect(TCS_CLEAR);
     delay(2);
     sc += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);
+    delay(2);
+    sb += tcsReadFrequencyHz();
   }
   r = sr / 5;
   g = sg / 5;
@@ -1089,43 +1483,215 @@ const float SCAN_OFFSET_Y = 8.0f;
 const float SCAN_Y_MAX = -0.05f;
 static inline float clampScanY(float y) { return y > SCAN_Y_MAX ? SCAN_Y_MAX : y; }
 
-// Disc classification by a SIMPLE THRESHOLD on the ambient-subtracted clear
-// channel — the two faces separate by ~10x, so no model is needed. gridState
-// holds the FRONT/displayed state (1 = cyan/on, 0 = black/off). The sensor views
-// the BACK of each disc: an ON disc (cyan front) shows its BLACK back and reads
-// LOW; an OFF disc (black front) shows its cyan back and reads HIGH. So on =
-// clear below the threshold. Value sits in the wide gap between the on-cluster
-// (~1.8k) and off-cluster (~16k); a fixed cut is robust to that much margin.
-// Classification threshold. Named for the channel it ACTUALLY reads: physically
-// BLUE, not clear.
+// Disc classification by a SIMPLE THRESHOLD on one ambient-subtracted channel.
+// gridState holds the FRONT/displayed state (1 = cyan/on, 0 = black/off). The
+// sensor views the BACK of each disc: an ON disc (cyan front) shows its BLACK
+// back and reads LOW; an OFF disc (black front) shows its cyan back and reads
+// HIGH. So on = channel below the threshold.
 //
-// !! THE TCS3200 S2/S3 SELECT LINES ARE PHYSICALLY CROSSED ON THIS RIG
-// !! (measured 2026-08-09, 6-pass two-class run). The TcsFilter enum labels are
-// !! the datasheet mapping and are therefore WRONG for what each value selects
-// !! here. An unfiltered channel must be ~ the sum of the filtered ones:
-// !!     true R+G+B = 13276  vs  the value-2 channel = 1753   ratio 0.07  absurd
-// !!     true R+G+B = 13276  vs  the value-1 channel = 13888  ratio 1.05  correct
-// !! So: value 0 -> RED, value 1 -> CLEAR (labelled TCS_BLUE), value 2 -> BLUE
-// !! (labelled TCS_CLEAR), value 3 -> GREEN. tcsReadRGBC's `b` output physically
-// !! holds CLEAR and its `c` output physically holds BLUE, so classifyDisc()
-// !! thresholds BLUE.
+// !! THE INVARIANT: classifyDisc THRESHOLDS THE `c` SLOT -- TcsFilter value 2,
+// !! commanded (S2=H, S3=L). Re-derived 2026-08-22 from full-board ground
+// !! truth, and this REVERSES the 2026-08-20 decision to threshold `b`.
 // !!
-// !! DO NOT "FIX" THE WIRING. Blue discriminates the cyan disc face from the
-// !! black one far better than clear, measured on the same run:
-// !!     blue  (value 2): black-back  828..1628, cyan-back 7677..14695 -> 10.21x
-// !!     clear (value 1): black-back 2075..2903, cyan-back 4462..7046  ->  2.22x
-// !! Clear collects broadband return from both faces and dilutes the colour
-// !! difference. Making the labels honest would cut usable margin from 2.17x
-// !! each way to 1.24x. The names are wrong; the behaviour is correct.
+// !! What went wrong: the 2026-08-20 note claimed BLUE separated 4.61x and
+// !! CLEAR only 1.60x, from 222 cells of rows 0-5. That is backwards. The
+// !! channel it measured as "blue" is the one this code now reads as `c`; the
+// !! labels, not the physics, were swapped. Measured on rows 0-5 of the SAME
+// !! kind of board, ambient-subtracted at 3V3, against the source bitmap:
+// !!     slot `c` (value 2): cyan-front 170..494,  black-front 2137..2992
+// !!     slot `b` (value 1): cyan-front 0..2381,   black-front 427..1669
+// !! Slot `b`'s populations OVERLAP -- no cut can separate them.
+// !!
+// !! Full-board ground truth (666 cells, gallery id 68, check-pass scan,
+// !! target bitmap decoded from gallery.php), best achievable per slot:
+// !!     r: 7 errors   g: 6   b: 14   c: 6
+// !! Live, on `b` at 1112: 24 errors. On `c`: 6.
+// !!
+// !! Corroborated across 40 earlier jobs (ids 26..66, 26,640 cells): the
+// !! pre-2026-08-17 firmware thresholded `c` and scored 89/26,640 = 0.33%.
+// !! On job 42 it scored 0 errors while the best possible score on `b` was 17
+// !! -- proof by contradiction that `b` was never the channel being read.
+// !!
+// !! Threshold: geometric mean of the clean cluster edges, sqrt(494 * 1651)
+// !! = 903 -> 900. The error count is flat (6-7) anywhere from ~700 to ~1400,
+// !! so this sits mid-plateau. Separation at 3V3 is 4.93x (black p05 / cyan
+// !! p95) against a 5V-era median of 5.52x.
+// !!
+// !! SUPPLY-DEPENDENT. The 5V->3V3 move on 2026-08-20 scaled every channel
+// !! down; if the sensor goes back to 5V this MUST be re-derived. Old logs are
+// !! not column-comparable either -- slot semantics have changed twice.
+// !!
+// !! THIS CONSTANT IS ONLY A COLD-START SEED. Since 2026-08-24 the live cut is
+// !! derived from each scan's own two populations -- see chooseClearCut() -- and
+// !! the last accepted value is persisted to flash. SCAN_ON_CLEAR_MAX is used
+// !! only when there is no value on record yet (first scan after a fresh flash)
+// !! AND the current scan cannot supply one.
+const long SCAN_ON_CLEAR_MAX = 900;   // ambient-sub `c` < this => cyan/on (front)
+static inline uint8_t classifyDisc(long c, long cut) { return (c < cut) ? 1 : 0; }
+
+// ------------------------------------------------- adaptive scan threshold
+// WHY THIS EXISTS. A fixed cut has now silently broken the board twice, both
+// times because the HARDWARE moved under it while the disc CONTRAST did not:
+//   * 2026-08-20, TCS3200 5V -> 3V3: every channel scaled down ~3.5x, so the
+//     then-live 3535 sat above BOTH populations and every cell read "cyan".
+//   * 2026-08-23: the return signal halved again (black cluster ~2300 -> ~1000)
+//     and 900 landed INSIDE the black cluster -- it cut 124 of that scan's 213
+//     black cells onto the wrong side, and the draw then "corrected" the board
+//     into noise. That scan was NOT degraded: measured with no labels at all it
+//     was cleanly bimodal at 4.79x separation. Only the cut was wrong.
 //
-// 3535 replaces the historical 6000: the GEOMETRIC MEAN of the two measured
-// populations (black-back ceiling 1628, cyan-back floor 7677), so margin is
-// symmetric in ratio terms. 6000 sat 3.69x above the black-back ceiling but only
-// 1.28x below the cyan-back floor — and the thin side is where the earlier
-// full-board false positives (3291..5955) came from. 3535 gives 2.17x both ways;
-// 0/444 misclassified at either value on the validation run.
-const long SCAN_ON_BLUE_MAX = 3535;   // ambient-sub BLUE < this => cyan/on (front)
-static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
+// The invariant that actually holds across all of it is the RATIO: the two disc
+// faces have separated by ~4.8-5.5x in every healthy scan on record, at 5V and
+// at 3V3 alike. So derive the cut from the scan instead of pinning it.
+//
+// BACKTEST (50 check-pass scans with decoded-bitmap ground truth, both supply
+// regimes). Error rate, cells misclassified:
+//        method            5V (40 jobs)   3V3 (6)   3V3 post-fix (4)
+//        fixed 3535           0.33%        47.42%      48.50%
+//        fixed 900           22.00%         1.60%       0.23%
+//        per-scan Otsu        1.71%         1.75%       0.38%
+//        per-scan GAP CUT     1.45%         1.58%       0.15%
+//        hybrid (below)  ---- 0.49% over all 50 scans ----
+// Each fixed constant is excellent in its own regime and catastrophic in the
+// other. The adaptive cut picked ~5500-6900 at 5V and ~800-1450 at 3V3 on its
+// own, with no retuning, and beat the hand-tuned constant on recent jobs.
+//
+// GAP CUT, NOT RAW OTSU, AND A GAP SEED TOO. The cut is the geometric mean of
+// the two cluster EDGES (low p95, high p05), not Otsu's variance split: that
+// criterion gets dragged around by the ~10x dynamic range, while the gap
+// midpoint is what we actually want, and it won in all three regimes above.
+// The SEED that splits the two sets is now the widest adjacent ratio as well --
+// Otsu seeded there until 2026-08-24, when its class-balance term walked the
+// split into the majority cluster on a 36-cyan image and wedged the rig for
+// three jobs. Full account and backtest at the seed loop in chooseClearCut().
+//
+// THE GUARD, AND WHY "TOO LOW -> RESCAN" IS ONLY HALF RIGHT. Adaptive
+// thresholding has exactly one catastrophic failure and it is in the data: job
+// 56's target bitmap has ZERO cyan cells, so there is no second cluster and the
+// algorithm invents a split -- 280 errors against 1 for a carried-forward cut.
+// But rescanning cannot help there: the cluster is missing because the IMAGE is
+// uniform, not because the sensor is sick, and a rescan returns the same thing.
+// Low separation has two causes and they need opposite responses:
+//   both clusters populated AND sep >= MIN  -> trust it, adopt and persist
+//   both clusters populated AND sep <  MIN  -> populations OVERLAP = sensor
+//                                              fault -> rescan, then refuse
+//   one cluster sparse                      -> uniform image, normal -> use the
+//                                              last accepted cut, do NOT rescan
+// The carry-forward is the useful part: the board learns its cut from the most
+// recent full-contrast scan, so a sparse image inherits a threshold already
+// correct for the current supply and LED brightness, with no constant involved.
+const int   SCAN_MIN_CLUSTER = 40;     // cells; below this a cluster is "sparse"
+// TUNED BY BACKTEST, do not raise on intuition. Swept over the same 50 scans:
+//   MIN_SEP  1.50  1.80  2.00  2.20  2.50  3.00
+//   refused     1     1     2     2     4     5
+//   err rate 0.53% 0.53% 0.53% 0.53% 0.51% 0.50%
+// Accuracy on drawn jobs is FLAT across the whole range while refusals climb,
+// so strictness buys ~24 cell-errors and costs 4 refused prints. 1.80 refuses
+// exactly one scan in 50 — job 56, whose target bitmap has zero cyan cells and
+// which is genuinely undecidable — and passes every scan that was actually fine
+// (including four sparse-image 5V scans that sit at 2.26-2.53 and classify
+// correctly). It also still sits well clear of every healthy scan on record,
+// which measure 4.8-6.2x.
+const float SCAN_MIN_SEP     = 1.8f;   // hi_p05 / lo_p95 for a scan to be trusted
+const long  SCAN_CUT_MIN     = 60;     // sanity band on any derived cut
+const long  SCAN_CUT_MAX     = 20000;
+
+// This scan's raw per-cell reads. Module scope, not stack: 4 x 666 x 4 = ~10.6 KB
+// and the loop task's stack is not the place for it. Classification is deferred
+// to a second pass because the cut is not known until every cell has been read.
+static long scanR[GRID_H][GRID_W], scanG[GRID_H][GRID_W];
+static long scanB[GRID_H][GRID_W], scanC[GRID_H][GRID_W];
+
+// Last accepted cut, mirrored from flash. 0 = nothing on record yet.
+static long lastGoodCut = 0;
+void cutSaveRecord(long cut);          // defined with the other flash records
+
+static int cmpLongAsc(const void* a, const void* b) {
+  long x = *(const long*)a, y = *(const long*)b;
+  return (x > y) - (x < y);
+}
+
+// Derive a cut from scanC[][]. Always fills cut/sep100/nlo/nhi; returns true
+// only when both clusters are populated AND separated, i.e. the scan is
+// trustworthy enough to adopt its cut as the new last-good.
+bool chooseClearCut(long& cutOut, int& sep100Out, int& nloOut, int& nhiOut) {
+  const int N = GRID_W * GRID_H;
+  static long v[GRID_W * GRID_H];
+  int n = 0;
+  for (int y = 0; y < GRID_H; y++)
+    for (int x = 0; x < GRID_W; x++) v[n++] = scanC[y][x];
+  qsort(v, n, sizeof(long), cmpLongAsc);
+
+  // WIDEST-RATIO-GAP SEED, NOT OTSU. Otsu maximises w*(m2-m1)^2, and that `w`
+  // term is a class-BALANCE weight: it collapses toward zero as either side of
+  // the split gets small, so on a lopsided picture Otsu will happily walk the
+  // split INTO the majority cluster to buy back balance. That is not a corner
+  // case, it wedged the rig on 2026-08-24:
+  //   job 79 ("Ak") draws 36 cyan cells out of 666. The scan was perfectly
+  //   healthy -- cyan p95 = 164, black p05 = 832, a clean 5.07x gap -- but
+  //   Otsu seeded ~10 cells deep into the black cluster, so the "low" set came
+  //   back as 46 cells with ~10 black ones in it. That contaminated loP95, and
+  //   sep collapsed 5.07 -> 1.48. With nlo = 46 >= SCAN_MIN_CLUSTER the sparse
+  //   branch below could not catch it either, so scanGrid returned
+  //   untrustworthy, runPendingJob refused to draw, and the job was abandoned
+  //   after 3 attempts. The board never changes when nothing is drawn, so every
+  //   following job re-decided identically: 80 and 81 were abandoned, 82 was
+  //   next. Each abandoned job still leaves a gallery entry pending AND still
+  //   gets a YouTube recording (next.php arms that at pop time), which is why
+  //   those entries showed a video of the PREVIOUS print's board.
+  //
+  // The gap between two disc faces is multiplicative (~4.8-6.2x on every
+  // healthy scan on record), so seed on the widest ADJACENT RATIO instead. It
+  // has no balance term, so a 36/630 split is found exactly as well as a
+  // 330/336 one. Outer 1% is skipped so a single dark or blown outlier cannot
+  // present itself as the gap.
+  //
+  // BACKTEST, 45 check-pass scans from bug_logs_2/plog_2026-08-24.txt with
+  // decoded-bitmap ground truth (gallery.php), same method as SCAN_MIN_SEP:
+  //        seed          refused   err rate
+  //        Otsu             2       0.43%     (refuses 56 and 79)
+  //        widest gap       0       0.36%     (refuses neither)
+  // It is strictly better on the two scans that matter and never worse
+  // elsewhere: job 79 comes back sep=5.10 nlo=38 (correctly SPARSE, not a
+  // fault) and job 27/35, the other two lopsided scans, drop 5->2 and 3->0
+  // errors. Result is insensitive to the skip band over 0.5%-5% (identical
+  // error counts), so 1% is not a tuned number.
+  //
+  // The OVERLAP guard still works -- verified by compressing job 49's two
+  // populations toward their common mean: sep tracks the compression down
+  // (5.89 / 2.81 / 1.98 / 1.58 / 1.20) and trips REFUSE below 1.8 exactly as
+  // before. Fixing the seed removed the FALSE positive without removing the
+  // real one.
+  double bestGap = -1.0;
+  long seed = v[n / 2];
+  const int band = n / 100;            // skip the outer 1% on each side
+  for (int i = (band > 1 ? band : 1); i < n - band; i++) {
+    if (v[i] <= v[i - 1] || v[i - 1] < 1) continue;   // no gap / unusable ratio
+    double r = (double)v[i] / (double)v[i - 1];
+    if (r > bestGap) { bestGap = r; seed = v[i]; }
+  }
+
+  int nlo = 0;
+  while (nlo < n && v[nlo] < seed) nlo++;
+  int nhi = n - nlo;
+  nloOut = nlo; nhiOut = nhi;
+
+  if (nlo < 1 || nhi < 1) {            // degenerate: everything on one side
+    cutOut = lastGoodCut ? lastGoodCut : SCAN_ON_CLEAR_MAX;
+    sep100Out = 0;
+    return false;
+  }
+  long loP95 = v[nlo - 1 - (int)((nlo - 1) * 0.05f)];   // 95th pct of the low set
+  long hiP05 = v[nlo + (int)((nhi - 1) * 0.05f)];       //  5th pct of the high set
+  if (loP95 < 1) loP95 = 1;
+  long cut = (long)sqrt((double)loP95 * (double)hiP05);
+  if (cut < SCAN_CUT_MIN) cut = SCAN_CUT_MIN;
+  if (cut > SCAN_CUT_MAX) cut = SCAN_CUT_MAX;
+  cutOut = cut;
+  sep100Out = (int)((100.0f * hiP05) / loP95);
+  return (nlo >= SCAN_MIN_CLUSTER && nhi >= SCAN_MIN_CLUSTER &&
+          sep100Out >= (int)(SCAN_MIN_SEP * 100));
+}
 
 // Re-home + reassert mm/absolute modes. $1=255 lives in EEPROM so it would
 // survive on its own, but matching the boot sequence keeps state predictable.
@@ -1143,7 +1709,7 @@ void rehome() {
 }
 
 // One full scan sweep: re-home, drop the flip arm to SCAN, sweep the sensor over
-// every cell, read the ambient-subtracted clear channel and threshold it into
+// every cell, read the ambient-subtracted BLUE channel and threshold it into
 // gridState. (The old blown-regime ceiling / re-init recovery is gone — ambient
 // subtraction removes the room-light sensitivity that caused that failure.)
 // Serpentine scan order as a flat index 0..GRID_W*GRID_H-1: even rows L→R, odd
@@ -1156,7 +1722,7 @@ static inline void cellAt(int i, int& y, int& x) {
 static inline float cellScanX(int y, int x) { return grid[y][x].x + SCAN_OFFSET_X; }
 static inline float cellScanY(int y, int x) { return clampScanY(grid[y][x].y + SCAN_OFFSET_Y); }
 
-void scanGrid() {
+bool scanGrid() {
   rehome();
   // Run the scan sweep with the flip arm dropped to SCAN (~33.5°, 12.5° below
   // RELEASE) rather than parked at REST. The sensor trails the flip head by SCAN_OFFSET_X (−24mm,
@@ -1180,19 +1746,16 @@ void scanGrid() {
   cellAt(0, y0, x0);
   moveToYSafe(cellScanX(y0, x0), cellScanY(y0, x0));
   waitForMotion();
-  int rowOn = 0;
   for (int i = 0; i < N; i++) {
     int y, x;
     cellAt(i, y, x);
 
-    // 1. Sense this cell (stationary).
+    // 1. Sense this cell (stationary). Classification is DEFERRED: the cut is
+    //    derived from the whole scan's two populations, which do not exist yet.
     long r, g, b, c;
     readAmbientSubtracted(r, g, b, c);
-    uint8_t on = classifyDisc(c);
-    gridState[y][x] = on;
-    rowOn += on;
+    scanR[y][x] = r; scanG[y][x] = g; scanB[y][x] = b; scanC[y][x] = c;
     bool last = (i == N - 1);
-    bool rowEnd = last || ((i + 1) % GRID_W == 0);
 
     // 2. Start the move to the next cell (non-blocking — GRBL begins moving).
     if (!last) {
@@ -1213,25 +1776,66 @@ void scanGrid() {
       }
     }
 
-    // 3. Write this cell's log to flash WHILE GRBL travels to the next cell.
-    //    Per-cell ambient-subtracted RGBC + on/off; per-row on-count at row end
-    //    (cross-checks displayBitmap's `dB y=N diff=M`). SCAN_PX_LOG_ALL logs
-    //    every cell (~666 lines/scan, needs the raised PLOG_MAX_BYTES).
+    // 3. Ensure the move finished before sensing the next cell. The px logging
+    //    that used to fill this slot (hiding flash writes behind GRBL travel)
+    //    now runs after the sweep, because a cell's verdict is not known until
+    //    the cut is. That costs a few seconds of flash writes at the end of a
+    //    ~17 min scan, and the log format is unchanged.
+    if (!last) waitForMotion();
+  }
+  // Scan done (and any stage-1 squisks swept through) — park the flip arm at REST.
+  writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
+
+  // --- derive this scan's cut from its own two populations -------------------
+  long cut = 0; int sep100 = 0, nlo = 0, nhi = 0;
+  const bool clean = chooseClearCut(cut, sep100, nlo, nhi);
+  const bool populated = (nlo >= SCAN_MIN_CLUSTER && nhi >= SCAN_MIN_CLUSTER);
+  long useCut;
+  const char* mode;
+  bool trustworthy = true;
+  if (clean) {
+    useCut = cut; mode = "adaptive";
+    if (cut != lastGoodCut) { lastGoodCut = cut; cutSaveRecord(cut); }
+  } else if (populated) {
+    // Both clusters exist but they OVERLAP — the sensor is not separating the
+    // faces any more. Drawing on this would scramble the board, which is
+    // exactly what happened on 2026-08-23. Caller re-scans, then gives up.
+    useCut = lastGoodCut ? lastGoodCut : SCAN_ON_CLEAR_MAX;
+    mode = "OVERLAP"; trustworthy = false;
+  } else {
+    // One cluster is sparse: a near-uniform image. Perfectly normal — there is
+    // simply nothing to split, so carry the last accepted cut forward. Do NOT
+    // rescan; the missing cluster is a property of the picture, not the sensor.
+    useCut = lastGoodCut ? lastGoodCut : SCAN_ON_CLEAR_MAX;
+    mode = "sparse";
+  }
+  plog::logf("scan cut: %s t=%ld sep=%d.%02d nlo=%d nhi=%d used=%ld",
+             mode, cut, sep100 / 100, sep100 % 100, nlo, nhi, useCut);
+
+  // --- classify + log, in scan order so the log reads exactly as before ------
+  int rowOn = 0;
+  for (int i = 0; i < N; i++) {
+    int y, x;
+    cellAt(i, y, x);
+    uint8_t on = classifyDisc(scanC[y][x], useCut);
+    gridState[y][x] = on;
+    rowOn += on;
+    bool rowEnd = (i == N - 1) || ((i + 1) % GRID_W == 0);
 #ifdef SCAN_PX_LOG_ALL
     const bool logpx = true;
 #else
     const bool logpx = (y == 0 || y == 1 || y == 2 || y == 9 || y == 14);
 #endif
-    if (logpx) plog::logf("px y%dc%d r%ld g%ld b%ld c%ld on%d", y, x, r, g, b, c, (int)on);
+    if (logpx) plog::logf("px y%dc%d r%ld g%ld b%ld c%ld on%d", y, x,
+                          scanR[y][x], scanG[y][x], scanB[y][x], scanC[y][x], (int)on);
     if (rowEnd) { plog::logf("scan y=%d on=%d", y, rowOn); rowOn = 0; }
-
-    // 4. Ensure the move finished before sensing the next cell.
-    if (!last) waitForMotion();
   }
-  // Scan done (and any stage-1 squisks swept through) — park the flip arm at REST.
-  writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
-  gridStateFresh = true;
-  gridStateFromScan = true;
+
+  // An untrustworthy scan must not be carried into the next job as a "measured"
+  // picture of the board, and must not be re-used to skip the next scan.
+  gridStateFresh = trustworthy;
+  gridStateFromScan = trustworthy;
+  return trustworthy;
 }
 
 // `G4 P0` is a dwell that GRBL syncs through the planner before acking, so
@@ -1716,7 +2320,12 @@ int lidarWindowRead(uint32_t& avg10, uint16_t& mn, uint16_t& mx) {
 #define CADENCE_PATH "/cadence.bin"
 #define CADENCE_TMP  "/cadence.tmp"
 const uint32_t CADENCE_MAGIC   = 0x5041524CUL;  // 'PARL'
-const uint16_t CADENCE_VERSION = 1;
+// v1 -> v2 on 2026-08-25 added the rowsDone/progYear/progYday checkpoint. The
+// version bump makes cadenceLoadRecord reject any v1 record rather than
+// misreading its bytes; the cost is one extra sweep on the first boot after the
+// upgrade, and only the dist10 capture is lost -- which the flash log's `ld`
+// lines already carry verbatim.
+const uint16_t CADENCE_VERSION = 2;
 
 // Module-level (not a stack local): ~1.4 KB, and the loop task's stack is not
 // the place for it. Doubles as the in-RAM cache of what is on flash.
@@ -1771,9 +2380,10 @@ void cadenceLoadRecord() {
     return;
   }
   cadenceRecValid = true;
-  plog::logf("cadence: record y%d d%d ok%lu sensor%d",
+  plog::logf("cadence: record y%d d%d ok%lu sensor%d rows%u",
              (int)(cadenceRec.year + 1900), (int)cadenceRec.yday,
-             (unsigned long)cadenceRec.cellsOk, (int)cadenceRec.sensorOk);
+             (unsigned long)cadenceRec.cellsOk, (int)cadenceRec.sensorOk,
+             (unsigned)cadenceRec.rowsDone);
 }
 
 // Write cadenceRec through a temp file, then swap — same crash policy as
@@ -1799,9 +2409,66 @@ void cadenceSaveRecord() {
   }
   LittleFS.remove(CADENCE_PATH);
   LittleFS.rename(CADENCE_TMP, CADENCE_PATH);
-  plog::logf("cadence: record saved y%d d%d ok%lu",
+  plog::logf("cadence: record saved y%d d%d ok%lu rows%u",
              (int)(cadenceRec.year + 1900), (int)cadenceRec.yday,
-             (unsigned long)cadenceRec.cellsOk);
+             (unsigned long)cadenceRec.cellsOk, (unsigned)cadenceRec.rowsDone);
+}
+
+// ------------------------------------------------- last-good cut flash record
+// The adaptive cut survives reboots so a fresh boot does not have to fall back
+// to the compile-time seed. Same crash policy as cadenceSaveRecord: temp file
+// then rename, and a failed write only costs the seed on the next cold start.
+#define CUT_PATH "/clearcut.bin"
+#define CUT_TMP  "/clearcut.tmp"
+const uint32_t CUT_MAGIC   = 0x50415243UL;  // 'PARC'
+const uint16_t CUT_VERSION = 1;
+
+static uint32_t cutChecksum(const ClearCutRecord& r) {
+  const uint8_t* p = (const uint8_t*)&r;
+  size_t n = sizeof(ClearCutRecord) - sizeof(r.checksum);
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619UL; }
+  return h;
+}
+
+// Anything unexpected leaves lastGoodCut at 0, which just means "no cut on
+// record" — the first scan then supplies one, or the seed is used. Safe.
+void cutLoadRecord() {
+  lastGoodCut = 0;
+  if (!cadenceFsReady()) return;
+  File f = LittleFS.open(CUT_PATH, "r");
+  if (!f) { plog::log("cut: none on flash, seeding from SCAN_ON_CLEAR_MAX"); return; }
+  ClearCutRecord r;
+  if (f.size() != sizeof(r)) { f.close(); plog::log("cut: record size mismatch, ignoring"); return; }
+  size_t got = f.read((uint8_t*)&r, sizeof(r));
+  f.close();
+  if (got != sizeof(r) || r.magic != CUT_MAGIC || r.version != CUT_VERSION ||
+      r.checksum != cutChecksum(r) || r.cut < SCAN_CUT_MIN || r.cut > SCAN_CUT_MAX) {
+    plog::log("cut: record corrupt/out of range, ignoring");
+    return;
+  }
+  lastGoodCut = r.cut;
+  plog::logf("cut: loaded last-good %ld", lastGoodCut);
+}
+
+void cutSaveRecord(long cut) {
+  if (!cadenceFsReady()) return;         // RAM-only until reboot, which is fine
+  ClearCutRecord r;
+  r.magic = CUT_MAGIC; r.version = CUT_VERSION; r.pad = 0;
+  r.cut = (int32_t)cut;
+  r.checksum = cutChecksum(r);
+  File t = LittleFS.open(CUT_TMP, "w");
+  if (!t) { plog::log("cut: save open failed (RAM-only until reboot)"); return; }
+  size_t wrote = t.write((const uint8_t*)&r, sizeof(r));
+  t.close();
+  if (wrote != sizeof(r)) {
+    plog::log("cut: short write (RAM-only until reboot)");
+    LittleFS.remove(CUT_TMP);
+    return;
+  }
+  LittleFS.remove(CUT_PATH);
+  LittleFS.rename(CUT_TMP, CUT_PATH);
+  plog::logf("cut: saved %ld", cut);
 }
 
 static inline bool lidarScanDoneOn(const struct tm& t) {
@@ -1831,11 +2498,33 @@ void runDailyLidarScan(const struct tm& day) {
              day.tm_year + 1900, day.tm_mon + 1, day.tm_mday,
              day.tm_hour, day.tm_min);
 
-  memset(&cadenceRec, 0, sizeof(cadenceRec));
-  cadenceRec.magic   = CADENCE_MAGIC;
-  cadenceRec.version = CADENCE_VERSION;
-  cadenceRec.gridW   = GRID_W;
-  cadenceRec.gridH   = GRID_H;
+  // RESUME POINT. The record used to be stamped only on completion, so a
+  // mid-sweep MCU reset threw the entire pass away and the next boot started
+  // again at cell 0. On 2026-08-25 that turned a recoverable serial glitch
+  // (see grblIsOk) into 7 restarts between 10:00 and 12:13 -- 304, 292, 207,
+  // 291, 295 and 70 cells, none past row 8 of 18 -- and because cadenceGate()
+  // only returns once the scan is done, the rig did not poll or print for the
+  // whole three hours. Left alone it would have looped to the 18:00 cutoff and
+  // printed nothing all day.
+  //
+  // Now every completed row is checkpointed, so a restart costs at most one row
+  // and the sweep converges even if the underlying fault comes back. Resume
+  // only within the SAME local day: a checkpoint from yesterday describes a
+  // board that has been printed on since, so it is not partial data any more.
+  int startRow = 0;
+  if (cadenceRecValid && cadenceRec.sensorOk &&
+      cadenceRec.progYear == day.tm_year && cadenceRec.progYday == day.tm_yday &&
+      cadenceRec.rowsDone > 0 && cadenceRec.rowsDone < GRID_H) {
+    startRow = (int)cadenceRec.rowsDone;
+    plog::logf("cadence: resuming lidar scan at row %d/%d (%lu cells already measured)",
+               startRow, GRID_H, (unsigned long)cadenceRec.cellsOk);
+  } else {
+    memset(&cadenceRec, 0, sizeof(cadenceRec));
+    cadenceRec.magic   = CADENCE_MAGIC;
+    cadenceRec.version = CADENCE_VERSION;
+    cadenceRec.gridW   = GRID_W;
+    cadenceRec.gridH   = GRID_H;
+  }
 
   if (lidarEnsure()) {
     cadenceRec.sensorOk = 1;
@@ -1849,12 +2538,13 @@ void runDailyLidarScan(const struct tm& day) {
     writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
 
     const int N = GRID_W * GRID_H;
+    const int i0 = startRow * GRID_W;      // serpentine visit index of the resume row
     int y0, x0;
-    cellAt(0, y0, x0);
+    cellAt(i0, y0, x0);
     moveToYSafe(lidarTargetX(y0, x0), lidarTargetY(y0, x0));
     waitForMotion();
 
-    for (int i = 0; i < N; i++) {
+    for (int i = i0; i < N; i++) {
       int y, x;
       cellAt(i, y, x);
 
@@ -1887,14 +2577,33 @@ void runDailyLidarScan(const struct tm& day) {
                  (unsigned long)(avg10 / 10), (unsigned long)(avg10 % 10),
                  n, (unsigned)mn, (unsigned)mx);
 
-      // 4. Ensure the move finished before sensing the next cell.
+      // 4. Checkpoint the row that just finished (see the resume note above).
+      //    ~1.4 KB through the temp-file swap, 17 times a sweep, and it sits in
+      //    the same pipelined window as the plog write -- hidden behind GRBL's
+      //    travel to the next cell. The final row is skipped here because the
+      //    completion stamp below writes the record anyway.
+      if (!last && (i + 1) % GRID_W == 0) {
+        cadenceRec.rowsDone = (uint16_t)((i + 1) / GRID_W);
+        cadenceRec.progYear = day.tm_year;
+        cadenceRec.progYday = day.tm_yday;
+        cadenceSaveRecord();
+      }
+
+      // 5. Ensure the move finished before sensing the next cell.
       if (!last) waitForMotion();
     }
+    cadenceRec.rowsDone = GRID_H;          // sweep complete
   } else {
-    plog::log("cadence: lidar unavailable - recording an empty scan for today");
     // The date is still stamped. A dead ranger must not put the rig into a
     // retry loop that spends the whole day re-attempting a 50-minute sweep;
     // sensorOk=0 says plainly that this day has no data.
+    //
+    // sensorOk is deliberately NOT forced to 0 here. On the resume path it may
+    // already be 1 with a checkpoint's worth of real cells behind it, and it
+    // means "the ranger produced the cells that are present" -- cellsOk says
+    // how many. Only the fresh path reaches here with sensorOk=0, from memset.
+    plog::logf("cadence: lidar unavailable - writing off today (rows%u cells%lu)",
+               (unsigned)cadenceRec.rowsDone, (unsigned long)cadenceRec.cellsOk);
   }
 
   // Stamp with the time the scan FINISHED, re-read rather than reusing `day`:
@@ -2082,11 +2791,21 @@ void grblBringup() {
     break;
 
 restart_grbl:
-    plog::log("GRBL restart + retry homing");
-    Serial1.end();
-    delay(200);
-    Serial1.begin(115200, SERIAL_8N1, D0, D1);
-    delay(2000);  // GRBL boot wait after re-opening Serial1
+    // Escalating backoff. A transient fault clears on the first bounce, so the
+    // early retries stay fast; a Mega that is unpowered, unplugged or hung will
+    // never clear, and hammering it every ~80 s (the stall timeout plus a fixed
+    // 2 s wait) just burns the flash log and the servo park cycle. Cap at 60 s
+    // so recovery is still prompt once the hardware comes back.
+    {
+      unsigned long backoff = 2000UL * (unsigned long)attempt;
+      if (backoff > GRBL_RETRY_BACKOFF_MAX_MS) backoff = GRBL_RETRY_BACKOFF_MAX_MS;
+      plog::logf("GRBL restart + retry homing (attempt %d, backoff %lums)",
+                 attempt, backoff);
+      Serial1.end();
+      delay(200);
+      Serial1.begin(115200, SERIAL_8N1, D0, D1);
+      delay(backoff);  // GRBL boot wait after re-opening Serial1
+    }
   }
   inStartupPhase = false;
   grblHomed = true;
@@ -2094,14 +2813,34 @@ restart_grbl:
 
 void setup() {
   // Servo is driven by a dedicated 5V Arduino Nano over Serial2, TX-only on D9
-  // → Nano D0 RX, shared GND. RX pin is -1 (nothing comes back on this link).
+  // → Nano D2 RX (SoftwareSerial), shared GND. RX pin is -1 (nothing comes back on this link).
   // One-way; the companion sketch parses integer µs values per line. Bring the
   // UART up first so the very first park command below is actually received.
   // The ESP32-S3 GPIO matrix routes UART2's TX to D9, so the WIRING IS
   // UNCHANGED from the RP2040 bit-bang that used to drive the same pin.
+  // Shield peripheral rail FIRST -- the ServoNano this park command is aimed at
+  // is powered from it, and so is GRBL. No-op on a hand-wired rig.
+  pinMode(SHIELD_PWR_PIN, OUTPUT);
+  digitalWrite(SHIELD_PWR_PIN, HIGH);
+
+  pinMode(SERVO_ACK_PIN, INPUT);  // divider's bottom leg is the pulldown
+
+  // Long enough for the rail to rise AND the ServoNano's bootloader to hand
+  // over, or the park below is sent into a board that is not listening yet and
+  // the arm stays wherever it was.
+  //
+  // !! Serial2.begin() is DELIBERATELY AFTER this delay. Opening the UART
+  // !! drives D9 to the idle-HIGH state immediately, and D9 goes to an input on
+  // !! the ServoNano -- which is on the switched rail and therefore still at
+  // !! 0 V during the ramp. Driving 3.3 V into an input whose VDD is 0 V
+  // !! forward-biases that pin's protection diode and injects current into the
+  // !! dead rail. Leaving the UART shut keeps D9 high-Z (the ESP32 reset
+  // !! default) until the ServoNano is actually powered, which removes the
+  // !! injection entirely -- and does it without raising R1, whose value is set
+  // !! by noise immunity on the servo command line, not by this.
+  delay(SHIELD_PWR_SETTLE_MS);
+
   Serial2.begin(9600, SERIAL_8N1, -1, SERVO_TX_PIN);
-  pinMode(SERVO_ACK_PIN, INPUT_PULLUP);
-  delay(100);
   servoTxLine(SERVO_US_REST);
 
   delay(10000);
@@ -2120,6 +2859,14 @@ void setup() {
   // The log persists across resets.
   plog::begin();
   plog::log("boot");
+#if SERVO_ACK_MODE > 0
+  // Active-HIGH ack: the line must idle LOW. Idling HIGH means the
+  // ServoNano still has the old active-LOW firmware, under which every
+  // command would read as acked and SERVO_ACK_MODE 2 would enforce
+  // nothing. By here the boot REST command's 40 ms pulse is long gone.
+  if (!servoAckProbeIdle())
+    plog::log("ACK LINE IDLES HIGH - ServoNano is probably still running the OLD active-LOW build. The ack is NOT protecting you: flash ServoNano.ino before running any job.");
+#endif
   // Flip/servo build variables. A boot line is the only record of which firmware
   // a run actually used, and the flip regime (engage/release base angles, comp
   // mode, unload) is exactly what a bad print has to be read against. Mirrors
@@ -2202,6 +2949,7 @@ void setup() {
   timeBegin();
   timeWaitForSync(30000);
   cadenceLoadRecord();
+  cutLoadRecord();
   // Bring the ranger up now rather than lazily at the first 10:00 scan, so a
   // wiring fault surfaces in the log at boot. Bounded (10 attempts) and
   // idempotent — runDailyLidarScan()'s own lidarEnsure() re-tries anyway if
@@ -2326,6 +3074,242 @@ void sendSnapshotRequest(const char* galleryId) {
   }
 }
 
+// ---- in-flight job persistence --------------------------------------------
+// next.php POPS a queue item — the server hands it over exactly once and keeps
+// no copy in the queue. So from the moment fetchNext() returns, the ONLY record
+// that this print was ever requested lives in this MCU's RAM. Any reset before
+// the job completes destroys it: the item is gone from queue.txt, no snapshot
+// is ever requested, and the gallery entry sits `pending` forever.
+//
+// That is precisely how gallery 80 ("Ak") was lost on 2026-08-23 — popped at
+// 14:38, killed one second into scanGrid by the GRBL stall watchdog, and never
+// seen again. Job 79 died the same way mid-draw.
+//
+// Fix: write the bitmap and gallery id to flash the moment we accept a job, and
+// resume from flash on the next boot instead of polling for new work. The
+// record is cleared only once the print is finished and its snapshot requested.
+// Redrawing is idempotent — a resumed job re-scans the board first (gridState
+// is not trusted across a reset), so it fixes up whatever was half-drawn rather
+// than starting from a false picture.
+#define JOB_PATH "/job.bin"
+#define JOB_TMP  "/job.tmp"
+const uint32_t JOB_MAGIC   = 0x50414A42UL;  // 'PAJB'
+const uint16_t JOB_VERSION = 1;
+
+// A job that resets the MCU every time it runs would otherwise resume forever
+// and brick the rig. Give up after this many starts and move on.
+const uint8_t JOB_MAX_ATTEMPTS = 3;
+
+struct PendingJobRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint8_t  attempts;      // how many times this job has been STARTED
+  uint8_t  reserved;
+  char     galleryId[16];
+  uint8_t  bitmap[84];
+  uint32_t checksum;
+};
+
+// Takes void* rather than const PendingJobRecord& on purpose: the .ino
+// preprocessor hoists a prototype for every function to the top of the file,
+// ahead of the struct definition, so a user type in the signature fails to
+// compile. Plain types sidestep that entirely.
+static uint32_t jobChecksum(const void* rec, size_t n) {
+  const uint8_t* p = (const uint8_t*)rec;
+  uint32_t h = 2166136261UL;  // FNV-1a, same as the cadence record
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619UL; }
+  return h;
+}
+// Bytes covered by the checksum: the whole record except the trailing field.
+#define JOB_CHECKED_BYTES (sizeof(PendingJobRecord) - sizeof(uint32_t))
+
+// Temp-file-then-rename, matching cadenceSaveRecord's crash policy. A brownout
+// mid-swap loses the record, which costs exactly what today's behaviour costs.
+void jobSavePending(const uint8_t* bitmap, const char* galleryId, uint8_t attempts) {
+  if (!cadenceFsReady()) {
+    plog::log("job: LittleFS unavailable - in-flight job NOT crash-safe");
+    return;
+  }
+  PendingJobRecord r;
+  memset(&r, 0, sizeof(r));
+  r.magic = JOB_MAGIC;
+  r.version = JOB_VERSION;
+  r.attempts = attempts;
+  strncpy(r.galleryId, galleryId, sizeof(r.galleryId) - 1);
+  memcpy(r.bitmap, bitmap, sizeof(r.bitmap));
+  r.checksum = jobChecksum(&r, JOB_CHECKED_BYTES);
+
+  File t = LittleFS.open(JOB_TMP, "w");
+  if (!t) { plog::log("job: save open failed"); return; }
+  size_t wrote = t.write((const uint8_t*)&r, sizeof(r));
+  t.close();
+  if (wrote != sizeof(r)) {
+    plog::logf("job: short write %u", (unsigned)wrote);
+    LittleFS.remove(JOB_TMP);
+    return;
+  }
+  LittleFS.remove(JOB_PATH);
+  LittleFS.rename(JOB_TMP, JOB_PATH);
+  plog::logf("job: saved id=%s attempt=%u", r.galleryId, (unsigned)attempts);
+}
+
+// Anything unexpected (missing, short, wrong magic/version, bad checksum) means
+// "no job on record" — the rig polls for new work, which is the safe direction.
+bool jobLoadPending(uint8_t* bitmapOut, char* idOut, size_t idCap, uint8_t& attemptsOut) {
+  if (!cadenceFsReady()) return false;
+  File f = LittleFS.open(JOB_PATH, "r");
+  if (!f) return false;
+  if (f.size() != sizeof(PendingJobRecord)) {
+    plog::logf("job: record size %u != %u, ignoring",
+               (unsigned)f.size(), (unsigned)sizeof(PendingJobRecord));
+    f.close();
+    LittleFS.remove(JOB_PATH);
+    return false;
+  }
+  PendingJobRecord r;
+  size_t got = f.read((uint8_t*)&r, sizeof(r));
+  f.close();
+  if (got != sizeof(r) || r.magic != JOB_MAGIC || r.version != JOB_VERSION ||
+      r.checksum != jobChecksum(&r, JOB_CHECKED_BYTES)) {
+    plog::log("job: record corrupt/foreign, discarding");
+    LittleFS.remove(JOB_PATH);
+    return false;
+  }
+  r.galleryId[sizeof(r.galleryId) - 1] = '\0';
+  if (strlen(r.galleryId) == 0 || strlen(r.galleryId) >= idCap) {
+    plog::log("job: record has unusable gallery id, discarding");
+    LittleFS.remove(JOB_PATH);
+    return false;
+  }
+  memcpy(bitmapOut, r.bitmap, sizeof(r.bitmap));
+  strncpy(idOut, r.galleryId, idCap - 1);
+  idOut[idCap - 1] = '\0';
+  attemptsOut = r.attempts;
+  return true;
+}
+
+void jobClearPending() {
+  if (!cadenceFsReady()) return;
+  if (LittleFS.remove(JOB_PATH)) plog::log("job: cleared");
+}
+
+// The whole print, from board scan through snapshot request. Extracted from
+// loop() so a job resumed from flash runs the exact same path as a freshly
+// polled one — there is no second, subtly-different code path to drift.
+// `fallbackId` is used only when pendingGalleryId is empty (a job whose id
+// failed validation, which is never persisted).
+void runPendingJob(uint8_t* bitmap, const char* fallbackId) {
+  // Re-scan the board before each job IF gridState[] isn't already a
+  // trustworthy *measured* picture of the discs. Two ways it can be:
+  //   * the very first job after boot reuses setup()'s scan;
+  //   * the previous job ended on a scan with no fix after it (check pass
+  //     found <= CHECK_FIX_MAX_SKIP wrong, or the draw flipped nothing at
+  //     all) — see the end-of-job carry-over below.
+  // Any flip since that scan makes the state inferred rather than measured,
+  // so we pay the full sweep again.
+  if (!gridStateFresh) {
+    plog::log("scanGrid begin");
+    if (!scanGrid()) {
+      // Both populations present but overlapping — the sensor is not
+      // separating the faces. One retry, in case it was transient.
+      plog::log("scan quality bad (overlap) — re-scanning once");
+      if (!scanGrid()) {
+        // Still bad. Drawing against this is how the board gets scrambled, so
+        // do not draw at all. The job record is left pending (jobClearPending
+        // only runs on the success path below), so the next loop pass resumes
+        // it and JOB_MAX_ATTEMPTS bounds the retries.
+        plog::log("scan still bad — REFUSING TO DRAW, job left pending");
+        releaseSteppers();
+        return;
+      }
+    }
+  } else {
+    // The scan homes on its own; skipping it means we still owe a homing
+    // cycle if the steppers were released for the idle (the gantry can be
+    // nudged with the motors off).
+    if (needsRehome) {
+      plog::log("rehome (scan skipped)");
+      rehome();
+    }
+    plog::log("scanGrid skipped (state fresh)");
+  }
+
+  plog::log("displayBitmap begin");
+  int flipped = displayBitmap(bitmap);
+  waitForIdle();
+  plog::logf("displayBitmap flipped %d cells", flipped);
+
+  // Check pass: re-scan the board (which reseeds gridState[] from the
+  // physical discs, catching any that didn't flip cleanly), then run
+  // displayBitmap again so its diff-against-gridState logic re-flips just
+  // the cells that are still wrong. Two short-circuits (CHECK_FIX_MAX_SKIP):
+  //   1. If the first draw flipped that few cells or fewer, the job was tiny
+  //      (few chances to fail) — skip the whole check pass, re-scan and all.
+  //   2. Otherwise re-scan, but only re-flip when MORE than that many cells
+  //      are still wrong. The color sensor is ~99.5% accurate, so a 666-cell
+  //      scan misreads ~3 cells on average — <=5 mismatches sit in that noise
+  //      floor, so re-flipping them would more likely flip a correct disc
+  //      than fix a real miss. Tolerating <=5 doesn't lower accuracy.
+  if (flipped <= CHECK_FIX_MAX_SKIP) {
+    plog::logf("check pass skipped (only %d flipped)", flipped);
+  } else {
+    plog::log("check pass: scanGrid begin");
+    if (!scanGrid()) {
+      // The board is already drawn; the only thing a bad check-pass scan can do
+      // is re-flip correct cells. Skip the fix rather than retry the 17 min
+      // scan. gridStateFresh is already false, so the next job re-measures.
+      plog::log("check pass: scan quality bad (overlap) — skipping fix");
+    } else {
+      int wrong = countMismatches(bitmap);
+      if (wrong > CHECK_FIX_MAX_SKIP) {
+        plog::logf("check pass: %d wrong, re-fixing", wrong);
+        displayBitmap(bitmap);
+        waitForIdle();
+      } else {
+        plog::logf("check pass: %d wrong (<=%d), skip fix", wrong, CHECK_FIX_MAX_SKIP);
+      }
+    }
+  }
+
+  plog::log("display done");
+  // Trigger the snapshot now that the board reflects the final corrected
+  // state (after the check pass), rather than relying on next.php to have
+  // armed it at job start — that earlier armed window let the snapshot
+  // poller grab a photo mid-draw.
+  sendSnapshotRequest(pendingGalleryId[0] ? pendingGalleryId : fallbackId);
+  onDisplayComplete();
+  // The print is done and the snapshot requested, so the job can no longer be
+  // lost by a reset. Drop the flash record before the long idle — leaving it
+  // would make the next boot redraw a print that already completed.
+  jobClearPending();
+  // Carry the scan over to the next job when gridState[] is still a
+  // measured picture of the board — i.e. the last thing that touched the
+  // discs was a scan, with no fixing after it (check pass re-scanned and
+  // found <= CHECK_FIX_MAX_SKIP wrong, or the draw itself flipped nothing).
+  // That scan already describes the final board, so re-running it next job
+  // costs ~70 min to learn what we just measured. If anything flipped after
+  // the last scan, the state is only inferred and the next job re-scans.
+  gridStateFresh = gridStateFromScan;
+  // Release steppers for the long idle (the $1=0 + jog dance, with its
+  // mandatory post-$1=0 sync — see releaseSteppers()).
+  releaseSteppers();
+  // The print is finished, so this is the cadence's decision point: if the
+  // day is over, sleep through the night instead of lingering 10 minutes and
+  // polling again. Checked HERE rather than only at the top of loop() so the
+  // rig never starts a ~1 h job it would finish deep into the evening and
+  // then immediately start another.
+  struct tm nowT;
+  if (localNow(nowT) && isNightHour(nowT.tm_hour)) {
+    sleepUntilMorning();
+  } else {
+    // Post-display linger: paces polling and lets the board settle before the
+    // next job. The recording is already stopped by now — the Mac Mini ends it
+    // when it captures this print's snapshot (the snapshot request above is the
+    // single "print done" signal), so no stream-end is sent from here.
+    delay(10UL * 60UL * 1000UL);
+  }
+}
+
 void loop() {
   ensureWiFi();
   timeBegin();
@@ -2340,19 +3324,57 @@ void loop() {
   // First clear daytime pass since boot: bring GRBL up and home now. No-op on
   // every later pass.
   grblBringup();
-  plog::log("poll start");
+
+  // Resume an interrupted job BEFORE asking the server for new work. next.php
+  // has no copy of a popped item, so this flash record is the only thing that
+  // can bring one back after a reset.
+  uint8_t bitmap[128];
+  bool haveJob = false;
+  {
+    char savedId[sizeof(pendingGalleryId)];
+    uint8_t attempts = 0;
+    if (jobLoadPending(bitmap, savedId, sizeof(savedId), attempts)) {
+      if (attempts >= JOB_MAX_ATTEMPTS) {
+        // Something about this job kills the MCU every time. Abandon it rather
+        // than resuming forever — the gallery entry stays pending, but the rig
+        // stays useful.
+        plog::logf("job: id=%s abandoned after %u attempts", savedId, (unsigned)attempts);
+        jobClearPending();
+      } else {
+        attempts++;
+        plog::logf("job: resuming id=%s attempt %u/%u",
+                   savedId, (unsigned)attempts, (unsigned)JOB_MAX_ATTEMPTS);
+        jobSavePending(bitmap, savedId, attempts);
+        strncpy(pendingGalleryId, savedId, sizeof(pendingGalleryId) - 1);
+        pendingGalleryId[sizeof(pendingGalleryId) - 1] = '\0';
+        // The board was left in an unknown, possibly half-drawn state, so the
+        // job must re-measure it rather than draw against a stale picture.
+        gridStateFresh = false;
+        gridStateFromScan = false;
+        haveJob = true;
+      }
+    }
+  }
+
   int status = 0;
   String galleryId = "";
   String body = "";
-  bool ok = fetchNext(status, galleryId, body);
-  if (!ok) {
-    plog::log("poll fetchNext failed");
-    delay(10000);
-    return;
-  }
-  plog::logf("poll status=%d bodyLen=%u", status, (unsigned)body.length());
 
-  if (status == 200 && body != "NONE" && body.length() > 0) {
+  if (!haveJob) {
+    plog::log("poll start");
+    bool ok = fetchNext(status, galleryId, body);
+    if (!ok) {
+      plog::log("poll fetchNext failed");
+      delay(10000);
+      return;
+    }
+    plog::logf("poll status=%d bodyLen=%u", status, (unsigned)body.length());
+  }
+
+  if (haveJob) {
+    // Resumed from flash — bitmap and pendingGalleryId are already populated.
+    runPendingJob(bitmap, pendingGalleryId);
+  } else if (status == 200 && body != "NONE" && body.length() > 0) {
     // 37 cols × 18 rows = 666 bits → 84 bytes (last byte has 6 padding bits).
     // 84 bytes encodes to exactly 112 base64 chars. decode_base64() does no
     // output-bounds-check, so reject anything longer before we hand it the
@@ -2364,7 +3386,8 @@ void loop() {
       delay(10000);
       return;
     }
-    uint8_t bitmap[128];
+    // Decodes into loop()'s `bitmap` (declared above for the resume path) —
+    // one buffer serves both, so there is no shadowing copy to get out of sync.
     int decoded = decode_base64((unsigned char*)body.c_str(), bitmap);
 
     if (decoded == 84) {
@@ -2381,92 +3404,10 @@ void loop() {
         pendingGalleryId[sizeof(pendingGalleryId) - 1] = '\0';
       }
 
-      // Re-scan the board before each job IF gridState[] isn't already a
-      // trustworthy *measured* picture of the discs. Two ways it can be:
-      //   * the very first job after boot reuses setup()'s scan;
-      //   * the previous job ended on a scan with no fix after it (check pass
-      //     found <= CHECK_FIX_MAX_SKIP wrong, or the draw flipped nothing at
-      //     all) — see the end-of-job carry-over below.
-      // Any flip since that scan makes the state inferred rather than measured,
-      // so we pay the full sweep again.
-      if (!gridStateFresh) {
-        plog::log("scanGrid begin");
-        scanGrid();
-      } else {
-        // The scan homes on its own; skipping it means we still owe a homing
-        // cycle if the steppers were released for the idle (the gantry can be
-        // nudged with the motors off).
-        if (needsRehome) {
-          plog::log("rehome (scan skipped)");
-          rehome();
-        }
-        plog::log("scanGrid skipped (state fresh)");
-      }
-
-      plog::log("displayBitmap begin");
-      int flipped = displayBitmap(bitmap);
-      waitForIdle();
-      plog::logf("displayBitmap flipped %d cells", flipped);
-
-      // Check pass: re-scan the board (which reseeds gridState[] from the
-      // physical discs, catching any that didn't flip cleanly), then run
-      // displayBitmap again so its diff-against-gridState logic re-flips just
-      // the cells that are still wrong. Two short-circuits (CHECK_FIX_MAX_SKIP):
-      //   1. If the first draw flipped that few cells or fewer, the job was tiny
-      //      (few chances to fail) — skip the whole check pass, re-scan and all.
-      //   2. Otherwise re-scan, but only re-flip when MORE than that many cells
-      //      are still wrong. The color sensor is ~99.5% accurate, so a 666-cell
-      //      scan misreads ~3 cells on average — <=5 mismatches sit in that noise
-      //      floor, so re-flipping them would more likely flip a correct disc
-      //      than fix a real miss. Tolerating <=5 doesn't lower accuracy.
-      if (flipped <= CHECK_FIX_MAX_SKIP) {
-        plog::logf("check pass skipped (only %d flipped)", flipped);
-      } else {
-        plog::log("check pass: scanGrid begin");
-        scanGrid();
-        int wrong = countMismatches(bitmap);
-        if (wrong > CHECK_FIX_MAX_SKIP) {
-          plog::logf("check pass: %d wrong, re-fixing", wrong);
-          displayBitmap(bitmap);
-          waitForIdle();
-        } else {
-          plog::logf("check pass: %d wrong (<=%d), skip fix", wrong, CHECK_FIX_MAX_SKIP);
-        }
-      }
-
-      plog::log("display done");
-      // Trigger the snapshot now that the board reflects the final corrected
-      // state (after the check pass), rather than relying on next.php to have
-      // armed it at job start — that earlier armed window let the snapshot
-      // poller grab a photo mid-draw.
-      sendSnapshotRequest(pendingGalleryId[0] ? pendingGalleryId : galleryId.c_str());
-      onDisplayComplete();
-      // Carry the scan over to the next job when gridState[] is still a
-      // measured picture of the board — i.e. the last thing that touched the
-      // discs was a scan, with no fixing after it (check pass re-scanned and
-      // found <= CHECK_FIX_MAX_SKIP wrong, or the draw itself flipped nothing).
-      // That scan already describes the final board, so re-running it next job
-      // costs ~70 min to learn what we just measured. If anything flipped after
-      // the last scan, the state is only inferred and the next job re-scans.
-      gridStateFresh = gridStateFromScan;
-      // Release steppers for the long idle (the $1=0 + jog dance, with its
-      // mandatory post-$1=0 sync — see releaseSteppers()).
-      releaseSteppers();
-      // The print is finished, so this is the cadence's decision point: if the
-      // day is over, sleep through the night instead of lingering 10 minutes and
-      // polling again. Checked HERE rather than only at the top of loop() so the
-      // rig never starts a ~1 h job it would finish deep into the evening and
-      // then immediately start another.
-      struct tm nowT;
-      if (localNow(nowT) && isNightHour(nowT.tm_hour)) {
-        sleepUntilMorning();
-      } else {
-        // Post-display linger: paces polling and lets the board settle before the
-        // next job. The recording is already stopped by now — the Mac Mini ends it
-        // when it captures this print's snapshot (the snapshot request above is the
-        // single "print done" signal), so no stream-end is sent from here.
-        delay(10UL * 60UL * 1000UL);
-      }
+      // Persisted BEFORE any motion: from here on a reset can recover the job
+      // instead of losing it with the queue item that no longer exists server-side.
+      if (pendingGalleryId[0]) jobSavePending(bitmap, pendingGalleryId, 1);
+      runPendingJob(bitmap, galleryId.c_str());
     } else {
       plog::logf("bad decode length: %d", decoded);
     }

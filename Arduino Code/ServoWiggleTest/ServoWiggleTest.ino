@@ -22,7 +22,7 @@ const float X_RIGHT = -31.0f;   // rightmost disc column
 const float Y_TOP   = -3.0f;
 const float Y_BOT   = -399.0f;
 
-const int SERVO_US_REST    = 544;
+const int SERVO_US_REST    = 565;
 const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/≈38°)
 const int SERVO_US_ENGAGE  = 1471;
 const int SERVO_90_DEG_SETTLE_MS = 300;

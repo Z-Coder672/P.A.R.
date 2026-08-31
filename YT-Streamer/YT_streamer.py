@@ -225,6 +225,7 @@ MOD_REASONING: Literal["low", "medium", "high", "xhigh", "max"] = cast(
 )
 MOD_IMAGE_MODEL    = os.getenv("MOD_IMAGE_MODEL", "claude-sonnet-4-6")
 MOD_NAME_MODEL     = os.getenv("MOD_NAME_MODEL",  "claude-haiku-4-5-20251001")
+MOD_ARTIST_MODEL   = os.getenv("MOD_ARTIST_MODEL", "claude-haiku-4-5-20251001")
 NOTIFY_EMAIL       = os.getenv("NOTIFY_EMAIL")
 SMTP_HOST          = os.getenv("SMTP_HOST")
 SMTP_USER          = os.getenv("SMTP_USER")
@@ -1694,6 +1695,24 @@ Respond with ONLY valid JSON, no markdown, no preamble. Schema:
 }
 """
 
+_MOD_ARTIST_SYSTEM_PROMPT = """\
+You are a content-policy reviewer for a community pixel-art display. You will be given the user-submitted artist name (free text, up to ~100 chars). It is an optional credit line, shown in the gallery as "by <artist>".
+
+Reject for: slurs, hate speech, sexual content, doxxing, targeted harassment, or spam/scam URLs. Approve harmless names (including silly, edgy-but-clean, non-English content, real names, handles, or pseudonyms). Use "review" only when uncertain.
+
+Curse words are NOT reason for rejection.
+
+Impersonation of a real, identifiable public figure or organization should be a "review" descision.
+
+Non-hate political speech should be a "review" descision.
+
+Respond with ONLY valid JSON, no markdown, no preamble. Schema:
+{"verdict": "approve" | "review" | "reject",
+ "confidence": <float 0.0-1.0>,
+ "flags": [<short strings>],
+}
+"""
+
 
 PIXEL_W = 37
 PIXEL_H = 18
@@ -1856,6 +1875,27 @@ def check_name(name: str) -> dict:
     return _claude_json(_MOD_NAME_SYSTEM_PROMPT, user_prompt, MOD_NAME_MODEL)
 
 
+def check_artist(artist: str) -> dict:
+    """Moderate the optional artist credit, independently of the piece name.
+
+    The field is optional, so a blank value is not "an empty name to judge" —
+    it is nothing at all. Short-circuit to a synthetic high-confidence approve
+    rather than asking the model about an empty string, which would otherwise
+    drag every artist-less submission into human review.
+    """
+    artist = (artist or "").strip()
+    if not artist:
+        return {"verdict": "approve", "confidence": 1.0,
+                "flags": [], "reasoning": "no artist name given"}
+
+    user_prompt = (
+        f"Moderate this artist name for a pixel art community site: {artist}\n\n"
+        'Respond ONLY with JSON: {"verdict":"approve|review|reject",'
+        '"confidence":0.0-1.0,"flags":[...],"reasoning":"max 20 words"}'
+    )
+    return _claude_json(_MOD_ARTIST_SYSTEM_PROMPT, user_prompt, MOD_ARTIST_MODEL)
+
+
 def _render_result(label: str, result: dict | Exception) -> str:
     if isinstance(result, Exception):
         return (
@@ -1877,7 +1917,8 @@ def _render_result(label: str, result: dict | Exception) -> str:
 
 
 def send_mod_email(item_id: str, name: str, png_b64: str,
-                   image_result, name_result) -> bool:
+                   image_result, name_result,
+                   artist: str = "", artist_result=None) -> bool:
     if not (NOTIFY_EMAIL and SMTP_HOST and SMTP_USER and SMTP_PASS):
         log.warning("[mod] Email not sent — SMTP not configured")
         return False
@@ -1893,6 +1934,7 @@ def send_mod_email(item_id: str, name: str, png_b64: str,
 <html><body style="font-family:system-ui,sans-serif;max-width:48rem">
   <h2>P.A.R. moderation review: #{item_id}</h2>
   <p><strong>Submission name:</strong> {name or '<em>(none)</em>'}</p>
+  <p><strong>Artist name:</strong> {artist or '<em>(none)</em>'}</p>
   <p>
     <img src="cid:{image_cid}"
          style="image-rendering:pixelated;width:456px;height:216px;
@@ -1900,6 +1942,7 @@ def send_mod_email(item_id: str, name: str, png_b64: str,
   </p>
   {_render_result('Image check', image_result)}
   {_render_result('Name check', name_result)}
+  {_render_result('Artist check', artist_result) if artist_result is not None else ''}
   <p style="margin-top:2rem">
     <a href="{approve_url}"
        style="background:#0a0;color:#fff;padding:0.6rem 1rem;
@@ -1971,6 +2014,9 @@ def process_mod_item(item: dict) -> None:
     item_id   = str(item.get("id", ""))
     image_b64 = item.get("image_b64", "")
     name      = item.get("name", "") or ""
+    # Optional credit line; absent on legacy queue entries and on submissions
+    # that left it blank, so it is deliberately NOT part of the guard below.
+    artist    = item.get("artist", "") or ""
 
     if not item_id or not image_b64:
         log.warning(f"[mod] Skipping malformed item: {item!r}")
@@ -1986,11 +2032,13 @@ def process_mod_item(item: dict) -> None:
         return
 
     t0 = time.monotonic()
-    log.info(f"[mod] #{item_id} → checking (name={name!r}, effort={MOD_REASONING})")
+    log.info(f"[mod] #{item_id} → checking (name={name!r}, artist={artist!r}, "
+             f"effort={MOD_REASONING})")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        fut_img  = pool.submit(check_image, png_for_claude)
-        fut_name = pool.submit(check_name, name)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        fut_img    = pool.submit(check_image, png_for_claude)
+        fut_name   = pool.submit(check_name, name)
+        fut_artist = pool.submit(check_artist, artist)
 
         # Outer timeout = generous bound around per-attempt timeout * (1 + retries)
         # so the threadpool .result() doesn't fire before check_image's
@@ -2027,19 +2075,37 @@ def process_mod_item(item: dict) -> None:
                         f"{time.monotonic()-t0:.1f}s: {e}")
             name_result = e
 
-    # Auto-approve only when BOTH checks come back as high-confidence approve.
-    # Per user spec, anything else — including a confident reject — goes to a
-    # human via email rather than being auto-rejected.
-    if (isinstance(image_result, dict) and isinstance(name_result, dict)
-            and _is_clear_approve(image_result) and _is_clear_approve(name_result)):
+        try:
+            artist_result = fut_artist.result(timeout=outer_budget)
+            log.info(f"[mod] #{item_id} artist check done in "
+                     f"{time.monotonic()-t0:.1f}s: "
+                     f"verdict={artist_result.get('verdict')!r} "
+                     f"conf={artist_result.get('confidence')}")
+        except concurrent.futures.TimeoutError:
+            log.warning(f"[mod] artist check exhausted {outer_budget}s budget "
+                        f"for #{item_id} — treating as failure")
+            artist_result = TimeoutError(f"artist check >{outer_budget}s")
+        except Exception as e:
+            log.warning(f"[mod] artist check raised for #{item_id} after "
+                        f"{time.monotonic()-t0:.1f}s: {e}")
+            artist_result = e
+
+    # Auto-approve only when ALL THREE checks come back as high-confidence
+    # approve. Per user spec, anything else — including a confident reject —
+    # goes to a human via email rather than being auto-rejected.
+    results = (image_result, name_result, artist_result)
+    if (all(isinstance(r, dict) for r in results)
+            and all(_is_clear_approve(r) for r in results)):
         log.info(f"[mod] auto-approve #{item_id} "
                  f"(img conf={image_result.get('confidence')}, "
-                 f"name conf={name_result.get('confidence')})")
+                 f"name conf={name_result.get('confidence')}, "
+                 f"artist conf={artist_result.get('confidence')})")
         _post_mod_action(item_id, "approve")
         return
 
     log.info(f"[mod] human review #{item_id} — emailing moderator")
-    sent = send_mod_email(item_id, name, png_for_email, image_result, name_result)
+    sent = send_mod_email(item_id, name, png_for_email, image_result, name_result,
+                          artist=artist, artist_result=artist_result)
     if sent:
         _post_mod_action(item_id, "email_sent")
 

@@ -51,6 +51,9 @@ if (is_dir($galleryDir)) {
             'pending'  => $isPending,
             'bitmap'   => (string)($info['bitmap'] ?? ''),
             'name'     => (string)($info['name'] ?? ''),
+            // '' for legacy entries and for submissions that left it blank --
+            // the frontend omits the "by ..." line entirely in that case.
+            'artist'   => (string)($info['artist'] ?? ''),
             'video_id' => isset($info['video_id']) && is_string($info['video_id'])
                 ? $info['video_id'] : null,
         ];
