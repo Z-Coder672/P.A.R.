@@ -211,24 +211,54 @@ def main() -> int:
 
     ok, failed = 0, 0
     for gid, path, name in pending:
-        title = f'"{name}" printing - P.A.R.'
-        log.info(f"[backfill] uploading #{gid}: {title!r}")
-        try:
-            video_id = ys.upload_recording(youtube, path, title)
-        except Exception as e:
-            log.error(f"[backfill] #{gid} raised: {e!r}")
-            video_id = None
-        if not video_id:
-            log.warning(f"[backfill] #{gid} failed; leaving {path} on disk")
+        # The daemon writes a `<mov>.video_id` sidecar when the upload succeeded
+        # but the attach POST did not, and keeps the recording. Re-uploading
+        # that footage would create a duplicate YouTube video, so re-POST the
+        # id we already have instead.
+        sidecar = path.with_suffix(path.suffix + ".video_id")
+        prior_id = None
+        if sidecar.exists():
+            try:
+                prior_id = (sidecar.read_text().strip() or None)
+            except Exception as e:
+                log.warning(f"[backfill] #{gid} unreadable sidecar {sidecar}: {e}")
+
+        if prior_id:
+            log.info(f"[backfill] #{gid} already uploaded as {prior_id}; "
+                     f"re-attaching instead of re-uploading")
+            video_id = prior_id
+        else:
+            title = f'"{name}" printing - P.A.R.'
+            log.info(f"[backfill] uploading #{gid}: {title!r}")
+            try:
+                video_id = ys.upload_recording(youtube, path, title)
+            except Exception as e:
+                log.error(f"[backfill] #{gid} raised: {e!r}")
+                video_id = None
+            if not video_id:
+                log.warning(f"[backfill] #{gid} failed; leaving {path} on disk")
+                failed += 1
+                continue
+
+        if not ys._post_video_id(gid, video_id):
+            # Keep the recording AND the sidecar so the next run retries the
+            # attach rather than the upload.
+            try:
+                sidecar.write_text(video_id)
+            except Exception as e:
+                log.warning(f"[backfill] #{gid} could not write sidecar: {e}")
+            log.error(f"[backfill] #{gid} uploaded as {video_id} but attach failed; "
+                      f"keeping {path}")
             failed += 1
             continue
-        ys._post_video_id(gid, video_id)
         # Same best-effort playlist filing the daemon does, so a recovered
         # recording ends up in the playlist too. `youtube` is the upload
         # client, passed only as the single-channel fallback.
         ys.attach_to_playlist(video_id, gid, upload_client=youtube)
         if not args.keep:
             _retire(path)
+            if sidecar.exists():
+                _retire(sidecar)
         ok += 1
 
     log.info(f"[backfill] done — {ok} uploaded, {failed} failed")

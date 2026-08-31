@@ -3409,7 +3409,13 @@ void loop() {
       if (pendingGalleryId[0]) jobSavePending(bitmap, pendingGalleryId, 1);
       runPendingJob(bitmap, galleryId.c_str());
     } else {
+      // MUST back off here. loop() ends immediately below, so returning with no
+      // delay re-enters fetchNext() at once — and next.php POPS A QUEUE ITEM per
+      // call. A single short/corrupt body would therefore drain the whole queue
+      // in seconds, stranding a pending gallery entry (and an unsendable bound
+      // submitter email) for every item. Matches every sibling error path.
       plog::logf("bad decode length: %d", decoded);
+      delay(10000);
     }
   } else {
     delay(10000);
@@ -3442,6 +3448,12 @@ bool fetchNext(int& outStatus, String& outGalleryId, String& outBody) {
   ssl.print("\r\n");
   ssl.print("User-Agent: P.A.R./1.0\r\n");
   ssl.print("Accept: */*\r\n");
+  // next.php is authenticated as of 2026-08-31 — it pops a queue item per call,
+  // so it must not be open to the world. FLASH THIS SKETCH BEFORE deploying the
+  // server change: old firmware sends no secret and would get 401 on every poll.
+  ssl.print("X-Snapshot-Secret: ");
+  ssl.print(SNAPSHOT_SECRET);
+  ssl.print("\r\n");
   ssl.print("Content-Length: 0\r\n");
   ssl.print("Connection: close\r\n");
   ssl.print("\r\n");
