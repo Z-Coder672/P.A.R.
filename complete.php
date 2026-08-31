@@ -55,5 +55,16 @@ if (!file_exists($pendingPath) || !rename($pendingPath, $infoPath)) {
     exit;
 }
 
+// We just performed the pending -> info rename, which means snapshot-request.php
+// did NOT finalize this entry first (it writes its flag and then renames, so an
+// already-info entry — the common case handled above — implies its flag was
+// already armed). A rename happening HERE therefore means the snapshot flag was
+// likely never armed (a dropped snapshot-request POST), which would otherwise
+// leave any in-flight recording running to the RECORD_MAX cap. Arm it now so the
+// snapshot poller stops the recording (and grabs the photo): the redundant
+// recording-stop path the unified snapshot trigger otherwise lacked. Mirrors
+// snapshot-request.php's write; $id is validated digits-only above.
+@file_put_contents(__DIR__ . '/snapshot-pending.flag', $id);
+
 par_notify_gallery_complete((int) $id);
 echo 'ok';

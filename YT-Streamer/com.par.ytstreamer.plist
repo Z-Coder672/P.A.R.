@@ -6,9 +6,27 @@
 
   A GUI (Aqua) LaunchAgent, NOT a LaunchDaemon: it must run in the user's login
   session so the AVFoundation camera capture works and the one-time Camera consent
-  prompt can be shown/clicked (Screen Sharing counts, so this works headless). A
-  system LaunchDaemon runs in a non-GUI context and would reproduce the exact
-  NotDetermined / no-frames failure this replaces.
+  prompt can be shown/clicked. A system LaunchDaemon runs in a non-GUI context and
+  would reproduce the exact NotDetermined / no-frames failure this replaces.
+
+  HEADLESS ≠ SESSIONLESS (do not re-litigate). macOS gates camera access on a
+  logged-in Aqua session, not on code identity. Proven 2026-08-13: with a valid,
+  cdhash-matched grant for this exact bundle (TCC auth_value=2), the daemon
+  bootstrapped into the Background domain (user/<uid>) still reported
+  authorizationStatus = 2 (Denied) and ffmpeg failed "Cannot use Brio 100" — while
+  ENUMERATING the camera fine. Permission was never the problem; the missing
+  session was. An MDM/PPPC profile would not help (it grants permission you
+  already have). No monitor and no human are required — only that a session
+  EXISTS, which is what automatic login provides at every boot.
+
+  Corollary: Screen Sharing does NOT reliably "count" as that session. Connecting
+  can fast-user-switch into a NEW session and tear down the console session that
+  holds the camera. That is exactly what broke this on 2026-08-11:
+    12:05:52  com.apple.fastUserSwitchBegin, object:501
+    12:05:52  loginwindow[96281] started session: 101297   (new session)
+    12:06:08  daemon: Brio gone (present: ['Capture screen 0'])
+    12:07:15  launchd SIGTERM -> this agent torn down
+  Attach to the existing console session instead of spawning a virtual one.
 
   It runs watchdog.py (the existing supervisor, with its rapid-fail budget), and
   launchd keeps the watchdog itself alive (RunAtLoad + KeepAlive) and starts it at
@@ -25,6 +43,21 @@
 <dict>
     <key>Label</key>
     <string>com.par.ytstreamer</string>
+
+    <!-- Bind this agent to the GUI (Aqua) session domain EXPLICITLY. A LaunchAgent
+         with no LimitLoadToSessionType already defaults to Aqua, so this changes no
+         behaviour — it makes the constraint visible instead of implicit, because the
+         implicit version fails silently and misleadingly:
+           launchctl bootstrap user/$(id -u) ...  ->  "Bootstrap failed: 5: Input/output error"
+         with nothing naming a session type as the cause. Aqua is CORRECT here (see
+         the HEADLESS != SESSIONLESS note above) — do NOT "fix" that error by
+         switching this to Background. The agent will load in the Background domain
+         and then be permanently denied the camera, which is strictly worse: it runs,
+         polls, accepts jobs, and records ZERO frames, so failures surface as silent
+         empty uploads rather than a refusal to start. If the domain does not exist,
+         the missing piece is the login session (enable automatic login), not this key. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
 
     <!-- Launch the SIGNED app launcher (com.par.ytstreamer), not python directly:
          it is the promptable/grantable TCC identity the camera grant attaches to.

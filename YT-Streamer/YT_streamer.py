@@ -16,7 +16,7 @@ snapshot stills when no recording is in flight.
 
 A recording starts when stream-start.php hands us a (gallery_id, name) and
 stops when either stream-end.php fires (Arduino's signal after its 10-min
-post-display linger) or a 1.5h hard cap elapses.
+post-display linger) or the RECORD_MAX_SECONDS hard cap elapses.
 
 Also runs the snapshot poller (Site5 -> SFTP photo) and the moderation poller
 on background threads; those are independent of the recorder.
@@ -60,6 +60,8 @@ from claude_agent_sdk import (
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+import httplib2
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
@@ -97,6 +99,49 @@ STREAM_END_URL         = os.getenv("STREAM_END_URL")
 STREAM_VIDEO_ID_URL    = os.getenv("STREAM_VIDEO_ID_URL")
 STREAM_POLL_INTERVAL   = int(os.getenv("STREAM_POLL_INTERVAL", "10"))
 
+# Public gallery listing, used as an INDEPENDENT recording-stop trigger: while a
+# recording is in flight the orchestrator polls this and stops the moment its
+# gallery id reads "not pending" (display done). This does NOT go through the
+# snapshot flag / snapshot poller, so it also covers the case where the Arduino's
+# snapshot-request.php (the flag arm) is lost but the entry still finalizes via
+# complete.php — the exact failure that let one recording run to the cap. No new
+# .env key needed: derive it from an existing endpoint URL (same origin), with an
+# optional GALLERY_URL override.
+def _sibling_url(base: str | None, leaf: str) -> str | None:
+    if not base or "/" not in base:
+        return None
+    return base.rsplit("/", 1)[0] + "/" + leaf
+GALLERY_URL            = os.getenv("GALLERY_URL") or _sibling_url(
+    SNAPSHOT_REQUEST_URL or STREAM_START_URL, "gallery.php")
+# How often (seconds) to poll the gallery for completion during a recording.
+# Slower than the main loop tick to stay gentle on the shared host's rate limits;
+# a few extra seconds of recording tail past display-done is immaterial.
+GALLERY_COMPLETE_POLL_INTERVAL = int(os.getenv("GALLERY_COMPLETE_POLL_INTERVAL", "20"))
+
+# ── UPLOAD RETRY ───────────────────────────────────────────────────────────────
+# A videos.insert is a multi-GB transfer over a residential link, so a transient
+# socket failure mid-upload is normal, not exceptional. Before these knobs
+# existed a single blip abandoned the recording permanently: the catch-all in
+# upload_recording returned None and nothing ever retried, despite the upload
+# being resumable precisely so it could continue. On 2026-08-22 that stranded
+# five prints (#68-#71, #74 — 4.5 GB) in one afternoon; three of them died
+# instantly on connection setup having transferred nothing, so a retry seconds
+# later would have succeeded.
+#
+# Two layers, because they cover different failures:
+#   - UPLOAD_CHUNK_RETRIES is handed to next_chunk(), whose own backoff retries
+#     a single failed chunk against the SAME resumable session. This is the
+#     cheap, correct path — the server keeps the bytes already received.
+#   - UPLOAD_MAX_ATTEMPTS restarts the whole upload with a fresh session when a
+#     chunk exhausts its retries. Costlier, so it is the outer fallback.
+UPLOAD_MAX_ATTEMPTS    = int(os.getenv("UPLOAD_MAX_ATTEMPTS", "5"))
+UPLOAD_CHUNK_RETRIES   = int(os.getenv("UPLOAD_CHUNK_RETRIES", "5"))
+# Backoff between whole-upload attempts: BASE * 2**(attempt-1), capped. Generous
+# because the failures this recovers from (link down, DHCP renew, ISP blip) tend
+# to last tens of seconds, not milliseconds.
+UPLOAD_RETRY_BASE_DELAY = float(os.getenv("UPLOAD_RETRY_BASE_DELAY", "10"))
+UPLOAD_RETRY_MAX_DELAY  = float(os.getenv("UPLOAD_RETRY_MAX_DELAY", "300"))
+
 # Local working dir for in-flight .mov recordings. Uploads delete on success;
 # failed uploads are left here for manual recovery.
 RECORDING_DIR          = Path("/tmp/recordings")
@@ -105,8 +150,12 @@ RECORDING_DIR          = Path("/tmp/recordings")
 # instead of opening the camera, because a USB webcam allows only one opener at
 # a time and the recording owns it.
 LATEST_FRAME_PATH      = RECORDING_DIR / "latest_frame.jpg"
-# 1.5h hard cap on a single recording (safety net if the stop signal is lost).
-RECORD_MAX_SECONDS     = 90 * 60
+# Hard cap on a single recording (safety net if the stop signal is lost). This is
+# a BACKSTOP, not a target — it must sit comfortably above the longest real print,
+# because a print that outruns it gets its recording truncated mid-artwork. Raised
+# 60 -> 90 min on 2026-08-22 after prints #71-#74 ran 60-64 min and were all cut
+# off before finishing; at the pinned VIDEO_BITRATE a 90-min file is ~1.7 GB.
+RECORD_MAX_SECONDS     = int(os.getenv("RECORD_MAX_MINUTES", "90")) * 60
 # Out-of-band watchdog ceiling. The cap above is enforced inside the orchestrator
 # loop, which shares its thread with the (native, blocking) stop() call — if stop
 # wedges, the cap can never fire. This grace is how far past the cap a recording
@@ -127,7 +176,7 @@ MIN_RECORD_SECONDS     = 60
 # a detached/launchd context" failure, where startRunning() succeeds but macOS
 # routes no frames and posts no synchronous error — is otherwise invisible: the
 # didFinishRecording delegate never fires, is_running() stays True, and the
-# orchestrator writes an empty file for the full 1.5h cap. This gate catches that
+# orchestrator writes an empty file for the full cap. This gate catches that
 # in seconds so the print can be logged/aborted instead of silently lost.
 FRAME_LIVENESS_TIMEOUT   = 12.0
 # Movie-file byte floor that proves real frames landed (used only when the sidecar
@@ -188,10 +237,32 @@ YT_VAULT_DMG           = Path(__file__).parent / os.getenv("YT_VAULT_DMG", "YT_s
 YT_VAULT_KEYCHAIN_KEY  = os.getenv("YT_VAULT_KEYCHAIN_KEY", "")
 YT_VAULT_SECRET_FILE   = os.getenv("YT_VAULT_SECRET_FILE", "")
 YT_VAULT_TOKEN_FILE    = "yt_token.json"
+# ── PLAYLIST (a playlist on a DIFFERENT channel than the uploads) ──────────────
+# videos.insert always lands on the channel the UPLOAD token was consented for,
+# and playlistItems.insert can only write a playlist owned by the channel ITS
+# token was consented for. One OAuth token is bound to exactly one channel, so
+# uploading to channel A while filing into a playlist on channel B needs TWO
+# separately-consented tokens. Both live in the same encrypted vault, under
+# different filenames. Set them up with:  ./run_auth_setup.sh
+#
+# If YT_PLAYLIST_ID is empty the whole playlist step is skipped (uploads are
+# unaffected). If the playlist token file is absent but YT_PLAYLIST_ID is set,
+# the upload client is used as a fallback — correct only when the playlist
+# happens to live on the upload channel.
+YT_PLAYLIST_ID               = os.getenv("YT_PLAYLIST_ID", "").strip()
+YT_VAULT_PLAYLIST_TOKEN_FILE = os.getenv("YT_VAULT_PLAYLIST_TOKEN_FILE",
+                                         "yt_token_playlist.json")
+# A playlist insert is a single cheap call (50 quota units) with no resumable
+# session to protect, so a couple of quick retries is all it warrants.
+PLAYLIST_MAX_ATTEMPTS        = int(os.getenv("PLAYLIST_MAX_ATTEMPTS", "3"))
+PLAYLIST_RETRY_BASE_DELAY    = float(os.getenv("PLAYLIST_RETRY_BASE_DELAY", "5"))
 # Background OAuth-token keepalive cadence (hours). The refresher runs even with
 # no start signals so a dead/expired refresh token surfaces in the log early
 # instead of wedging the next recording. Refresh-only — never interactive.
 YT_TOKEN_REFRESH_INTERVAL = float(os.getenv("YT_TOKEN_REFRESH_HOURS", "6")) * 3600.0
+# Public site URL used in the video description. Must carry the scheme —
+# YouTube only auto-links descriptions when the URL starts with http(s)://.
+SITE_BASE_URL = os.getenv("SITE_BASE_URL", "https://par.zimmzimm.com").rstrip("/")
 
 _required = {
     "SNAPSHOT_SECRET": SNAPSHOT_SECRET,
@@ -208,10 +279,10 @@ if _missing:
     sys.exit(1)
 
 # Target H.264 average bitrate for the recording. AVCaptureMovieFileOutput's
-# default is ~24 Mbps at 1080p (a 90-min cap would be ~16 GB) — far too large
+# default is ~24 Mbps at 1080p (a 60-min cap would be ~11 GB) — far too large
 # for /tmp and the YouTube upload, so we pin a sane average via the movie
 # output's compression settings. 2.5 Mbps is plenty for the low-detail LED
-# matrix subject (90-min cap ≈ 1.7 GB).
+# matrix subject (60-min cap ≈ 1.1 GB).
 VIDEO_BITRATE        = os.getenv("VIDEO_BITRATE", "2500k")
 VIDEO_BITRATE_BPS    = int(VIDEO_BITRATE.rstrip("kK")) * 1000
 CAMERA_RETRY_DELAY   = 30   # seconds between camera-availability re-checks
@@ -365,7 +436,7 @@ class AVFRecorder:
 
     Unlike the old fragmented-mp4 ffmpeg path, the moov atom is finalized on
     stop(); a hard crash mid-record loses the file, but the normal graceful-stop
-    path (snapshot signal or 1.5h cap) always finalizes cleanly."""
+    path (snapshot signal or cap) always finalizes cleanly."""
 
     def __init__(self, out_path: Path, name_prefix: str, sidecar_path: Path,
                  want_w: int = CAMERA_REC_W, want_h: int = CAMERA_REC_H,
@@ -481,7 +552,7 @@ class AVFRecorder:
         self._movie_out = movie
 
         # Cap the H.264 average bitrate — AVFoundation's default (~24 Mbps at
-        # 1080p) would make a 90-min recording ~16 GB. The video connection
+        # 1080p) would make a 60-min recording ~11 GB. The video connection
         # exists only after the output is added to the session.
         try:
             conn = movie.connectionWithMediaType_(_AVF.AVMediaTypeVideo)
@@ -607,7 +678,7 @@ class AVFRecorder:
     def _on_session_failure(self, kind, error):
         """AVCaptureSession runtime-error / interruption observer callback. Flips
         the recorder to finished so is_running() goes False and the orchestrator
-        stops the (dead) recording instead of writing an empty file for 1.5h."""
+        stops the (dead) recording instead of writing an empty file for 1h."""
         self._error = error if error is not None else RuntimeError(f"session {kind}")
         log.error(f"[record] AVCaptureSession {kind}: {error}")
         self._finished.set()
@@ -711,19 +782,25 @@ def _vault_unmount(device: str):
         _vault_lock.release()
 
 
-def _vault_read_token() -> str | None:
-    """Read yt_token.json from the vault; returns JSON string or None if absent."""
+def _vault_read_token(token_file: str = YT_VAULT_TOKEN_FILE) -> str | None:
+    """Read an OAuth token JSON out of the vault; None if absent.
+
+    `token_file` selects WHICH token: the upload token (yt_token.json, bound to
+    the channel that receives the videos) or the playlist token
+    (YT_VAULT_PLAYLIST_TOKEN_FILE, bound to the channel that owns the playlist).
+    The default keeps every existing caller pointed at the upload token.
+    """
     try:
         password = _vault_get_password()
         mount_point, device = _vault_mount(password)
         try:
-            token_path = Path(mount_point) / YT_VAULT_TOKEN_FILE
+            token_path = Path(mount_point) / token_file
             return token_path.read_text() if token_path.exists() else None
         finally:
             _vault_unmount(device)
             log.info("[vault] Vault unmounted")
     except Exception as e:
-        log.warning(f"[vault] Could not read token: {e}")
+        log.warning(f"[vault] Could not read {token_file}: {e}")
         return None
 
 
@@ -756,13 +833,14 @@ def _vault_read_sftp_password() -> str:
         log.info("[vault] Vault unmounted")
 
 
-def _vault_write_token(token_json: str):
-    """Write yt_token.json into the vault."""
+def _vault_write_token(token_json: str, token_file: str = YT_VAULT_TOKEN_FILE):
+    """Write an OAuth token JSON into the vault (see _vault_read_token for
+    which file is which)."""
     password = _vault_get_password()
     mount_point, device = _vault_mount(password)
     try:
-        (Path(mount_point) / YT_VAULT_TOKEN_FILE).write_text(token_json)
-        log.info("[vault] Token saved to vault")
+        (Path(mount_point) / token_file).write_text(token_json)
+        log.info(f"[vault] {token_file} saved to vault")
     finally:
         _vault_unmount(device)
         log.info("[vault] Vault unmounted")
@@ -786,35 +864,72 @@ def _load_client_secrets() -> dict:
         log.info("[vault] Vault unmounted")
 
 
-def get_youtube_service():
+# Set by an uploader thread when googleapiclient's lazy credential refresh dies
+# on the wire. The record orchestrator caches its YouTube client for the life of
+# the process, so without this a token that expires mid-run poisons that client
+# permanently and EVERY later upload fails the same way — the failure mode that
+# stranded prints #38–#45. Clearing the cached client on this signal means the
+# next print re-reads the vault, so a fresh token (written by backfill_uploads.py)
+# is picked up without restarting the daemon.
+_YT_AUTH_DEAD = threading.Event()
+
+# Same idea for the playlist token, which is a SEPARATE OAuth grant on a
+# separate channel and so dies on its own schedule. Kept distinct from
+# _YT_AUTH_DEAD so a dead playlist token never makes the orchestrator throw away
+# a perfectly good upload client (and vice versa) — the two failures are
+# independent and have different recoveries.
+_YT_PLAYLIST_AUTH_DEAD = threading.Event()
+
+
+def _build_service(token_file: str, interactive: bool, label: str, recovery: str):
     """
-    Authenticate with YouTube Data API v3 via OAuth 2.0.
-    Client secrets are loaded from the encrypted vault DMG on each auth flow.
-    Token is cached in yt_token.json for headless restarts (no vault needed after first auth).
-    Returns a service object, or None if auth fails.
+    Build a YouTube Data API v3 client from one of the vault's OAuth tokens.
+
+    `token_file` picks the grant — and therefore the CHANNEL. The upload token
+    is bound to the channel the videos land on; the playlist token is bound to
+    the channel that owns YT_PLAYLIST_ID. They are separate consents and must
+    never be interchanged: using the wrong one uploads to the wrong channel or
+    404s on the playlist. Client secrets (the same OAuth *client* for both) are
+    loaded from the vault only when a consent flow actually runs.
+
+    `interactive=False` makes this refresh-only: if the stored refresh token is
+    dead it returns None instead of starting the consent flow. Background
+    threads MUST pass False — `run_local_server` blocks until a browser hits its
+    loopback redirect and `run_console` blocks on input(), so on a daemon either
+    one wedges the calling thread forever. Wedging the record orchestrator would
+    stop *recording*, turning a failed-upload problem into a lost-footage one.
+    Recovery from a dead refresh token is `./run_auth_setup.sh` (or
+    `backfill_uploads.py` for the upload token), run by hand from the GUI
+    session where blocking on a human is fine.
     """
     creds = None
-    token_json = _vault_read_token()
+    token_json = _vault_read_token(token_file)
     if token_json:
         creds = Credentials.from_authorized_user_info(json.loads(token_json), YT_SCOPES)
 
     if not creds or not creds.valid:
         refreshed = False
         if creds and creds.expired and creds.refresh_token:
-            log.info("[youtube] Refreshing OAuth token...")
+            log.info(f"[{label}] Refreshing OAuth token ({token_file})...")
             try:
                 creds.refresh(Request())
                 refreshed = True
             except Exception as e:
-                log.warning(f"[youtube] Token refresh failed: {e!r} — falling back to browser OAuth")
+                log.warning(f"[{label}] Token refresh failed: {e!r}")
                 creds = None
+        if not refreshed and not interactive:
+            log.error(
+                f"[{label}] No usable token in {token_file} and interactive auth "
+                f"is disabled on this thread. {recovery}"
+            )
+            return None
         if not refreshed:
-            log.info("[youtube] Starting OAuth flow...")
+            log.info(f"[{label}] Starting OAuth flow for {token_file}...")
             try:
                 client_config = _load_client_secrets()
             except Exception as e:
                 log.error(f"[vault] Failed to load client secrets: {e}")
-                log.warning("[youtube] Uploads disabled until vault is reachable.")
+                log.warning(f"[{label}] Disabled until the vault is reachable.")
                 return None
             flow = InstalledAppFlow.from_client_config(client_config, YT_SCOPES)
             try:
@@ -822,51 +937,78 @@ def get_youtube_service():
             except Exception:
                 # Headless fallback: print URL, prompt for code
                 creds = flow.run_console()
-        _vault_write_token(creds.to_json())
+        _vault_write_token(creds.to_json(), token_file)
 
     return build("youtube", "v3", credentials=creds)
 
 
-def refresh_youtube_token_once() -> bool:
-    """Refresh-only keepalive for the cached OAuth token — NEVER interactive.
+def get_youtube_service(interactive: bool = True):
+    """The UPLOAD client — the channel that receives the videos (videos.insert).
+    Thin wrapper over _build_service; see it for the interactive= contract."""
+    return _build_service(
+        YT_VAULT_TOKEN_FILE, interactive, "youtube",
+        f"Uploads are paused; recordings will be kept in {RECORDING_DIR}. "
+        f"Recover with:  ./run_backfill.sh",
+    )
 
-    Reads yt_token.json from the vault and, if it carries a refresh_token,
-    forces a refresh (which both keeps the access token warm AND proves the
-    refresh token is still alive), then writes the fresh token back. On failure
-    it logs LOUDLY and returns False — it deliberately does NOT fall back to the
-    browser flow the way get_youtube_service does, because this runs on a
-    background thread with no human present and an interactive flow there would
-    wedge silently. Returns True iff a usable token is present after the attempt.
+
+def get_playlist_service(interactive: bool = False):
+    """The PLAYLIST client — the channel that owns YT_PLAYLIST_ID
+    (playlistItems.insert). A different channel from the upload one, hence a
+    different token. Defaults to non-interactive: every in-daemon caller is a
+    background thread."""
+    return _build_service(
+        YT_VAULT_PLAYLIST_TOKEN_FILE, interactive, "playlist",
+        "Videos will still upload, but nothing will be added to the playlist. "
+        "Recover with:  ./run_auth_setup.sh --which playlist",
+    )
+
+
+def refresh_youtube_token_once(token_file: str = YT_VAULT_TOKEN_FILE,
+                              tag: str = "youtube-refresh") -> bool:
+    """Refresh-only keepalive for one of the vault's OAuth tokens — NEVER
+    interactive.
+
+    Reads `token_file` from the vault and, if it carries a refresh_token, forces
+    a refresh (which both keeps the access token warm AND proves the refresh
+    token is still alive), then writes the fresh token back. On failure it logs
+    LOUDLY and returns False — it deliberately does NOT fall back to the browser
+    flow the way _build_service does, because this runs on a background thread
+    with no human present and an interactive flow there would wedge silently.
+    Returns True iff a usable token is present after the attempt.
+
+    Called once per token: the upload grant and the playlist grant are separate
+    consents on separate channels and expire independently, so each needs its
+    own keepalive (and its own loud line in the log when it dies).
     """
-    token_json = _vault_read_token()
+    token_json = _vault_read_token(token_file)
     if not token_json:
-        log.info("[youtube-refresh] no token in vault yet — nothing to refresh "
-                 "(auth happens on the first recording)")
+        log.info(f"[{tag}] no {token_file} in vault yet — nothing to refresh "
+                 f"(run ./run_auth_setup.sh to create it)")
         return False
     try:
         creds = Credentials.from_authorized_user_info(json.loads(token_json), YT_SCOPES)
     except Exception as e:
-        log.warning(f"[youtube-refresh] token unreadable: {e!r}")
+        log.warning(f"[{tag}] token unreadable: {e!r}")
         return False
     if not creds.refresh_token:
-        log.warning("[youtube-refresh] token has no refresh_token — cannot keep alive")
+        log.warning(f"[{tag}] token has no refresh_token — cannot keep alive")
         return False
     try:
         creds.refresh(Request())
     except Exception as e:
         log.error(
-            f"[youtube-refresh] refresh FAILED: {e!r} — the refresh token is "
-            f"expired/revoked. The NEXT start signal will block recording+upload "
-            f"until you re-auth (open the URL the daemon prints). NOTE: if this "
+            f"[{tag}] refresh FAILED for {token_file}: {e!r} — the refresh token "
+            f"is expired/revoked. Re-auth with ./run_auth_setup.sh. NOTE: if this "
             f"OAuth app is in Google 'Testing' status its refresh tokens die 7 "
-            f"days after issuance regardless of use — publish it to production to "
-            f"stop this recurring.")
+            f"days after issuance regardless of use — and there are now TWO of "
+            f"them, so publish the app to production to stop this recurring.")
         return False
     try:
-        _vault_write_token(creds.to_json())
+        _vault_write_token(creds.to_json(), token_file)
     except Exception as e:
-        log.warning(f"[youtube-refresh] refreshed OK but could not persist to vault: {e!r}")
-    log.info(f"[youtube-refresh] token refreshed OK (access-token expiry {creds.expiry})")
+        log.warning(f"[{tag}] refreshed OK but could not persist to vault: {e!r}")
+    log.info(f"[{tag}] token refreshed OK (access-token expiry {creds.expiry})")
     return True
 
 
@@ -888,23 +1030,48 @@ def poll_token_refresh():
             refresh_youtube_token_once()
         except Exception as e:
             log.warning(f"[youtube-refresh] unexpected error: {e!r}")
+        # The playlist grant is a second, independent consent (different
+        # channel, different expiry clock), so keep it warm too — but only when
+        # a playlist is actually configured.
+        if YT_PLAYLIST_ID:
+            try:
+                refresh_youtube_token_once(YT_VAULT_PLAYLIST_TOKEN_FILE,
+                                           "playlist-refresh")
+            except Exception as e:
+                log.warning(f"[playlist-refresh] unexpected error: {e!r}")
         time.sleep(YT_TOKEN_REFRESH_INTERVAL)
 
 
-def upload_recording(youtube, out_path: Path, title: str) -> str | None:
-    """Resumable upload of a finished recording (QuickTime .mov) via
-    videos.insert. Returns the 11-char YouTube video id, or None on failure."""
-    body = {
-        "snippet": {
-            "title": title,
-            "description": "Recorded by P.A.R. — par.zimmzimm.com",
-            "categoryId": "28",  # Science & Technology
-        },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
-    }
+# HTTP statuses worth another go: request timeout, rate limit, and the 5xx
+# family. Anything else (400 malformed, 403 quota/permission, 404) is a standing
+# condition that retrying would only burn API quota on.
+_RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+# Transport failures worth another go. Most land as OSError — BrokenPipeError,
+# TimeoutError, ConnectionResetError, ssl.SSLError and OSError(49, "Can't assign
+# requested address") are all subclasses. The other two are NOT OSError
+# subclasses and would otherwise fall through to the non-retryable branch:
+# httplib2.ServerNotFoundError is a DNS failure, and google.auth's TransportError
+# wraps a connection error during a token fetch. RefreshError is deliberately
+# absent (and is not a TransportError subclass), so a dead token still fails fast.
+_RETRYABLE_TRANSPORT_EXC = (OSError, httplib2.HttpLib2Error, TransportError)
+
+
+def _http_error_status(e: HttpError) -> int | None:
+    return getattr(getattr(e, "resp", None), "status", None)
+
+
+def _upload_retry_delay(attempt: int) -> float:
+    """Exponential backoff before whole-upload attempt N+1 (attempt is 1-based)."""
+    return min(UPLOAD_RETRY_BASE_DELAY * (2 ** (attempt - 1)), UPLOAD_RETRY_MAX_DELAY)
+
+
+def _attempt_upload(youtube, out_path: Path, body: dict, attempt: int) -> tuple[str | None, bool]:
+    """One videos.insert against a fresh resumable session.
+
+    Returns (video_id, retryable): video_id is None on failure, and retryable
+    says whether an outer retry stands any chance of doing better.
+    """
     media = MediaFileUpload(str(out_path), mimetype="video/quicktime",
                             resumable=True, chunksize=8 * 1024 * 1024)
     request = youtube.videos().insert(
@@ -912,30 +1079,252 @@ def upload_recording(youtube, out_path: Path, title: str) -> str | None:
         body=body,
         media_body=media,
     )
+    tag = out_path.name if attempt == 1 else f"{out_path.name} (attempt {attempt})"
 
     response = None
     last_progress_log = 0.0
     while response is None:
         try:
-            status, response = request.next_chunk()
+            # num_retries lets googleapiclient retry THIS chunk against the same
+            # resumable session, with its own exponential backoff. The server
+            # keeps whatever it already received, so this is far cheaper than
+            # restarting — it is the layer that should absorb most blips.
+            status, response = request.next_chunk(num_retries=UPLOAD_CHUNK_RETRIES)
             if status:
                 pct = status.progress() * 100
                 if pct - last_progress_log >= 10:
-                    log.info(f"[upload] {out_path.name} {pct:.0f}%")
+                    log.info(f"[upload] {tag} {pct:.0f}%")
                     last_progress_log = pct
+        except RefreshError as e:
+            # The stored refresh token is dead (Google expires them 7 days after
+            # issuance while the app is in 'Testing'). Never retryable — the
+            # orchestrator must drop its cached client and a human must re-auth.
+            _YT_AUTH_DEAD.set()
+            log.error(
+                f"[upload] AUTH DEAD on {out_path.name}: {e!r} — the refresh "
+                f"token is expired or revoked. Recordings will keep being made "
+                f"and kept in {RECORDING_DIR}, but nothing will upload until you "
+                f"re-auth:  ./run_backfill.sh   (permanent fix: publish the "
+                f"OAuth app to 'In production' in the Google Cloud console — "
+                f"Testing-status refresh tokens always die after 7 days)"
+            )
+            return None, False
         except HttpError as e:
-            log.error(f"[upload] HttpError on {out_path.name}: {e}")
-            return None
+            status_code = _http_error_status(e)
+            retryable = status_code in _RETRYABLE_HTTP_STATUS
+            log.error(
+                f"[upload] HttpError {status_code} on {tag}: {e}"
+                f"{'' if retryable else ' (not retryable)'}"
+            )
+            return None, retryable
+        except _RETRYABLE_TRANSPORT_EXC as e:
+            # Exactly what the resumable protocol exists to survive — see the
+            # tuple's definition for what lands here and why.
+            log.warning(f"[upload] transport error on {tag}: {e!r}")
+            return None, True
         except Exception as e:
-            log.error(f"[upload] Unexpected error on {out_path.name}: {e!r}")
-            return None
+            # Genuinely unexpected — surface it rather than silently burning
+            # attempts on a bug that a retry cannot fix.
+            log.error(f"[upload] Unexpected error on {tag}: {e!r}", exc_info=True)
+            return None, False
 
     video_id = response.get("id") if isinstance(response, dict) else None
     if not video_id:
         log.error(f"[upload] videos.insert returned no id: {response!r}")
-        return None
-    log.info(f"[upload] {out_path.name} -> video_id={video_id}")
-    return video_id
+        return None, False
+    return video_id, False
+
+
+def upload_recording(youtube, out_path: Path, title: str) -> str | None:
+    """Resumable upload of a finished recording (QuickTime .mov) via
+    videos.insert, retried across transient network failures.
+
+    Returns the 11-char YouTube video id, or None if every attempt failed (in
+    which case the caller leaves the .mov on disk for ./run_backfill.sh)."""
+    body = {
+        "snippet": {
+            "title": title,
+            "description": (
+                "Submit your own art here: "
+                f"{SITE_BASE_URL}/upload\n\n"
+                f"Recorded by P.A.R. — {SITE_BASE_URL}"
+            ),
+            "categoryId": "28",  # Science & Technology
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
+        # The source can vanish between attempts (manual cleanup, a backfill run
+        # moving it to uploaded/). Retrying then is pointless.
+        if not out_path.exists():
+            log.error(f"[upload] {out_path} disappeared before attempt {attempt}; giving up")
+            return None
+
+        video_id, retryable = _attempt_upload(youtube, out_path, body, attempt)
+        if video_id:
+            log.info(f"[upload] {out_path.name} -> video_id={video_id}")
+            return video_id
+        if not retryable:
+            return None
+        if attempt == UPLOAD_MAX_ATTEMPTS:
+            break
+
+        delay = _upload_retry_delay(attempt)
+        log.warning(
+            f"[upload] retrying {out_path.name} in {delay:.0f}s "
+            f"(attempt {attempt + 1}/{UPLOAD_MAX_ATTEMPTS})"
+        )
+        time.sleep(delay)
+
+    log.error(
+        f"[upload] {out_path.name} failed after {UPLOAD_MAX_ATTEMPTS} attempts; "
+        f"leaving it on disk for ./run_backfill.sh"
+    )
+    return None
+
+
+# ── PLAYLIST ───────────────────────────────────────────────────────────────────
+#
+# Filing each finished upload into a playlist. The playlist lives on a DIFFERENT
+# channel than the videos, which is the whole reason this needs its own client:
+# playlistItems.insert is authorised against the playlist's OWNING channel, not
+# the video's. A video from another channel can be added freely as long as it is
+# public or unlisted (ours are public — see upload_recording's body), so no
+# cross-channel permission is involved beyond owning the playlist itself.
+#
+# This is strictly best-effort: the upload and the gallery attachment are what
+# matter, and a playlist failure must never cost a recording. Every path here
+# logs and returns instead of raising.
+
+_playlist_service = None
+_playlist_service_lock = threading.Lock()
+_playlist_fallback_warned = False
+
+
+def _get_playlist_client(upload_client=None):
+    """Cached playlist client, rebuilt when its token is reported dead.
+
+    Falls back to the UPLOAD client when no playlist token exists in the vault —
+    which is only correct if the playlist happens to live on the upload channel.
+    That's a legitimate single-channel setup, so it's a warning (once), not an
+    error; if the playlist is really on another channel the insert just 404s and
+    says so.
+    """
+    global _playlist_service, _playlist_fallback_warned
+    with _playlist_service_lock:
+        if _YT_PLAYLIST_AUTH_DEAD.is_set():
+            log.warning("[playlist] discarding cached playlist client (auth was "
+                        "reported dead); re-reading the vault")
+            _playlist_service = None
+            _YT_PLAYLIST_AUTH_DEAD.clear()
+        if _playlist_service is None:
+            try:
+                # Non-interactive: every caller is a background uploader thread.
+                _playlist_service = get_playlist_service(interactive=False)
+            except Exception as e:
+                log.error(f"[playlist] auth failed: {e!r}")
+                _playlist_service = None
+        if _playlist_service is None and upload_client is not None:
+            if not _playlist_fallback_warned:
+                log.warning(
+                    f"[playlist] no {YT_VAULT_PLAYLIST_TOKEN_FILE} in the vault "
+                    f"— falling back to the upload channel's own credentials. "
+                    f"That only works if {YT_PLAYLIST_ID} is a playlist on the "
+                    f"UPLOAD channel. If it belongs to another channel, run "
+                    f"./run_auth_setup.sh --which playlist.")
+                _playlist_fallback_warned = True
+            return upload_client
+        return _playlist_service
+
+
+def add_video_to_playlist(youtube, video_id: str, playlist_id: str) -> bool:
+    """playlistItems.insert with a couple of quick retries. Returns success.
+
+    Never raises — the caller is finishing a successful upload and a playlist
+    problem must not turn that into a failure."""
+    body = {
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id},
+        }
+    }
+    for attempt in range(1, PLAYLIST_MAX_ATTEMPTS + 1):
+        tag = f"{video_id} -> {playlist_id}" + (f" (attempt {attempt})" if attempt > 1 else "")
+        try:
+            youtube.playlistItems().insert(part="snippet", body=body).execute()
+            return True
+        except RefreshError as e:
+            # Playlist token dead. Distinct from the upload token's death: mark
+            # only the playlist client stale so the next print re-reads the
+            # vault and picks up a token freshly written by run_auth_setup.sh.
+            _YT_PLAYLIST_AUTH_DEAD.set()
+            log.error(
+                f"[playlist] AUTH DEAD adding {tag}: {e!r} — the PLAYLIST refresh "
+                f"token is expired or revoked (this is the second, separate grant "
+                f"— uploads are unaffected). Re-auth with: "
+                f"./run_auth_setup.sh --which playlist")
+            return False
+        except HttpError as e:
+            status = _http_error_status(e)
+            if status == 409:
+                # Playlist configured to reject duplicates and the video is
+                # already in it. Nothing to do, and definitely not an error.
+                log.info(f"[playlist] {video_id} already in {playlist_id}")
+                return True
+            retryable = status in _RETRYABLE_HTTP_STATUS
+            hint = ""
+            if status == 404:
+                hint = (" — playlist not found for THIS token's channel; check "
+                        "YT_PLAYLIST_ID and that the playlist token was consented "
+                        "for the channel that owns it")
+            elif status == 403:
+                hint = (" — forbidden; the playlist token's channel does not own "
+                        "this playlist")
+            log.error(f"[playlist] HttpError {status} on {tag}: {e}{hint}"
+                      f"{'' if retryable else ' (not retryable)'}")
+            if not retryable:
+                return False
+        except _RETRYABLE_TRANSPORT_EXC as e:
+            log.warning(f"[playlist] transport error on {tag}: {e!r}")
+        except Exception as e:
+            log.error(f"[playlist] unexpected error on {tag}: {e!r}", exc_info=True)
+            return False
+
+        if attempt == PLAYLIST_MAX_ATTEMPTS:
+            break
+        delay = PLAYLIST_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        log.warning(f"[playlist] retrying {video_id} in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{PLAYLIST_MAX_ATTEMPTS})")
+        time.sleep(delay)
+
+    log.error(f"[playlist] gave up adding {video_id} to {playlist_id} after "
+              f"{PLAYLIST_MAX_ATTEMPTS} attempts — add it by hand if you want it there")
+    return False
+
+
+def attach_to_playlist(video_id: str, gallery_id: int | None = None,
+                       upload_client=None) -> bool:
+    """Best-effort 'file this upload into the configured playlist'. No-ops when
+    YT_PLAYLIST_ID is unset. Never raises."""
+    if not YT_PLAYLIST_ID:
+        return False
+    try:
+        client = _get_playlist_client(upload_client)
+        if client is None:
+            log.error(f"[playlist] no playlist client; {video_id} NOT added to "
+                      f"{YT_PLAYLIST_ID}")
+            return False
+        ok = add_video_to_playlist(client, video_id, YT_PLAYLIST_ID)
+        if ok:
+            where = f" (#{gallery_id})" if gallery_id is not None else ""
+            log.info(f"[playlist] added {video_id}{where} to {YT_PLAYLIST_ID}")
+        return ok
+    except Exception as e:
+        log.error(f"[playlist] attach raised for {video_id}: {e!r}", exc_info=True)
+        return False
 
 
 # ── CAMERA ─────────────────────────────────────────────────────────────────────
@@ -1215,7 +1604,7 @@ def poll_snapshot_queue():
                     # fall back to the recording's own id. Signal after the grab
                     # (the live-frame sidecar copy already happened) and
                     # regardless of upload success, so a failed snapshot upload
-                    # doesn't strand the recording at the 1.5h cap.
+                    # doesn't strand the recording at the cap.
                     with _inflight_lock:
                         inflight_id = _inflight_id
                     effective_id = gallery_id if gallery_id is not None else inflight_id
@@ -1703,7 +2092,7 @@ def poll_mod_queue() -> None:
 # Single-thread state machine: poll stream-start.php for a (gallery_id, name)
 # start signal, start an AVFRecorder (native AVCaptureSession) recording the
 # local USB webcam -> /tmp/recordings/<id>_<ts>.mov, wait for the snapshot-stop
-# signal (or 1.5h cap), stop the recorder (finalizes the moov), then hand the
+# signal (or the cap), stop the recorder (finalizes the moov), then hand the
 # file off to a background uploader so the next print can start recording
 # immediately even if the upload is slow.
 
@@ -1777,6 +2166,44 @@ def _check_stop(expected_gid: int, started: float) -> bool:
     return True
 
 
+def _check_gallery_completed(expected_gid: int) -> bool:
+    """Independent recording-stop trigger: return True if the gallery entry for
+    this recording has finalized server-side (display done). This path does NOT
+    depend on the snapshot flag or the snapshot poller — it asks gallery.php
+    directly — so it stops the recording even when the Arduino's
+    snapshot-request.php (the flag arm) is lost but complete.php still finalizes
+    the entry (the failure mode that let a recording run to the cap).
+
+    An entry reads pending=true from next.php pop until display-done, when
+    snapshot-request.php / complete.php rename pending.json -> info.json (or a
+    photo lands); gallery.php derives pending=false at that point. So a
+    pending=false read is a genuine "print done" signal that can't fire early.
+    Fails closed (returns False) on any error/misconfig so a flaky read can never
+    cut a recording short — the snapshot signal and the cap remain in force."""
+    if not GALLERY_URL:
+        return False
+    try:
+        resp = requests.get(
+            GALLERY_URL,
+            headers={"User-Agent": "P.A.R./1.0"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+    except Exception as e:
+        log.debug(f"[record] gallery completion poll error: {e}")
+        return False
+    items = data if isinstance(data, list) else data.get("items", [])
+    for it in items:
+        try:
+            if int(it.get("id")) == expected_gid:
+                return it.get("pending") is False
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> None:
     """Background uploader. Builds the title (no timestamp), uploads, posts
     the resulting video_id back to the gallery, and unlinks on success."""
@@ -1794,6 +2221,11 @@ def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> N
         _post_video_id(gallery_id, video_id)
     except Exception as e:
         log.error(f"[upload] video_id POST raised: {e!r}")
+    # Best-effort, and deliberately AFTER the gallery attachment: the site
+    # embed is what the print is for, the playlist is a nicety. `youtube` is
+    # passed only as the single-channel fallback (see _get_playlist_client) —
+    # the playlist normally has its own token for its own channel.
+    attach_to_playlist(video_id, gallery_id, upload_client=youtube)
     try:
         out_path.unlink()
     except Exception as e:
@@ -1808,7 +2240,7 @@ def record_orchestrator() -> None:
         log.warning("[record] Disabled — STREAM_START_URL not set")
         return
     # Recordings stop when the snapshot poller captures the print's snapshot (the
-    # unified "print done" signal); the 1.5h cap is the backstop. The old
+    # unified "print done" signal); the RECORD_MAX_SECONDS cap is the backstop. The old
     # stream-end.php poll is retired, so STREAM_END_URL is no longer used here.
 
     RECORDING_DIR.mkdir(parents=True, exist_ok=True)
@@ -1847,9 +2279,22 @@ def record_orchestrator() -> None:
         # verify_camera_accessible just confirmed the cam enumerates; the
         # AVFRecorder re-selects it by name itself. (Tiny race if it vanished in
         # between — AVFRecorder.start() raises and we skip this print.)
+        # A previous upload found the refresh token dead, which permanently
+        # poisons the cached client. Drop it so we re-read the vault below — that
+        # picks up a token freshly written by backfill_uploads.py without needing
+        # a daemon restart.
+        if _YT_AUTH_DEAD.is_set():
+            log.warning("[record] discarding cached YouTube client (auth was "
+                        "reported dead); re-reading the vault")
+            youtube = None
+            _YT_AUTH_DEAD.clear()
+
         if youtube is None:
             try:
-                youtube = get_youtube_service()
+                # interactive=False: this is a background thread, and the consent
+                # flow would block it forever — which would stop recording, not
+                # just uploading. See get_youtube_service's docstring.
+                youtube = get_youtube_service(interactive=False)
             except Exception as e:
                 log.error(f"[youtube] auth failed: {e!r}")
             if not youtube:
@@ -1873,7 +2318,7 @@ def record_orchestrator() -> None:
         # Frame-liveness gate: a session can start cleanly yet stream nothing
         # (camera unauthorized in this launch context, device grabbed by another
         # opener, etc.). If no frames land within the window, abort now — otherwise
-        # the loop below would "record" an empty file until the 1.5h cap and the
+        # the loop below would "record" an empty file until the cap and the
         # upload would silently skip it (the exact multi-print outage this guards).
         if not rec.wait_until_streaming():
             log.error(f"[record] #{gallery_id}: NO frames within "
@@ -1901,6 +2346,11 @@ def record_orchestrator() -> None:
             _inflight_started = started
         deadline = started + RECORD_MAX_SECONDS
         stop_reason = "unknown"
+        # Independent completion poll (see _check_gallery_completed): throttled to
+        # its own slower cadence, and gated by MIN_RECORD_SECONDS like the
+        # snapshot signal so a stale finalized state can't stop a fresh recording.
+        next_gallery_poll = started + max(MIN_RECORD_SECONDS,
+                                          GALLERY_COMPLETE_POLL_INTERVAL)
 
         try:
             while True:
@@ -1913,6 +2363,12 @@ def record_orchestrator() -> None:
                 if _check_stop(gallery_id, started):
                     stop_reason = "snapshot"
                     break
+                now = time.monotonic()
+                if now >= next_gallery_poll:
+                    next_gallery_poll = now + GALLERY_COMPLETE_POLL_INTERVAL
+                    if _check_gallery_completed(gallery_id):
+                        stop_reason = "gallery-complete"
+                        break
                 time.sleep(STREAM_POLL_INTERVAL)
 
             log.info(f"[record] stopping ({stop_reason}) after "
