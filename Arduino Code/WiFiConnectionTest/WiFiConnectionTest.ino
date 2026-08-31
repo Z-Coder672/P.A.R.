@@ -1,4 +1,4 @@
-// WiFi + HTTPS smoke test for the P.A.R. Nano RP2040 Connect.
+// WiFi + HTTPS smoke test for the P.A.R. Arduino Nano ESP32.
 //
 // Connects to WiFi (same retry/watchdog pattern as PARMain), then GETs
 // /gallery.php every 10s and prints status + body length. /gallery.php is
@@ -11,8 +11,11 @@
 //   - Block par.zimmzimm.com at the router; ssl.connect() should fail and the
 //     loop should keep polling without wedging.
 
-#include <WiFiNINA.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <esp_system.h>      // esp_restart()
 #include "env.h"
+#include "par_root_ca.h"     // 6-root bundle; see setCACert() below
 
 const char* SSID     = "ab guest";
 const char* PASSWORD = WIFI_PASSWORD;
@@ -30,8 +33,9 @@ void ensureWiFi() {
   unsigned long stallT0 = millis();
   for (int attempt = 1; ; attempt++) {
     Serial.print("WiFi attempt "); Serial.print(attempt); Serial.print(": ");
-    WiFi.disconnect();
-    WiFi.end();
+    // WiFi.end() on WiFiNINA powered the co-processor down; the ESP32
+    // equivalent is disconnect(true), which also releases the station config.
+    WiFi.disconnect(true);
     delay(100);
     WiFi.begin(SSID, PASSWORD);
     unsigned long t0 = millis();
@@ -50,12 +54,12 @@ void ensureWiFi() {
       Serial.println("!!! WiFi stall, forcing MCU reset");
       Serial.flush();
       delay(50);
-      NVIC_SystemReset();
+      esp_restart();
     }
   }
 }
 
-// Raw GET, mirroring fetchNext() in PARMain — fresh WiFiSSLClient per call,
+// Raw GET, mirroring fetchNext() in PARMain — fresh WiFiClientSecure per call,
 // hand-written HTTP request, parse status + body length. We don't decode the
 // body (gallery.php can be a few KB) — we just count bytes so we know TLS is
 // actually working end-to-end.
@@ -63,7 +67,14 @@ bool getGallery(int& outStatus, size_t& outBodyBytes) {
   outStatus = 0;
   outBodyBytes = 0;
 
-  WiFiSSLClient ssl;
+  // WiFiNINA's WiFiSSLClient validated against the NINA's own baked-in root
+  // store. WiFiClientSecure has no default store, so the roots must be supplied
+  // or the handshake fails. par_root_ca.h carries SIX roots on purpose: the site
+  // sits behind Cloudflare, which rotates issuing CAs without notice — pinning a
+  // single root would break the rig on a rotation.
+  WiFiClientSecure ssl;
+  ssl.setCACert(PAR_ROOT_CA);
+  ssl.setTimeout(HTTP_RESPONSE_TIMEOUT_MS / 1000);
   if (!ssl.connect(SERVER, PORT)) {
     Serial.println("connect() failed");
     return false;

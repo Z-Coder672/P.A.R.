@@ -37,3 +37,9 @@ YT-Streamer/stream.log.fresh
 /consensus/
 /consensus_bitmap.png
 /photo-bitmap/
+
+# Nano ESP32 port: pre-port backup of the Arduino sketch folder
+Arduino Code.bak/
+
+# Rig photo sets from lidar standoff test passes (HEIC, ~240 MB) — never committed
+LiDAR Testing*/

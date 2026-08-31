@@ -1,33 +1,44 @@
-// WiFi scan diagnostic for the P.A.R. Nano RP2040 Connect.
+// WiFi scan diagnostic for the P.A.R. Arduino Nano ESP32.
 //
 // Purpose: when PARMain keeps logging `s=1` (WL_NO_SSID_AVAIL), this answers the
-// only question that matters — can the NINA radio actually SEE "ab guest" from
-// the rig's physical location? It scans and prints every SSID the module finds,
-// with channel, RSSI, and encryption, then flags any "ab guest" hit.
+// only question that matters — can the radio actually SEE "ab guest" from the
+// rig's physical location? It scans and prints every SSID it finds, with
+// channel, RSSI, and encryption, then flags any "ab guest" hit.
 //
-// The NINA is 2.4 GHz only. Channel 1-13 = 2.4 GHz (joinable); the NINA won't
-// report 5 GHz APs at all. So:
+// The ESP32-S3's radio is 2.4 GHz only, same as the NINA it replaced. Channel
+// 1-13 = 2.4 GHz (joinable); 5 GHz APs are not reported at all. So:
 //   - "ab guest" appears with decent RSSI  -> radio is fine; the NO_SSID_AVAIL
-//     in PARMain is an association/auth/wedged-module issue, look there next.
+//     in PARMain is an association/auth issue, look there next.
 //   - "ab guest" never appears             -> the AP isn't broadcasting that
 //     SSID on 2.4 GHz from here. No firmware change helps; fix the AP side
 //     (re-enable/!split the 2.4 GHz radio, move the rig, check the channel).
 //
+// PORT: the WL_NO_MODULE probe and WiFi.firmwareVersion() print are gone. Both
+// described the NINA co-processor's SPI link and its own firmware image; the
+// ESP32-S3 radio is on-die, so there is no separate module to be missing and no
+// second firmware version to report. Faking either would only report on the
+// host core.
+//
 // No credentials needed — scanning is passive. Run with Serial Monitor @115200.
 
-#include <WiFiNINA.h>
+#include <WiFi.h>
 
 const char* TARGET_SSID = "ab guest";
 const unsigned long SCAN_INTERVAL_MS = 8000;
 
-const char* encStr(uint8_t t) {
+// On the ESP32 core encryptionType() returns a wifi_auth_mode_t, which draws
+// finer distinctions than the NINA's five ENC_TYPE_* values did.
+const char* encStr(wifi_auth_mode_t t) {
   switch (t) {
-    case ENC_TYPE_WEP:  return "WEP";
-    case ENC_TYPE_TKIP: return "WPA";
-    case ENC_TYPE_CCMP: return "WPA2";
-    case ENC_TYPE_NONE: return "open";
-    case ENC_TYPE_AUTO: return "auto";
-    default:            return "?";
+    case WIFI_AUTH_OPEN:            return "open";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ent";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+    default:                        return "?";
   }
 }
 
@@ -37,12 +48,10 @@ void setup() {
   while (!Serial && millis() - t0 < 3000) {}
   Serial.println("\n=== WiFi scan test ===");
 
-  if (WiFi.status() == WL_NO_MODULE) {
-    Serial.println("!!! NINA module not found — check firmware/wiring");
-    while (true) delay(1000);
-  }
-  Serial.print("NINA firmware: ");
-  Serial.println(WiFi.firmwareVersion());
+  // Station mode without connecting: scanNetworks() needs the interface up.
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
 }
 
 unsigned long scanNum = 0;

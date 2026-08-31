@@ -1,16 +1,22 @@
-// TCS3200 sanity check: sample R/G/B/C twice a second and dump to serial.
-// Prints raw frequencies plus a blue-vs-black guess from the same tiny
-// ternary transformer used by P.A.R.Main.
+// TCS3200 sanity check: LED ambient-subtracted RGBC read + a simple
+// clear-channel threshold (no ML model). Prints the ambient-subtracted RGBC and
+// the resulting front-face guess (cyan/black) roughly twice a second.
+//
+// Read model (matches PARMain): a 5-frame averaged RGBC with the illumination
+// LEDs OFF (ambient) is subtracted from a 5-frame average with the LEDs ON.
+// Room light cancels, so the result depends only on the disc + our own LEDs.
+//
+// Polarity: the sensor views the BACK of each disc. An ON disc (cyan on the
+// FRONT) shows its BLACK back to the sensor -> LOW clear channel; an OFF disc
+// (black front) shows its cyan back -> HIGH clear. So front cyan/on = clear
+// below the threshold. gridState/the "on" result is the FRONT/displayed color.
 
-#include "classifier.h"
-
-const int AVG_WINDOW = 5;  // must match train-time averaging window
-
-const int TCS_S0  = 4;
-const int TCS_S1  = 5;
-const int TCS_S2  = 6;
-const int TCS_S3  = 7;
-const int TCS_OUT = 8;
+const int TCS_S0  = D4;
+const int TCS_S1  = D5;
+const int TCS_S2  = D6;
+const int TCS_S3  = D7;
+const int TCS_OUT = D8;
+const int TCS_LED = D10;  // illumination bank (NPN base); HIGH = on
 
 enum TcsFilter {
   TCS_RED   = 0,
@@ -25,18 +31,51 @@ void tcsSelect(TcsFilter f) {
 }
 
 unsigned long tcsReadFrequencyHz() {
-  const int N = 5;
-  unsigned long sum = 0;
-  int valid = 0;
-  for (int i = 0; i < N; i++) {
-    unsigned long halfUs = pulseIn(TCS_OUT, HIGH, 100000UL);
-    if (halfUs == 0) continue;
-    sum += 500000UL / halfUs;
-    valid++;
-  }
-  if (valid == 0) return 0;
-  return sum / valid;
+  unsigned long halfUs = pulseIn(TCS_OUT, HIGH, 100000UL);
+  if (halfUs == 0) return 0;
+  return 500000UL / halfUs;
 }
+
+// 5-frame averaged RGBC at whatever the current illumination is. Used twice per
+// read by readAmbientSubtracted() — once LEDs-off, once LEDs-on.
+void tcsReadRGBC(unsigned long& r, unsigned long& g,
+                 unsigned long& b, unsigned long& c) {
+  uint32_t sr = 0, sg = 0, sb = 0, sc = 0;
+  for (int i = 0; i < 5; i++) {
+    tcsSelect(TCS_RED);   delay(2); sr += tcsReadFrequencyHz();
+    tcsSelect(TCS_GREEN); delay(2); sg += tcsReadFrequencyHz();
+    tcsSelect(TCS_BLUE);  delay(2); sb += tcsReadFrequencyHz();
+    tcsSelect(TCS_CLEAR); delay(2); sc += tcsReadFrequencyHz();
+  }
+  r = sr / 5; g = sg / 5; b = sb / 5; c = sc / 5;
+}
+
+// LED settle after toggling the illumination bank before reading.
+const int LED_SETTLE_MS = 20;
+
+// One ambient-subtracted RGBC read: LEDs-off average subtracted from LEDs-on
+// average. Negatives clamped to 0. LEDs left off.
+void readAmbientSubtracted(long& r, long& g, long& b, long& c) {
+  unsigned long ar, ag, ab, ac, lr, lg, lb, lc;
+  digitalWrite(TCS_LED, LOW);  delay(LED_SETTLE_MS); tcsReadRGBC(ar, ag, ab, ac);
+  digitalWrite(TCS_LED, HIGH); delay(LED_SETTLE_MS); tcsReadRGBC(lr, lg, lb, lc);
+  digitalWrite(TCS_LED, LOW);
+  r = (long)lr - (long)ar; if (r < 0) r = 0;
+  g = (long)lg - (long)ag; if (g < 0) g = 0;
+  b = (long)lb - (long)ab; if (b < 0) b = 0;
+  c = (long)lc - (long)ac; if (c < 0) c = 0;
+}
+
+// Simple threshold on the ambient-subtracted clear channel. 1 = cyan/on
+// (front), 0 = black/off. See polarity note at the top.
+// Classification threshold. Physically the BLUE channel, not clear — the S2/S3
+// select lines are crossed on this rig, so tcsReadRGBC's `c` output holds blue.
+// That is deliberate (blue separates the disc faces 10.21x vs clear's 2.22x).
+// Full explanation and the measurements are in PARMain.ino at this constant.
+// 3535 = geometric mean of the measured populations; was 6000, which was
+// lopsided (3.69x / 1.28x) toward the failure side.
+const long SCAN_ON_BLUE_MAX = 3535;
+static inline uint8_t classifyDisc(long c) { return (c < SCAN_ON_BLUE_MAX) ? 1 : 0; }
 
 void setup() {
   Serial.begin(115200);
@@ -47,67 +86,28 @@ void setup() {
   pinMode(TCS_S2, OUTPUT);
   pinMode(TCS_S3, OUTPUT);
   pinMode(TCS_OUT, INPUT);
+  pinMode(TCS_LED, OUTPUT);
+  digitalWrite(TCS_LED, LOW);
 
   // 20% output frequency scaling.
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
   tcsSelect(TCS_CLEAR);
 
-  Serial.println("TCS3200 test ready.");
-  Serial.println("R\tG\tB\tC\tlogit\tguess\tus");
+  Serial.println("TCS3200 ambient-subtracted test ready.");
+  Serial.println("R\tG\tB\tC\tguess");
 }
 
-// Ring buffer of the last AVG_WINDOW raw RGBC frames + running sum, so the
-// windowed mean is a single divide per channel.
-static uint32_t ring[AVG_WINDOW][4];
-static uint32_t ringSum[4] = {0, 0, 0, 0};
-static uint8_t  ringIdx = 0;
-static uint8_t  ringFilled = 0;
-
 void loop() {
-  unsigned long r, g, b, c;
-  tcsSelect(TCS_RED);   delay(2); r = tcsReadFrequencyHz();
-  tcsSelect(TCS_GREEN); delay(2); g = tcsReadFrequencyHz();
-  tcsSelect(TCS_BLUE);  delay(2); b = tcsReadFrequencyHz();
-  tcsSelect(TCS_CLEAR); delay(2); c = tcsReadFrequencyHz();
+  long r, g, b, c;
+  readAmbientSubtracted(r, g, b, c);
+  const char* guess = classifyDisc(c) ? "cyan" : "black";
 
-  if (ringFilled == AVG_WINDOW) {
-    ringSum[0] -= ring[ringIdx][0];
-    ringSum[1] -= ring[ringIdx][1];
-    ringSum[2] -= ring[ringIdx][2];
-    ringSum[3] -= ring[ringIdx][3];
-  } else {
-    ringFilled++;
-  }
-  ring[ringIdx][0] = r;  ringSum[0] += r;
-  ring[ringIdx][1] = g;  ringSum[1] += g;
-  ring[ringIdx][2] = b;  ringSum[2] += b;
-  ring[ringIdx][3] = c;  ringSum[3] += c;
-  ringIdx = (ringIdx + 1) % AVG_WINDOW;
+  Serial.print(r); Serial.print('\t');
+  Serial.print(g); Serial.print('\t');
+  Serial.print(b); Serial.print('\t');
+  Serial.print(c); Serial.print('\t');
+  Serial.println(guess);
 
-  if (ringFilled < AVG_WINDOW) {
-    delay(1);
-    return;
-  }
-
-  float rgbc[4] = {
-    (float)ringSum[0] / (float)AVG_WINDOW,
-    (float)ringSum[1] / (float)AVG_WINDOW,
-    (float)ringSum[2] / (float)AVG_WINDOW,
-    (float)ringSum[3] / (float)AVG_WINDOW,
-  };
-  unsigned long t0 = micros();
-  float logit = classifier_logit(rgbc);
-  unsigned long us = micros() - t0;
-  const char* guess = (logit > 3.0f) ? "blue" : "black";
-
-  Serial.print((unsigned long)rgbc[0]); Serial.print("\t");
-  Serial.print((unsigned long)rgbc[1]); Serial.print("\t");
-  Serial.print((unsigned long)rgbc[2]); Serial.print("\t");
-  Serial.print((unsigned long)rgbc[3]); Serial.print("\t");
-  Serial.print(logit, 3); Serial.print("\t");
-  Serial.print(guess); Serial.print("\t");
-  Serial.println(us);
-
-  delay(1);
+  delay(500);
 }
