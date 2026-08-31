@@ -31,6 +31,7 @@ browser for consent) — ../run_auth_setup.sh does that for you over SSH:
 from __future__ import annotations
 
 import argparse
+import logging
 import json
 import sys
 
@@ -41,6 +42,20 @@ from googleapiclient.discovery import build
 import YT_streamer as ys
 
 log = ys.log
+
+# ── CREDENTIAL HYGIENE ─────────────────────────────────────────────────────────
+# requests_oauthlib logs the ENTIRE token response at DEBUG — access_token AND
+# refresh_token in cleartext — and urllib3/oauthlib log the Authorization header
+# carrying the client secret. YT_streamer puts the root logger at DEBUG, and the
+# run_*.sh wrappers tee stdout to a world-readable file in /tmp, so those three
+# facts together wrote live credentials to plaintext disk (observed 2026-08-30).
+# The whole point of the DMG vault is that credentials never land unencrypted,
+# so pin the noisy third-party loggers here, BEFORE any flow runs.
+for _noisy in ("requests_oauthlib", "requests_oauthlib.oauth2_session", "oauthlib",
+               "urllib3", "urllib3.connectionpool", "google_auth_oauthlib",
+               "google.auth.transport.requests", "googleapiclient.discovery"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 
 UPLOAD = "upload"
 PLAYLIST = "playlist"

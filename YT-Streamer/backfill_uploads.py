@@ -25,6 +25,7 @@ A successfully uploaded .mov is MOVED to RECORDING_DIR/uploaded/, never removed
 from __future__ import annotations
 
 import argparse
+import logging
 import json
 import re
 import sys
@@ -40,6 +41,20 @@ from googleapiclient.discovery import build
 import YT_streamer as ys
 
 log = ys.log
+
+# ── CREDENTIAL HYGIENE ─────────────────────────────────────────────────────────
+# requests_oauthlib logs the ENTIRE token response at DEBUG — access_token AND
+# refresh_token in cleartext — and urllib3/oauthlib log the Authorization header
+# carrying the client secret. YT_streamer puts the root logger at DEBUG, and the
+# run_*.sh wrappers tee stdout to a world-readable file in /tmp, so those three
+# facts together wrote live credentials to plaintext disk (observed 2026-08-30).
+# The whole point of the DMG vault is that credentials never land unencrypted,
+# so pin the noisy third-party loggers here, BEFORE any flow runs.
+for _noisy in ("requests_oauthlib", "requests_oauthlib.oauth2_session", "oauthlib",
+               "urllib3", "urllib3.connectionpool", "google_auth_oauthlib",
+               "google.auth.transport.requests", "googleapiclient.discovery"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 
 # <gallery_id>_<unix_ts>.mov — the name record_orchestrator writes.
 MOV_RE = re.compile(r"^(\d+)_(\d+)\.mov$")
