@@ -470,6 +470,20 @@ function ordinalSuffix(n) {
     }
 }
 
+// The artist credit is optional at every hop (blank on legacy entries, on
+// submissions that skipped the field, and on the reset call), so the line is
+// hidden outright rather than rendered as an empty "by".
+function setGalleryModalArtist(el, artist) {
+    const value = typeof artist === 'string' ? artist.trim() : '';
+    if (!value) {
+        el.textContent = '';
+        el.classList.add('hidden');
+        return;
+    }
+    el.textContent = `by ${value}`;
+    el.classList.remove('hidden');
+}
+
 function openQueueModal(item) {
     const modal = document.getElementById('galleryItemModal');
     const nameEl = document.getElementById('galleryModalName');
@@ -478,6 +492,7 @@ function openQueueModal(item) {
     const noSnapshotEl = document.getElementById('galleryModalNoSnapshot');
     const pendingEl = document.getElementById('galleryModalPending');
     const queueEl = document.getElementById('galleryModalQueue');
+    const artistEl = document.getElementById('galleryModalArtist');
 
     imgEl.classList.add('hidden');
     snapshotEl.classList.add('hidden');
@@ -487,6 +502,7 @@ function openQueueModal(item) {
     queueEl.classList.add('hidden');
 
     nameEl.textContent = item.name || '(unnamed)';
+    setGalleryModalArtist(artistEl, item.artist);
 
     if (item.bitmap) {
         const src = bitmapBase64ToCanvas(item.bitmap);
@@ -546,8 +562,10 @@ function openGalleryModal(item) {
     const pendingEl = document.getElementById('galleryModalPending');
     const queueEl = document.getElementById('galleryModalQueue');
     const videoEl = document.getElementById('galleryModalVideo');
+    const artistEl = document.getElementById('galleryModalArtist');
 
     nameEl.textContent = '';
+    setGalleryModalArtist(artistEl, '');
     imgEl.classList.add('hidden');
     snapshotEl.classList.add('hidden');
     snapshotEl.removeAttribute('src');
@@ -557,6 +575,7 @@ function openGalleryModal(item) {
     resetGalleryModalVideo();
 
     nameEl.textContent = item.name || '(unnamed)';
+    setGalleryModalArtist(artistEl, item.artist);
 
     if (item.bitmap) {
         const src = bitmapBase64ToCanvas(item.bitmap);
@@ -1377,6 +1396,7 @@ sendQueueBtn.addEventListener('click', function() {
     setQueueStatus('');
     document.getElementById('pictureName').value = '';
     document.getElementById('pictureNameError').classList.add('hidden');
+    document.getElementById('pictureArtist').value = '';
     document.getElementById('nameModal').classList.remove('hidden');
     document.getElementById('pictureName').focus();
 });
@@ -2065,6 +2085,7 @@ document.getElementById('pictureName').addEventListener('input', function() {
 // Name modal — cancel
 document.getElementById('cancelNameModal').addEventListener('click', function() {
     document.getElementById('nameModal').classList.add('hidden');
+    document.getElementById('pictureArtist').value = '';
     const emailInput = document.getElementById('pictureEmail');
     emailInput.value = '';
     emailInput.classList.remove('input-error');
@@ -2076,6 +2097,7 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
     const nameModal = document.getElementById('nameModal');
     const nameInput = document.getElementById('pictureName');
     const nameError = document.getElementById('pictureNameError');
+    const artistInput = document.getElementById('pictureArtist');
     const emailInput = document.getElementById('pictureEmail');
     const emailError = document.getElementById('pictureEmailError');
     const name = nameInput.value.trim();
@@ -2101,10 +2123,17 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
     emailInput.classList.remove('input-error');
 
     const state = captureGridState();
+    // Optional, like email: omitted from the payload entirely when blank, so
+    // the server stores '' and the gallery skips the "by ..." line.
+    const artist = artistInput.value.trim();
+
     const payload = {
         item: encodeGridStateToBase64(state),
         name: name
     };
+    if (artist) {
+        payload.artist = artist;
+    }
     if (email) {
         payload.email = email;
     }
@@ -2133,6 +2162,7 @@ document.getElementById('confirmNameModal').addEventListener('click', async func
             ? 'Picture submitted for review. Once approved it joins the P.A.R. queue, and we\'ll email you when it prints.'
             : 'Picture submitted for review. Once approved it joins the P.A.R. queue to be printed.');
         emailInput.value = '';
+        artistInput.value = '';
     } catch (error) {
         console.error('Error sending picture to queue:', error);
         const message = error instanceof Error

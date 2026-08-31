@@ -128,6 +128,7 @@ fclose($handle);
 $parsed = json_decode($nextItem, true);
 $bitmapBase64 = is_array($parsed) ? ($parsed['item'] ?? $nextItem) : $nextItem;
 $itemName = is_array($parsed) ? ($parsed['name'] ?? '') : '';
+$itemArtist = is_array($parsed) ? ($parsed['artist'] ?? '') : '';
 $subId = is_array($parsed) ? (string) ($parsed['sub_id'] ?? '') : '';
 
 $galleryDir = __DIR__ . '/gallery';
@@ -141,7 +142,10 @@ if (mkdir($entryDir, 0777, true)) {
     if ($decoded !== false && strlen($decoded) === EXPECTED_BITMAP_BYTES) {
         file_put_contents(
             $entryDir . '/pending.json',
-            json_encode(['name' => $itemName, 'bitmap' => $bitmapBase64], JSON_UNESCAPED_UNICODE)
+            json_encode(
+                ['name' => $itemName, 'artist' => $itemArtist, 'bitmap' => $bitmapBase64],
+                JSON_UNESCAPED_UNICODE
+            )
         );
         // Bind any stored notification email (kept off-webroot) to this gallery
         // id so snapshot-request.php can notify the submitter when it completes.

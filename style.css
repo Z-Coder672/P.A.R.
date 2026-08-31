@@ -1549,9 +1549,28 @@ body.modal-open {
     max-width: 500px;
     display: flex;
     flex-direction: column;
+    padding-top: 3rem;
+    /* Cap to the viewport so a tall entry (bitmap + photo + recording) scrolls
+       inside the modal instead of running off-screen with no way to reach it —
+       the overlay is position:fixed, so the page behind can't scroll to it. */
+    max-height: 90vh;
+    /* Small-viewport units account for mobile browser chrome; ignored by
+       browsers that don't support them, which keep the vh value above. */
+    max-height: 90dvh;
+}
+
+.gallery-modal-scroll {
+    display: flex;
+    flex-direction: column;
     align-items: center;
     gap: 1rem;
-    padding-top: 3rem;
+    width: 100%;
+    overflow-y: auto;
+    /* A flex child won't shrink below its content without this, which would
+       defeat the max-height above. */
+    min-height: 0;
+    /* Don't chain the scroll to the page once this box hits its end. */
+    overscroll-behavior: contain;
 }
 
 .gallery-modal-name {
@@ -1560,6 +1579,20 @@ body.modal-open {
     color: #ffffff;
     text-align: center;
     margin: 0;
+}
+
+/* Optional artist credit under the piece name. Hidden (not blank) when the
+   submitter left the field empty — see setGalleryModalArtist. */
+.gallery-modal-artist {
+    font-size: 0.9rem;
+    font-weight: 400;
+    color: #999999;
+    text-align: center;
+    margin: 0;
+}
+
+.gallery-modal-artist.hidden {
+    display: none;
 }
 
 .gallery-modal-image {
@@ -1641,8 +1674,12 @@ body.modal-open {
 }
 
 .name-modal-input {
-    background-color: #0d0d0d;
-    border: 2px solid #444444;
+    /* Lighter than the #1a1a1a modal surface so the fields read as raised
+       wells rather than holes punched in the panel. */
+    background-color: #222222;
+    /* Near-white so the fields read as clearly editable against the modal's
+       dark surface — deliberately not pure #fff, which fights the cyan focus. */
+    border: 2px solid #d9d9d9;
     border-radius: 6px;
     color: #ffffff;
     font-size: 1rem;
@@ -1658,7 +1695,9 @@ body.modal-open {
 }
 
 .name-modal-input::placeholder {
-    color: #555555;
+    /* Lifted alongside the lighter field background — #555 was tuned against
+       the old #0d0d0d and loses contrast against #222. */
+    color: #7d7d7d;
 }
 
 .name-modal-input.input-error {

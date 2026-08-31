@@ -85,6 +85,9 @@ foreach ($lines as $line) {
             'id'        => (string)$entry['id'],
             'image_b64' => (string)($entry['item'] ?? ''),
             'name'      => (string)($entry['name'] ?? ''),
+            // Optional; the daemon moderates it as a separate check and
+            // treats '' as nothing to review.
+            'artist'    => (string)($entry['artist'] ?? ''),
         ];
         $entry['status']    = 'processing';
         $entry['status_ts'] = $now;
