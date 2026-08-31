@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-P.A.R. is a website for a custom 37×18 pixel LED matrix display. Users draw pixel art (or upload/crop photos), send them to a queue, and an Arduino device polls the queue and displays each image. The Mac Mini records the camera feed for each print and uploads the recording to YouTube; the website's Latest tab embeds the most recent upload and the gallery modal embeds each print's recording.
+P.A.R. is a website for a custom 37×18 pixel flip-disc display. Users draw pixel art (or upload/crop photos), send them to a queue, and an Arduino device polls the queue and displays each image. The Mac Mini records the camera feed for each print and uploads the recording to YouTube; the website's Latest tab embeds the most recent upload and the gallery modal embeds each print's recording.
 
 ## Repo
 
