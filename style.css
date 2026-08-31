@@ -1573,6 +1573,14 @@ body.modal-open {
     overscroll-behavior: contain;
 }
 
+/* Flex children shrink to fit their container by default, so the bitmap, the
+   photo and the 16/9 recording box were being vertically crushed to squeeze
+   inside max-height instead of overflowing. Pin them to their natural size and
+   let .gallery-modal-scroll scroll. */
+.gallery-modal-scroll > * {
+    flex-shrink: 0;
+}
+
 .gallery-modal-name {
     font-size: 1.1rem;
     font-weight: 600;
@@ -1635,6 +1643,8 @@ body.modal-open {
 .gallery-modal-video {
     width: 100%;
     aspect-ratio: 16 / 9;
+    /* Belt-and-braces against the flex crush; see .gallery-modal-scroll > *. */
+    flex-shrink: 0;
     margin-top: 0.75rem;
     border: 1px solid #333333;
     border-radius: 4px;
