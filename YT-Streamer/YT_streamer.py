@@ -255,6 +255,8 @@ YT_VAULT_PLAYLIST_TOKEN_FILE = os.getenv("YT_VAULT_PLAYLIST_TOKEN_FILE",
                                          "yt_token_playlist.json")
 # A playlist insert is a single cheap call (50 quota units) with no resumable
 # session to protect, so a couple of quick retries is all it warrants.
+VIDEO_ID_MAX_ATTEMPTS        = int(os.getenv("VIDEO_ID_MAX_ATTEMPTS", "5"))
+VIDEO_ID_RETRY_BASE_DELAY    = float(os.getenv("VIDEO_ID_RETRY_BASE_DELAY", "5"))
 PLAYLIST_MAX_ATTEMPTS        = int(os.getenv("PLAYLIST_MAX_ATTEMPTS", "3"))
 PLAYLIST_RETRY_BASE_DELAY    = float(os.getenv("PLAYLIST_RETRY_BASE_DELAY", "5"))
 # Background OAuth-token keepalive cadence (hours). The refresher runs even with
@@ -2163,23 +2165,51 @@ def poll_mod_queue() -> None:
 # immediately even if the upload is slow.
 
 
-def _post_video_id(gallery_id: int, video_id: str) -> None:
+def _post_video_id(gallery_id: int, video_id: str) -> bool:
+    """Attach the uploaded video to its gallery entry. True on success.
+
+    THE RETURN VALUE IS LOAD-BEARING: the caller keeps the .mov unless this
+    succeeds. This used to be fire-and-forget with no retry while the caller
+    removed the recording unconditionally afterwards — so a single 500 or
+    timeout left the video public on YouTube, the gallery entry with no
+    video_id, and no local file for backfill to retry from. Silent, permanent,
+    one log line.
+
+    4xx is permanent (bad id, malformed video_id, entry genuinely absent) and is
+    not retried. Transport errors and 408/429/5xx are.
+    """
     if not STREAM_VIDEO_ID_URL:
         log.warning("[stream-start] STREAM_VIDEO_ID_URL not set; skipping video_id POST")
-        return
-    try:
-        resp = requests.post(
-            STREAM_VIDEO_ID_URL,
-            data={"secret": SNAPSHOT_SECRET, "id": str(gallery_id), "video_id": video_id},
-            headers={"User-Agent": "P.A.R./1.0"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            log.info(f"[stream-start] Attached video_id={video_id} to gallery #{gallery_id}")
-        else:
-            log.warning(f"[stream-start] video_id POST returned {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        log.error(f"[stream-start] video_id POST failed: {e}")
+        return False
+
+    for attempt in range(1, VIDEO_ID_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(
+                STREAM_VIDEO_ID_URL,
+                data={"secret": SNAPSHOT_SECRET, "id": str(gallery_id), "video_id": video_id},
+                headers={"User-Agent": "P.A.R./1.0"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                log.info(f"[stream-start] Attached video_id={video_id} to gallery #{gallery_id}")
+                return True
+            log.warning(f"[stream-start] video_id POST attempt {attempt}/"
+                        f"{VIDEO_ID_MAX_ATTEMPTS} returned {resp.status_code}: "
+                        f"{resp.text[:200]}")
+            if resp.status_code not in (408, 429, 500, 502, 503, 504):
+                log.error(f"[stream-start] video_id POST for #{gallery_id} failed "
+                          f"permanently ({resp.status_code}); not retrying")
+                return False
+        except Exception as e:
+            log.warning(f"[stream-start] video_id POST attempt {attempt}/"
+                        f"{VIDEO_ID_MAX_ATTEMPTS} failed: {e}")
+
+        if attempt < VIDEO_ID_MAX_ATTEMPTS:
+            time.sleep(VIDEO_ID_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+
+    log.error(f"[stream-start] video_id POST for #{gallery_id} gave up after "
+              f"{VIDEO_ID_MAX_ATTEMPTS} attempts (video_id={video_id})")
+    return False
 
 
 def _wait_for_start() -> tuple[int, str] | None:
@@ -2284,18 +2314,33 @@ def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> N
         log.warning(f"[upload] failed for #{gallery_id}; leaving {out_path} on disk")
         return
     try:
-        _post_video_id(gallery_id, video_id)
+        attached = _post_video_id(gallery_id, video_id)
     except Exception as e:
         log.error(f"[upload] video_id POST raised: {e!r}")
+        attached = False
     # Best-effort, and deliberately AFTER the gallery attachment: the site
     # embed is what the print is for, the playlist is a nicety. `youtube` is
     # passed only as the single-channel fallback (see _get_playlist_client) —
     # the playlist normally has its own token for its own channel.
     attach_to_playlist(video_id, gallery_id, upload_client=youtube)
+
+    if not attached:
+        # Keep the recording so the print stays recoverable, and drop a sidecar
+        # naming the video we already uploaded. Without it a later backfill
+        # would re-upload the same footage as a duplicate YouTube video; with
+        # it, backfill skips straight to re-POSTing the id.
+        try:
+            out_path.with_suffix(out_path.suffix + ".video_id").write_text(video_id)
+        except Exception as e:
+            log.warning(f"[upload] could not write video_id sidecar: {e}")
+        log.error(f"[upload] #{gallery_id} uploaded as {video_id} but NOT attached; "
+                  f"keeping {out_path} for ./run_backfill.sh")
+        return
+
     try:
         out_path.unlink()
     except Exception as e:
-        log.warning(f"[upload] could not unlink {out_path}: {e}")
+        log.warning(f"[upload] could not remove {out_path}: {e}")
 
 
 def record_orchestrator() -> None:

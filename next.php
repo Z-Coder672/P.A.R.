@@ -61,6 +61,32 @@ if ($requestMethod !== 'POST') {
     exit;
 }
 
+// Authenticated since 2026-08-31. This endpoint DESTRUCTIVELY pops a queue item
+// per call and was previously wide open, so anyone who knew the URL could drain
+// queue.txt one request at a time — each pop stranding a pending gallery entry
+// and binding a submitter email that could then never be sent. It is
+// deliberately still NOT rate limited, so the device can never be locked out of
+// its own work queue; the secret is what keeps everyone else out.
+// Same accept-either shape as the other device endpoints (POST field or header);
+// the Arduino sends the header.
+foreach (@file(__DIR__ . '/.env', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $envLine) {
+    if (strpos($envLine, '=') !== false) {
+        [$k, $v] = explode('=', $envLine, 2);
+        putenv(trim($k) . '=' . trim(trim($v), '"\''));
+    }
+}
+$secret = getenv('SNAPSHOT_SECRET') ?: '';
+$provided = $_POST['secret'] ?? ($_SERVER['HTTP_X_SNAPSHOT_SECRET'] ?? '');
+if (!is_string($provided)) {
+    $provided = '';
+}
+if ($secret === '' || !hash_equals($secret, $provided)) {
+    http_response_code(401);
+    header('Content-Type: text/plain; charset=UTF-8');
+    echo 'unauthorized';
+    exit;
+}
+
 header('Content-Type: text/plain; charset=UTF-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 

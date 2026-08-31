@@ -43,7 +43,7 @@ poll server  → got bitmap? → re-scan board (skipped if last action was a cle
 
 **0. `cadenceGate()`** — the clear-to-operate gate, before any motion or server ingestion. See **Daily Cadence** below. **HARD RULE: with no trusted time-server clock it returns false and the rig holds parked — no polling, no scanning, not even homing.** There is no "uncadenced" fallback; `loop()` just waits 30 s and retries the gate.
 
-**1. Poll** — `fetchNext()` opens a raw TLS socket to the server, `POST /next.php` (must be POST — intermediates may silently retry GETs, and each retry would pop a queue item the board never sees)
+**1. Poll** — `fetchNext()` opens a raw TLS socket to the server, `POST /next.php` with an `X-Snapshot-Secret` header (must be POST — intermediates may silently retry GETs, and each retry would pop a queue item the board never sees; the secret is required as of 2026-08-31, so **flash this sketch before deploying that server change** or every poll 401s). The response's `X-Gallery-Id` header is the entry id, validated digits-only by `isDigitsOnlyId()` before it is stored — it is interpolated into the `/complete.php` URL and the snapshot POST body
 
 **2. Parse response**
 - Status 200 + body = new bitmap (base64, 112 chars max)
@@ -202,8 +202,10 @@ GRBL's RX buffer = 128 bytes. Code tracks how many bytes are in-flight:
 | Reply corrupted by line noise | `grblScrub()` drops non-printables; `grblIsOk`/`grblHasError`/`grblHasAlarm` match by substring so a surviving printable junk byte can't lose the ack. Counted in `gRxCorruptOks` / `gRxIdleDropped` |
 | Servo command unacked (`SERVO_ACK_MODE 2`) | Re-send and **retry forever**. Blocking is the safe failure: every call site is reached with GRBL idle. Deliberately does *not* reset — a reset re-homes, and homing with the arm possibly at ENGAGE is how the arm broke |
 | WiFi down > 60 s | Park servo → `esp_restart()` |
-| WiFi/HTTP failure | Log, wait 10s, retry |
-| Bitmap wrong length | Log, wait 10s, retry |
+| `next.php` poll failure | Log, wait 10s, retry |
+| Bitmap wrong length | Log, wait 10s, retry (the 10s back-off is load-bearing — `next.php` pops an item per call, so retrying with no delay would drain the queue) |
+| `snapshot-request.php` failure | Log only. **No retry** — a missed snapshot just leaves `gallery/<id>/image.*` absent |
+| `complete.php` failure | Exponential back-off 1s→60s over a 5-minute budget; on exhaustion the id is dropped and the entry stays `pending` server-side |
 | VL53L4CD init fails ×10 | Log, record the day with `sensorOk = 0`, **keep printing** |
 | NTP never syncs | HOLD PARKED — no motion, no polling, not even homing; log every 5 min, retry every 30 s |
 | NTP fix goes stale (> 24 h, e.g. router dead) | Same hold-parked state as never-synced; recovers on the next fix |

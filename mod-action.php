@@ -91,6 +91,14 @@ if ($verdict === 'approve') {
     // Append to main queue. Promotion is an explicit admin action, so we only
     // enforce MAX_MAIN_QUEUE_LENGTH here as a generous backstop against a bug
     // blowing the queue up.
+    //
+    // THE ENTRY IS ONLY DROPPED FROM mod_queue.txt IF THIS SUCCEEDS. Previously
+    // the drop happened unconditionally while the append was gated on the cap
+    // and on taking the second lock, so approving into a full queue destroyed
+    // the submission outright — and still answered {"ok":true}. The submitter's
+    // encrypted address was then orphaned as sub-<id>.enc, never bound to a
+    // gallery id and so never sent.
+    $promotedOk = false;
     if (!file_exists($mainFile)) {
         file_put_contents($mainFile, '');
     }
@@ -112,11 +120,29 @@ if ($verdict === 'approve') {
                 JSON_UNESCAPED_UNICODE
             );
             fseek($mainHandle, 0, SEEK_END);
-            fwrite($mainHandle, $promoted . PHP_EOL);
+            $promotedOk = fwrite($mainHandle, $promoted . PHP_EOL) !== false;
             fflush($mainHandle);
+        } else {
+            $queueFull = true;
         }
         flock($mainHandle, LOCK_UN);
         fclose($mainHandle);
+    }
+
+    if (!$promotedOk) {
+        // Leave mod_queue.txt exactly as we found it (the entry keeps its
+        // current status, so it can be approved again once there is room) and
+        // tell the caller, instead of silently eating the submission.
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        http_response_code(503);
+        header('Content-Type: application/json; charset=UTF-8');
+        echo json_encode([
+            'ok'    => false,
+            'error' => isset($queueFull) ? 'main_queue_full' : 'promote_failed',
+            'id'    => $id,
+        ]);
+        exit;
     }
 }
 
