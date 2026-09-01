@@ -1927,6 +1927,18 @@ def check_name(name: str) -> dict:
     return _claude_json(_MOD_NAME_SYSTEM_PROMPT, user_prompt, MOD_NAME_MODEL)
 
 
+def _timed_check(fn, *args):
+    """Run one moderation check and report its OWN duration as (result, seconds).
+
+    The three checks run concurrently but are read back SEQUENTIALLY, so logging
+    `now - batch_start` credits each check with the wall time of every check read
+    before it. That made the instant blank-artist short-circuit (which issues no
+    SDK call at all) log as a 6-9s model call, indistinguishable from a real one.
+    """
+    t = time.monotonic()
+    return fn(*args), time.monotonic() - t
+
+
 def check_artist(artist: str) -> dict:
     """Moderate the optional artist credit, independently of the piece name.
 
@@ -2088,9 +2100,9 @@ def process_mod_item(item: dict) -> None:
              f"effort={MOD_REASONING})")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        fut_img    = pool.submit(check_image, png_for_claude)
-        fut_name   = pool.submit(check_name, name)
-        fut_artist = pool.submit(check_artist, artist)
+        fut_img    = pool.submit(_timed_check, check_image, png_for_claude)
+        fut_name   = pool.submit(_timed_check, check_name, name)
+        fut_artist = pool.submit(_timed_check, check_artist, artist)
 
         # Outer timeout = generous bound around per-attempt timeout * (1 + retries)
         # so the threadpool .result() doesn't fire before check_image's
@@ -2098,9 +2110,9 @@ def process_mod_item(item: dict) -> None:
         outer_budget = MOD_CHECK_TIMEOUT * (2 + MOD_CHECK_RETRIES)
 
         try:
-            image_result = fut_img.result(timeout=outer_budget)
+            image_result, image_secs = fut_img.result(timeout=outer_budget)
             log.info(f"[mod] #{item_id} image check done in "
-                     f"{time.monotonic()-t0:.1f}s: "
+                     f"{image_secs:.1f}s: "
                      f"verdict={image_result.get('verdict')!r} "
                      f"conf={image_result.get('confidence')}")
         except concurrent.futures.TimeoutError:
@@ -2113,9 +2125,9 @@ def process_mod_item(item: dict) -> None:
             image_result = e
 
         try:
-            name_result = fut_name.result(timeout=outer_budget)
+            name_result, name_secs = fut_name.result(timeout=outer_budget)
             log.info(f"[mod] #{item_id} name check done in "
-                     f"{time.monotonic()-t0:.1f}s: "
+                     f"{name_secs:.1f}s: "
                      f"verdict={name_result.get('verdict')!r} "
                      f"conf={name_result.get('confidence')}")
         except concurrent.futures.TimeoutError:
@@ -2128,11 +2140,17 @@ def process_mod_item(item: dict) -> None:
             name_result = e
 
         try:
-            artist_result = fut_artist.result(timeout=outer_budget)
-            log.info(f"[mod] #{item_id} artist check done in "
-                     f"{time.monotonic()-t0:.1f}s: "
-                     f"verdict={artist_result.get('verdict')!r} "
-                     f"conf={artist_result.get('confidence')}")
+            artist_result, artist_secs = fut_artist.result(timeout=outer_budget)
+            if not artist.strip():
+                # check_artist short-circuits a blank credit line; no SDK session
+                # is spent. Logged distinctly so this is visible in stream.log.
+                log.info(f"[mod] #{item_id} artist check SKIPPED (no artist name) "
+                         f"— no SDK call, synthetic approve")
+            else:
+                log.info(f"[mod] #{item_id} artist check done in "
+                         f"{artist_secs:.1f}s: "
+                         f"verdict={artist_result.get('verdict')!r} "
+                         f"conf={artist_result.get('confidence')}")
         except concurrent.futures.TimeoutError:
             log.warning(f"[mod] artist check exhausted {outer_budget}s budget "
                         f"for #{item_id} — treating as failure")
