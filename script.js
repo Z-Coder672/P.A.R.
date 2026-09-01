@@ -148,14 +148,15 @@ function loadYouTubeIframeApi() {
 }
 
 // Mount a player on `mountEl` (the API replaces it with an iframe) that seeks to
-// ~10s before the end as soon as the duration is known. getDuration() only
+// ~10s before the end as soon as the duration is known (`nearEnd: false` plays
+// from the start instead). getDuration() only
 // returns a real value once playback metadata loads (≈ first PLAYING), so we try
 // on both onReady and the first PLAYING. Returns the YT.Player synchronously —
 // loadYouTubeIframeApi() must have resolved first.
-function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError, onReady } = {}) {
+function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError, onReady, nearEnd = true } = {}) {
     let seeked = false;
     const seekNearEnd = (p) => {
-        if (seeked) return;
+        if (seeked || !nearEnd) return;
         const dur = p.getDuration();
         if (dur && dur > NEAR_END_SECONDS) {
             p.seekTo(dur - NEAR_END_SECONDS, true);
@@ -641,11 +642,14 @@ async function maybeEmbedRecording(videoId, container) {
     let wantsPlay = false;
     const play = (p) => {
         // Muted is the only autoplay browsers reliably allow; the recordings are
-        // silent anyway. seekNearEnd() then fires off the first PLAYING.
+        // silent anyway.
         try { p.mute(); p.playVideo(); } catch (e) {}
     };
     galleryModalPlayer = createNearEndPlayer(mount, videoId, {
         autoplay: false,
+        // The modal autoplays, so it plays the print through from the top; the
+        // Latest tab still opens on the finished board.
+        nearEnd: false,
         onReady: (p) => {
             if (token !== galleryModalToken) return;
             ready = true;
