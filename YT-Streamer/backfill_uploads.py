@@ -230,11 +230,17 @@ def main() -> int:
         else:
             title = f'"{name}" printing - P.A.R.'
             log.info(f"[backfill] uploading #{gid}: {title!r}")
+            # Same timelapse intro the live uploader prepends, so a recovered
+            # print is indistinguishable from one that uploaded first time.
+            # `path` itself is never modified — it stays the retire/retry target.
+            composed = ys.compose_with_timelapse(path)
             try:
-                video_id = ys.upload_recording(youtube, path, title)
+                video_id = ys.upload_recording(youtube, composed or path, title)
             except Exception as e:
                 log.error(f"[backfill] #{gid} raised: {e!r}")
                 video_id = None
+            finally:
+                ys._drop_composed(composed)
             if not video_id:
                 log.warning(f"[backfill] #{gid} failed; leaving {path} on disk")
                 failed += 1

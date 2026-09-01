@@ -30,6 +30,7 @@ import threading
 import json
 import re
 import shutil
+import tempfile
 import requests
 import ftplib
 import ssl
@@ -40,7 +41,7 @@ import base64
 import io
 import concurrent.futures
 import anyio
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -189,6 +190,54 @@ FRAME_LIVENESS_MIN_BYTES = 64 * 1024
 # sees it) is visible in the log — the difference between an authorized
 # Terminal-launched run and a NotDetermined/Denied launchd-detached one.
 _CAMERA_AUTH_NAMES = {0: "NotDetermined", 1: "Restricted", 2: "Denied", 3: "Authorized"}
+
+# ── TIMELAPSE INTRO ───────────────────────────────────────────────────────────
+#
+# Every upload is prefixed with a fixed-SPEED timelapse of the whole print, so a
+# viewer sees the finished piece assemble before the real-time footage starts.
+# The label in the bottom-right names the speed for each half: "Timelapse
+# (<mult>x speed)" over the intro, "Real-time (1x speed)" after.
+#
+# The RATE is fixed, not the duration: the intro runs `duration / TIMELAPSE_SPEED`
+# seconds, so a longer print gets a proportionally longer intro and every video
+# reads at the same pace. (It was a fixed 20s at a computed multiplier first;
+# that made the multiplier a different number on every upload.)
+#
+# The labels are rendered to PNGs with Pillow and composited with ffmpeg's
+# `overlay`, NOT `drawtext`: the Homebrew ffmpeg on this machine is built
+# without libfreetype, so drawtext does not exist in it (`ffmpeg -filters |
+# grep drawtext` is empty). Don't "simplify" this back to drawtext without
+# checking that first — it fails at run time with "No such filter".
+TIMELAPSE_ENABLED       = os.getenv("TIMELAPSE_ENABLED", "1") not in ("0", "false", "no")
+TIMELAPSE_SPEED         = float(os.getenv("TIMELAPSE_SPEED", "125"))
+# An intro shorter than this is a blink, not a timelapse, so such recordings are
+# uploaded unmodified. At 125x this floors the source at ~4 minutes.
+TIMELAPSE_MIN_INTRO_S   = float(os.getenv("TIMELAPSE_MIN_INTRO_SECONDS", "2"))
+# Label geometry, both expressed as a fraction of frame height so the overlay
+# scales with CAMERA_VIDEO_SIZE. ~1/24 of 1080p is a 45px cap height — "medium".
+TIMELAPSE_FONT_DIV      = float(os.getenv("TIMELAPSE_FONT_DIV", "24"))
+TIMELAPSE_MARGIN_DIV    = float(os.getenv("TIMELAPSE_MARGIN_DIV", "36"))
+TIMELAPSE_TEXT_RGB      = (0, 0, 0)          # black, per spec
+TIMELAPSE_FONT_CANDIDATES = (
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/Library/Fonts/Arial.ttf",
+)
+# The composed file is a full re-encode of (20s + the whole print), so it uses
+# the hardware encoder by default; libx264 is the fallback if VideoToolbox is
+# unavailable. Bitrate sits above VIDEO_BITRATE because this is a second
+# generation of H.264 over an already-compressed source.
+# Decode only keyframes for the timelapse pass when the file's keyframes are
+# dense enough to fill the intro (measured per recording, never assumed). This is
+# where nearly all the compose time is saved; set to 0 to force full decode.
+TIMELAPSE_KEYFRAME_DECODE = os.getenv("TIMELAPSE_KEYFRAME_DECODE", "1") not in ("0", "false", "no")
+TIMELAPSE_ENCODER       = os.getenv("TIMELAPSE_ENCODER", "h264_videotoolbox")
+TIMELAPSE_BITRATE       = os.getenv("TIMELAPSE_BITRATE", "4000k")
+# Hard ceiling on the compose subprocess. A 90-min 1080p re-encode runs in
+# minutes on VideoToolbox; anything near this is wedged, and a wedged compose
+# must not hold the uploader thread (and therefore the recording) forever.
+TIMELAPSE_TIMEOUT       = float(os.getenv("TIMELAPSE_TIMEOUT", "3600"))
 
 # FTPS (port 21, explicit TLS). The Site5 addon FTP account is FTP-only —
 # SSH/SFTP on :22 is reserved for the main cPanel user, so paramiko can't
@@ -1075,7 +1124,8 @@ def _attempt_upload(youtube, out_path: Path, body: dict, attempt: int) -> tuple[
     Returns (video_id, retryable): video_id is None on failure, and retryable
     says whether an outer retry stands any chance of doing better.
     """
-    media = MediaFileUpload(str(out_path), mimetype="video/quicktime",
+    mime = "video/mp4" if out_path.suffix.lower() == ".mp4" else "video/quicktime"
+    media = MediaFileUpload(str(out_path), mimetype=mime,
                             resumable=True, chunksize=8 * 1024 * 1024)
     request = youtube.videos().insert(
         part="snippet,status",
@@ -2300,6 +2350,253 @@ def _check_gallery_completed(expected_gid: int) -> bool:
     return False
 
 
+# ── TIMELAPSE INTRO COMPOSITION ───────────────────────────────────────────────
+#
+# Turns a finished recording into <the whole thing at TIMELAPSE_SPEED> + <the whole
+# recording at 1x>, with a bottom-right label naming the speed of each half.
+#
+# THREE PASSES, not one filter graph. Each segment is encoded on its own, then
+# the two are joined by the concat DEMUXER with `-c copy` (a remux — seconds):
+#
+#   A  timelapse segment  (setpts + label)  -> seg_tl.mp4
+#   B  real-time segment  (label)           -> seg_rt.mp4
+#   C  concat -c copy A+B                   -> <stem>_tl.mp4
+#
+# The one-graph version (`-i src -i src` + the concat FILTER) works, but every
+# input shares one set of decoder flags, so the timelapse branch is forced to
+# fully decode all ~81k frames of a 45-min print just to keep ~650 of them.
+# Splitting the passes lets A decode KEYFRAMES ONLY (see _keyframe_interval),
+# which is where nearly all the savings are. It also keeps each process to a
+# single input, so there is no cross-branch frame buffering to rely on.
+#
+# A and B must be encoded identically (same encoder, bitrate, size, pixfmt, SAR,
+# frame rate) or the `-c copy` concat in C is invalid — that is why both carry
+# `fps=`, `format=yuv420p` and `setsar=1`.
+
+
+def _probe_video(path: Path) -> tuple[float, int, int, float] | None:
+    """(duration_s, width, height, fps) for a video file, or None if ffprobe
+    can't read it. fps falls back to CAMERA_FRAMERATE."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate:format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, timeout=60, check=True,
+        ).stdout
+        meta = json.loads(out)
+        st = meta["streams"][0]
+        dur = float(meta["format"]["duration"])
+        w, h = int(st["width"]), int(st["height"])
+        num, _, den = st.get("r_frame_rate", "").partition("/")
+        try:
+            fps = float(num) / float(den)
+        except (ValueError, ZeroDivisionError):
+            fps = float(CAMERA_FRAMERATE)
+        if not 1.0 <= fps <= 240.0:
+            fps = float(CAMERA_FRAMERATE)
+        if dur <= 0 or w <= 0 or h <= 0:
+            return None
+        return dur, w, h, fps
+    except Exception as e:
+        log.warning(f"[timelapse] ffprobe failed on {path.name}: {e!r}")
+        return None
+
+
+def _timelapse_font(px: int):
+    for cand in TIMELAPSE_FONT_CANDIDATES:
+        if os.path.exists(cand):
+            try:
+                return ImageFont.truetype(cand, px)
+            except Exception:
+                continue
+    log.warning("[timelapse] no TrueType font found; falling back to PIL default "
+                "(the label will be tiny)")
+    return ImageFont.load_default()
+
+
+def _render_label_png(text: str, frame_h: int, out_path: Path) -> None:
+    """Render `text` to a transparent PNG sized to the glyphs plus a little
+    padding. ffmpeg composites it with `overlay`; see the TIMELAPSE_ENABLED
+    comment for why this isn't drawtext."""
+    px = max(12, int(round(frame_h / TIMELAPSE_FONT_DIV)))
+    font = _timelapse_font(px)
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    l, t, r, b = probe.textbbox((0, 0), text, font=font)
+    pad = max(2, px // 5)
+    img = Image.new("RGBA", (r - l + 2 * pad, b - t + 2 * pad), (0, 0, 0, 0))
+    ImageDraw.Draw(img).text((pad - l, pad - t), text, font=font,
+                             fill=TIMELAPSE_TEXT_RGB + (255,))
+    img.save(out_path)
+
+
+def _keyframe_interval(src: Path, sample_s: float = 120.0) -> float | None:
+    """Mean seconds between keyframes over the first `sample_s` of the file, or
+    None if it can't be determined. `-read_intervals` stops the scan early, so
+    this costs a fraction of a second even on a multi-GB recording.
+
+    This gates keyframe-only decoding of the timelapse pass: recordings come from
+    AVCaptureMovieFileOutput, whose GOP we don't control, so the density has to be
+    MEASURED rather than assumed. Too-sparse keyframes would make the intro repeat
+    frames instead of stepping smoothly through the print."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+             "-read_intervals", f"%+{sample_s:.0f}",
+             "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(src)],
+            capture_output=True, timeout=120, check=True,
+        ).stdout.decode("utf-8", "replace")
+        ts = []
+        for tok in out.split():
+            try:
+                ts.append(float(tok.strip().rstrip(",")))
+            except ValueError:
+                continue
+        if len(ts) < 2:
+            return None
+        return (ts[-1] - ts[0]) / (len(ts) - 1)
+    except Exception as e:
+        log.debug(f"[timelapse] keyframe probe failed on {src.name}: {e!r}")
+        return None
+
+
+def _encoder_args(encoder: str) -> list[str]:
+    args = ["-c:v", encoder, "-b:v", TIMELAPSE_BITRATE]
+    if encoder == "h264_videotoolbox":
+        args += ["-allow_sw", "1", "-realtime", "0", "-profile:v", "high"]
+    else:
+        args += ["-preset", "veryfast", "-pix_fmt", "yuv420p"]
+    return args + ["-tag:v", "avc1"]
+
+
+def _segment_cmd(src: Path, label_png: Path, dst: Path, fps: float, margin: int,
+                 encoder: str, speed: float | None, keyframes_only: bool) -> list[str]:
+    """One encoded segment: the whole source, sped up by `speed` (None = 1x),
+    with `label_png` composited bottom-right."""
+    pos = f"x=W-w-{margin}:y=H-h-{margin}"
+    head = f"[0:v]setpts=PTS/{speed:.6f},fps={fps:.6f}[s];" if speed else f"[0:v]fps={fps:.6f}[s];"
+    fc = head + f"[s][1:v]overlay={pos}:eof_action=repeat,format=yuv420p,setsar=1[v]"
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "warning"]
+    if keyframes_only:
+        # Decoder flag — must precede the input it applies to.
+        cmd += ["-skip_frame", "nokey"]
+    cmd += ["-i", str(src), "-i", str(label_png),
+            "-filter_complex", fc,
+            "-map", "[v]", "-an"]        # video-only, always — never broadcast audio
+    return cmd + _encoder_args(encoder) + [str(dst)]
+
+
+def _run_ffmpeg(cmd: list[str], what: str) -> bool:
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=TIMELAPSE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.error(f"[timelapse] {what} timed out after {TIMELAPSE_TIMEOUT:.0f}s")
+        return False
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip()[-500:]
+        log.error(f"[timelapse] {what} rc={proc.returncode}: {tail}")
+        return False
+    log.info(f"[timelapse] {what} ok in {time.monotonic() - t0:.0f}s")
+    return True
+
+
+def compose_with_timelapse(src: Path) -> Path | None:
+    """Build "<timelapse intro> + <full recording>" next to `src` and return the
+    new path, or None to upload `src` unchanged (disabled, too short, or the
+    compose failed). Never raises and never touches `src` — a failure here must
+    cost the label, not the recording."""
+    if not TIMELAPSE_ENABLED:
+        return None
+    info = _probe_video(src)
+    if not info:
+        return None
+    dur, w, h, fps = info
+    mult = round(TIMELAPSE_SPEED, 1)
+    intro = dur / mult
+    if mult <= 1.0 or intro < TIMELAPSE_MIN_INTRO_S:
+        log.info(f"[timelapse] {src.name} is only {dur:.0f}s — a {intro:.1f}s intro "
+                 f"at {mult:g}x; uploading as-is")
+        return None
+
+    # Trailing ".0" is noise on the common whole-number rate, but a fractional
+    # TIMELAPSE_SPEED override still shows its tenth.
+    tl_text = f"Timelapse ({mult:g}x speed)"
+    rt_text = "Real-time (1x speed)"
+    dst = src.with_name(f"{src.stem}_tl.mp4")
+    margin = max(8, int(round(h / TIMELAPSE_MARGIN_DIV)))
+
+    # The intro samples one source frame every `mult/fps` seconds. Keyframe-only
+    # decoding can supply that ONLY if keyframes are at least that dense; with a
+    # 2x margin it degrades to full decode rather than a stuttering intro.
+    need_every = mult / fps
+    kf = _keyframe_interval(src) if TIMELAPSE_KEYFRAME_DECODE else None
+    keyframes_only = kf is not None and kf <= need_every / 2.0
+    if TIMELAPSE_KEYFRAME_DECODE:
+        log.info(f"[timelapse] keyframes every {kf if kf is None else round(kf, 2)}s, "
+                 f"intro needs one frame per {need_every:.2f}s -> "
+                 f"{'keyframe-only' if keyframes_only else 'full'} decode")
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="par_tl_"))
+    try:
+        tl_png, rt_png = tmpdir / "tl.png", tmpdir / "rt.png"
+        _render_label_png(tl_text, h, tl_png)
+        _render_label_png(rt_text, h, rt_png)
+        seg_tl, seg_rt = tmpdir / "seg_tl.mp4", tmpdir / "seg_rt.mp4"
+
+        encoders = [TIMELAPSE_ENCODER]
+        if TIMELAPSE_ENCODER != "libx264":
+            encoders.append("libx264")   # VideoToolbox can be unavailable/busy
+        for enc in encoders:
+            log.info(f"[timelapse] {src.name}: {dur:.0f}s source -> "
+                     f"{intro:.1f}s intro at {mult:g}x [{enc}]")
+            t0 = time.monotonic()
+            ok = _run_ffmpeg(
+                _segment_cmd(src, tl_png, seg_tl, fps, margin, enc, mult, keyframes_only),
+                f"pass A (timelapse, {intro:.1f}s)")
+            if ok:
+                ok = _run_ffmpeg(
+                    _segment_cmd(src, rt_png, seg_rt, fps, margin, enc, None, False),
+                    f"pass B (real-time, {dur:.0f}s)")
+            if ok:
+                # The concat demuxer needs a list file; both segments came out of
+                # the same encoder with the same settings, so -c copy is valid.
+                listing = tmpdir / "segments.txt"
+                listing.write_text("".join(
+                    f"file '{seg}'\n" for seg in (seg_tl, seg_rt)))
+                ok = _run_ffmpeg(
+                    ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "warning",
+                     "-f", "concat", "-safe", "0", "-i", str(listing),
+                     "-c", "copy", "-movflags", "+faststart", str(dst)],
+                    "pass C (concat)")
+            if ok and dst.exists() and dst.stat().st_size > 0:
+                log.info(f"[timelapse] composed {dst.name} ({dst.stat().st_size} bytes) "
+                         f"in {time.monotonic() - t0:.0f}s total")
+                return dst
+            dst.unlink(missing_ok=True)
+            seg_tl.unlink(missing_ok=True)
+            seg_rt.unlink(missing_ok=True)
+        log.error(f"[timelapse] giving up on {src.name}; uploading it unmodified")
+        return None
+    except Exception as e:
+        log.error(f"[timelapse] compose raised: {e!r}")
+        dst.unlink(missing_ok=True)
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _drop_composed(composed: Path | None) -> None:
+    """Remove the transient timelapse composite. The raw .mov is the recovery
+    artifact backfill knows how to find, so the composite is never what we keep."""
+    if composed is None:
+        return
+    try:
+        composed.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning(f"[timelapse] could not remove {composed}: {e}")
+
+
 def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> None:
     """Background uploader. Builds the title (no timestamp), uploads, posts
     the resulting video_id back to the gallery, and unlinks on success."""
@@ -2308,11 +2605,20 @@ def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> N
         return
     clean = (name or "").strip() or "Untitled"
     title = f'"{clean}" printing - P.A.R.'
-    log.info(f"[upload] starting: {title!r} ({out_path.stat().st_size} bytes)")
-    video_id = upload_recording(youtube, out_path, title)
+    # Prepend the timelapse intro. What gets uploaded is the composed file when
+    # compose succeeds and the raw .mov otherwise — compose failure costs the
+    # intro, never the print. `out_path` stays untouched throughout, so it
+    # remains the recovery artifact for ./run_backfill.sh in every failure path;
+    # the composed file is transient and is dropped on every exit below.
+    composed = compose_with_timelapse(out_path)
+    upload_path = composed or out_path
+    log.info(f"[upload] starting: {title!r} ({upload_path.stat().st_size} bytes)")
+    video_id = upload_recording(youtube, upload_path, title)
     if not video_id:
+        _drop_composed(composed)
         log.warning(f"[upload] failed for #{gallery_id}; leaving {out_path} on disk")
         return
+    _drop_composed(composed)
     try:
         attached = _post_video_id(gallery_id, video_id)
     except Exception as e:
