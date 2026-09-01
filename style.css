@@ -1573,6 +1573,14 @@ body.modal-open {
     overscroll-behavior: contain;
 }
 
+/* Flex children shrink to fit their container by default, so the bitmap, the
+   photo and the 16/9 recording box were being vertically crushed to squeeze
+   inside max-height instead of overflowing. Pin them to their natural size and
+   let .gallery-modal-scroll scroll. */
+.gallery-modal-scroll > * {
+    flex-shrink: 0;
+}
+
 .gallery-modal-name {
     font-size: 1.1rem;
     font-weight: 600;
@@ -1635,6 +1643,8 @@ body.modal-open {
 .gallery-modal-video {
     width: 100%;
     aspect-ratio: 16 / 9;
+    /* Belt-and-braces against the flex crush; see .gallery-modal-scroll > *. */
+    flex-shrink: 0;
     margin-top: 0.75rem;
     border: 1px solid #333333;
     border-radius: 4px;
@@ -1812,4 +1822,24 @@ body.modal-open {
         padding-top: 1rem;
         padding-bottom: 1rem;
     }
+}
+
+/* Global site footer (Privacy / Terms) — matches the legal pages */
+.site-footer {
+    border-top: 1px solid #2a2a2a;
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 1.5rem;
+    color: #888888;
+    font-size: 0.85rem;
+    text-align: center;
+}
+
+.site-footer a {
+    color: #888888;
+    text-decoration: none;
+}
+
+.site-footer a:hover {
+    color: #02b2d9;
 }
