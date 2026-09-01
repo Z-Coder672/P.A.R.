@@ -1949,8 +1949,12 @@ def check_artist(artist: str) -> dict:
     """
     artist = (artist or "").strip()
     if not artist:
-        return {"verdict": "approve", "confidence": 1.0,
-                "flags": [], "reasoning": "no artist name given"}
+        # model_called=False marks this as OUR verdict, not the model's, so the
+        # moderator email can say so — the fields are otherwise indistinguishable
+        # from a real judgement and read as though Claude wrote the reasoning.
+        return {"verdict": "approve", "confidence": 1.0, "flags": [],
+                "reasoning": "no artist name given — field is optional, nothing to review",
+                "model_called": False}
 
     user_prompt = (
         f"Moderate this artist name for a pixel art community site: {artist}\n\n"
@@ -1971,12 +1975,27 @@ def _render_result(label: str, result: dict | Exception) -> str:
     conf    = result.get("confidence", "?")
     flags   = ", ".join(result.get("flags", []) or []) or "—"
     reason  = result.get("reasoning", "")
+    if result.get("model_called") is False:
+        # A verdict the daemon produced itself. Same fields as a real one, so
+        # without this banner the hardcoded reasoning reads as a model judgement.
+        return (
+            f"<h3>{label} <span style='font-weight:normal;color:#8a6d00'>"
+            f"— not checked</span></h3>"
+            f"<p style='background:#fffbe6;border-left:3px solid #e0b400;"
+            f"padding:8px 12px;margin:6px 0'>"
+            f"<strong>Skipped automatically — no Claude call was made.</strong><br>"
+            f"This verdict and reasoning were generated programmatically, "
+            f"not by the model.</p>"
+            f"<p><strong>Reason:</strong> {reason}</p>"
+            f"<p><strong>Verdict:</strong> {verdict} "
+            f"(<strong>confidence:</strong> {conf}) — automatic, not a model judgement</p>"
+        )
     return (
         f"<h3>{label}</h3>"
         f"<p><strong>Verdict:</strong> {verdict} "
         f"(<strong>confidence:</strong> {conf})</p>"
         f"<p><strong>Flags:</strong> {flags}</p>"
-        f"<p><strong>Reasoning:</strong> {reason}</p>"
+        f"<p><strong>Model reasoning:</strong> {reason}</p>"
     )
 
 
