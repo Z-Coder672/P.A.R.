@@ -41,7 +41,7 @@ import base64
 import io
 import concurrent.futures
 import anyio
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -238,6 +238,34 @@ TIMELAPSE_BITRATE       = os.getenv("TIMELAPSE_BITRATE", "4000k")
 # minutes on VideoToolbox; anything near this is wedged, and a wedged compose
 # must not hold the uploader thread (and therefore the recording) forever.
 TIMELAPSE_TIMEOUT       = float(os.getenv("TIMELAPSE_TIMEOUT", "3600"))
+
+# ── THUMBNAIL ─────────────────────────────────────────────────────────────────
+#
+# Every upload gets a custom thumbnail: the print's real snapshot photo (the
+# same frame the snapshot poller ships to gallery/<id>/image.jpg) with a large
+# yellow "Watch it print!" across the bottom. The TEXT is sized to span the full
+# thumbnail width minus an equal margin on each side — the font is fitted to
+# that width, so the phrase always fills the bottom edge-to-edge.
+#
+# The API side is thumbnails.set on the UPLOAD token (the `youtube` scope covers
+# it), which requires "custom thumbnails" to be enabled on the upload channel
+# (phone verification). Without it every set 403s — logged, never fatal: this is
+# a best-effort nicety like the playlist step and must never cost an upload.
+THUMBNAIL_ENABLED    = os.getenv("THUMBNAIL_ENABLED", "1") not in ("0", "false", "no")
+THUMBNAIL_TEXT       = os.getenv("THUMBNAIL_TEXT", "Watch it print!")
+# Per-side margin as a fraction of thumbnail width (width/DIV each side). The
+# text is scaled to exactly fill the remaining width, so a larger DIV means
+# larger text. 16 → 80px margins on a 1280-wide thumbnail.
+THUMBNAIL_MARGIN_DIV = float(os.getenv("THUMBNAIL_MARGIN_DIV", "16"))
+THUMBNAIL_TEXT_RGB   = (255, 221, 0)      # yellow, with a black stroke for contrast
+THUMBNAIL_W, THUMBNAIL_H = 1280, 720      # YT-recommended size; JPEG must stay <2MB
+THUMBNAIL_MAX_ATTEMPTS = int(os.getenv("THUMBNAIL_MAX_ATTEMPTS", "3"))
+# Retained per-print snapshot copies for thumbnail use. upload_snapshot unlinks
+# its input on success and the video upload runs minutes later on the uploader
+# thread, so the snapshot poller parks a copy here keyed by gallery id. If the
+# copy is gone (daemon restart, backfill days later) the site's own
+# gallery/<id>/image.jpg is fetched as the fallback source.
+THUMBNAIL_SRC_DIR    = SNAPSHOT_LOCAL_DIR / "thumb-src"
 
 # FTPS (port 21, explicit TLS). The Site5 addon FTP account is FTP-only —
 # SSH/SFTP on :22 is reserved for the main cPanel user, so paramiko can't
@@ -1647,20 +1675,26 @@ def poll_snapshot_queue():
                     target = f"gallery/{gallery_id}" if gallery_id is not None else "gallery root"
                     log.info(f"[snapshot] Request received (queued at {data['entry']}, target {target}), grabbing frame...")
                     snap = grab_snapshot()
-                    if snap:
-                        upload_snapshot(snap, gallery_id)
-
-                    # Tie this snapshot to the in-flight recording (if any) so it
-                    # doubles as the "print done → stop recording" signal. A
-                    # snapshot popped with id=null is the Arduino's post-display
-                    # touch (its body id is dropped by snapshot-request.php), so
-                    # fall back to the recording's own id. Signal after the grab
-                    # (the live-frame sidecar copy already happened) and
-                    # regardless of upload success, so a failed snapshot upload
-                    # doesn't strand the recording at the cap.
+                    # A snapshot popped with id=null is the Arduino's
+                    # post-display touch (its body id is dropped by
+                    # snapshot-request.php), so fall back to the in-flight
+                    # recording's own id — used both for the stop signal below
+                    # and to key the retained thumbnail copy.
                     with _inflight_lock:
                         inflight_id = _inflight_id
                     effective_id = gallery_id if gallery_id is not None else inflight_id
+                    if snap:
+                        # Park a copy first — upload_snapshot unlinks the file
+                        # on success, and the uploader thread builds this
+                        # print's YouTube thumbnail from it minutes from now.
+                        _retain_thumb_source(snap, effective_id)
+                        upload_snapshot(snap, gallery_id)
+
+                    # Tie this snapshot to the in-flight recording (if any) so it
+                    # doubles as the "print done → stop recording" signal. Signal
+                    # after the grab (the live-frame sidecar copy already
+                    # happened) and regardless of upload success, so a failed
+                    # snapshot upload doesn't strand the recording at the cap.
                     if effective_id is not None:
                         global _snapshot_stop_id, _snapshot_stop_ts
                         with _snapshot_stop_lock:
@@ -2634,6 +2668,186 @@ def _drop_composed(composed: Path | None) -> None:
         log.warning(f"[timelapse] could not remove {composed}: {e}")
 
 
+# ── THUMBNAIL ─────────────────────────────────────────────────────────────────
+#
+# Snapshot photo + yellow "Watch it print!" across the bottom. See the
+# THUMBNAIL_ENABLED comment block for the how/why; everything here is
+# best-effort and never raises into the uploader.
+
+def _thumb_src_path(gallery_id: int) -> Path:
+    return THUMBNAIL_SRC_DIR / f"{gallery_id}.jpg"
+
+
+def _retain_thumb_source(snap: Path, gallery_id: int | None) -> None:
+    """Park a copy of a just-grabbed snapshot for the uploader thread's
+    thumbnail build (upload_snapshot unlinks the original on success)."""
+    if not THUMBNAIL_ENABLED or gallery_id is None:
+        return
+    try:
+        THUMBNAIL_SRC_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(snap, _thumb_src_path(gallery_id))
+        # Opportunistic sweep of copies nothing ever consumed (upload failed and
+        # a later backfill used the site fallback instead). A week is far past
+        # any plausible retry window.
+        cutoff = time.time() - 7 * 86400
+        for stale in THUMBNAIL_SRC_DIR.glob("*.jpg"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception as e:
+        log.warning(f"[thumbnail] could not retain snapshot for #{gallery_id}: {e}")
+
+
+def _fetch_gallery_image(gallery_id: int, dst: Path) -> bool:
+    """Fallback thumbnail source: the snapshot the poller already uploaded to
+    the site. By thumbnail time (post video upload, minutes after display-done)
+    it is normally long since in place."""
+    url = f"{SITE_BASE_URL}/gallery/{gallery_id}/image.jpg"
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "P.A.R./1.0"})
+        if resp.status_code != 200 or not resp.content:
+            log.warning(f"[thumbnail] fetch {url} -> {resp.status_code}")
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(resp.content)
+        with Image.open(dst) as im:
+            im.load()  # force decode; raises on a non-image (e.g. an HTML error page)
+        return True
+    except Exception as e:
+        log.warning(f"[thumbnail] fetch {url} failed: {e!r}")
+        dst.unlink(missing_ok=True)
+        return False
+
+
+def _render_banner_layer(text: str, px: int) -> Image.Image:
+    """`text` (yellow, black stroke) rendered to an RGBA layer cropped to its
+    EXACT ink bounds. textbbox over-reports the trailing edge by the last
+    glyph's bearing (~15px at banner sizes), which would visibly unbalance the
+    side margins — so sizing and centering both use the real rendered pixels."""
+    font = _timelapse_font(px)
+    stroke = max(2, round(px / 20))
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    l, t, r, b = probe.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    pad = 2 * stroke + 4
+    layer = Image.new("RGBA", ((r - l) + 2 * pad, (b - t) + 2 * pad), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((pad - l, pad - t), text, font=font,
+                               fill=THUMBNAIL_TEXT_RGB + (255,),
+                               stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+    return layer.crop(layer.getbbox())
+
+
+def _fit_banner(text: str, target_w: int) -> Image.Image:
+    """Banner layer at the largest font size whose ink is no wider than
+    `target_w` — the whole bottom and no more. Font metrics aren't linear in px,
+    hence proportional passes plus a final step to the exact boundary."""
+    px = 100
+    layer = _render_banner_layer(text, px)
+    for _ in range(3):
+        if layer.width <= 0:
+            break
+        px = max(12, round(px * target_w / layer.width))
+        layer = _render_banner_layer(text, px)
+    while layer.width > target_w and px > 12:
+        px -= 1
+        layer = _render_banner_layer(text, px)
+    while layer.width < target_w:
+        bigger = _render_banner_layer(text, px + 1)
+        if bigger.width > target_w:
+            break
+        px += 1
+        layer = bigger
+    return layer
+
+
+def _build_thumbnail(src: Path, dst: Path) -> bool:
+    """1280x720 JPEG: the snapshot photo with THUMBNAIL_TEXT in yellow along the
+    bottom, fitted to the full width minus equal side margins."""
+    try:
+        with Image.open(src) as im:
+            img = ImageOps.fit(im.convert("RGB"), (THUMBNAIL_W, THUMBNAIL_H),
+                               Image.LANCZOS)
+        margin = round(THUMBNAIL_W / THUMBNAIL_MARGIN_DIV)
+        banner = _fit_banner(THUMBNAIL_TEXT, THUMBNAIL_W - 2 * margin)
+        # Ink-exact layer, so centering lands both side margins at `margin` and
+        # the glyph bottoms one margin above the frame bottom.
+        img.paste(banner, ((THUMBNAIL_W - banner.width) // 2,
+                           THUMBNAIL_H - margin - banner.height), banner)
+        img.save(dst, "JPEG", quality=90)
+        if dst.stat().st_size > 2_000_000:  # API hard limit is 2MB
+            img.save(dst, "JPEG", quality=75)
+        return True
+    except Exception as e:
+        log.error(f"[thumbnail] build from {src.name} failed: {e!r}")
+        return False
+
+
+def set_video_thumbnail(youtube, video_id: str, gallery_id: int | None) -> bool:
+    """Best-effort custom thumbnail on a freshly-uploaded video. Never raises —
+    a thumbnail failure must never cost the upload, the gallery attach, or the
+    playlist step."""
+    if not THUMBNAIL_ENABLED or gallery_id is None:
+        return False
+    src = _thumb_src_path(gallery_id)
+    fetched = THUMBNAIL_SRC_DIR / f"{gallery_id}.fetched.jpg"
+    thumb = THUMBNAIL_SRC_DIR / f"{gallery_id}.thumb.jpg"
+    try:
+        if not src.exists():
+            if not _fetch_gallery_image(gallery_id, fetched):
+                log.warning(f"[thumbnail] #{gallery_id}: no snapshot source "
+                            f"(no retained copy, site fetch failed); skipping")
+                return False
+            src = fetched
+        if not _build_thumbnail(src, thumb):
+            return False
+        for attempt in range(1, THUMBNAIL_MAX_ATTEMPTS + 1):
+            try:
+                youtube.thumbnails().set(
+                    videoId=video_id,
+                    media_body=MediaFileUpload(str(thumb), mimetype="image/jpeg"),
+                ).execute()
+                log.info(f"[thumbnail] set on {video_id} (#{gallery_id})")
+                return True
+            except RefreshError as e:
+                _YT_AUTH_DEAD.set()
+                log.error(f"[thumbnail] AUTH DEAD setting {video_id}: {e!r}")
+                return False
+            except HttpError as e:
+                status = _http_error_status(e)
+                if status == 403:
+                    log.error(
+                        f"[thumbnail] 403 setting {video_id}: {e} — likely "
+                        f"'custom thumbnails' not enabled on the upload channel "
+                        f"(needs phone verification in YouTube Studio)")
+                    return False
+                if status in _RETRYABLE_HTTP_STATUS and attempt < THUMBNAIL_MAX_ATTEMPTS:
+                    log.warning(f"[thumbnail] HttpError {status} on {video_id}; retrying")
+                    time.sleep(5 * attempt)
+                    continue
+                log.error(f"[thumbnail] HttpError {status} setting {video_id}: {e}")
+                return False
+            except _RETRYABLE_TRANSPORT_EXC as e:
+                if attempt < THUMBNAIL_MAX_ATTEMPTS:
+                    log.warning(f"[thumbnail] transport error on {video_id}: {e!r}; retrying")
+                    time.sleep(5 * attempt)
+                    continue
+                log.error(f"[thumbnail] transport error setting {video_id}: {e!r}")
+                return False
+        return False
+    except Exception as e:
+        log.error(f"[thumbnail] unexpected failure on {video_id}: {e!r}")
+        return False
+    finally:
+        # All three are transient derivatives of the snapshot already on the
+        # site; nothing retries a failed thumbnail, so nothing needs them kept.
+        for p in (thumb, fetched, _thumb_src_path(gallery_id)):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> None:
     """Background uploader. Builds the title (no timestamp), uploads, posts
     the resulting video_id back to the gallery, and unlinks on success."""
@@ -2661,10 +2875,13 @@ def _upload_and_attach(youtube, out_path: Path, gallery_id: int, name: str) -> N
     except Exception as e:
         log.error(f"[upload] video_id POST raised: {e!r}")
         attached = False
-    # Best-effort, and deliberately AFTER the gallery attachment: the site
-    # embed is what the print is for, the playlist is a nicety. `youtube` is
-    # passed only as the single-channel fallback (see _get_playlist_client) —
-    # the playlist normally has its own token for its own channel.
+    # Best-effort niceties, deliberately AFTER the gallery attachment: the site
+    # embed is what the print is for. Thumbnail first (it's what viewers see in
+    # the feed), then the playlist filing. `youtube` is the upload-channel
+    # client — exactly the one thumbnails.set must be authorised as; for the
+    # playlist it is passed only as the single-channel fallback (see
+    # _get_playlist_client), which normally has its own token for its own channel.
+    set_video_thumbnail(youtube, video_id, gallery_id)
     attach_to_playlist(video_id, gallery_id, upload_client=youtube)
 
     if not attached:
