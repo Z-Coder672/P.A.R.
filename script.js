@@ -127,6 +127,7 @@ let latestVideoPlayer = null;
 let latestVideoToken = 0;
 let galleryModalPlayer = null;
 let galleryModalToken = 0;
+let galleryModalAutoplayObserver = null;
 
 function loadYouTubeIframeApi() {
     if (window.YT && window.YT.Player) return Promise.resolve();
@@ -147,14 +148,15 @@ function loadYouTubeIframeApi() {
 }
 
 // Mount a player on `mountEl` (the API replaces it with an iframe) that seeks to
-// ~10s before the end as soon as the duration is known. getDuration() only
+// ~10s before the end as soon as the duration is known (`nearEnd: false` plays
+// from the start instead). getDuration() only
 // returns a real value once playback metadata loads (≈ first PLAYING), so we try
 // on both onReady and the first PLAYING. Returns the YT.Player synchronously —
 // loadYouTubeIframeApi() must have resolved first.
-function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError } = {}) {
+function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError, onReady, nearEnd = true } = {}) {
     let seeked = false;
     const seekNearEnd = (p) => {
-        if (seeked) return;
+        if (seeked || !nearEnd) return;
         const dur = p.getDuration();
         if (dur && dur > NEAR_END_SECONDS) {
             p.seekTo(dur - NEAR_END_SECONDS, true);
@@ -175,6 +177,7 @@ function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError } = {
             onReady: (e) => {
                 seekNearEnd(e.target);
                 if (autoplay) e.target.playVideo();
+                if (typeof onReady === 'function') onReady(e.target);
             },
             onStateChange: (e) => {
                 if (e.data === YT.PlayerState.PLAYING) seekNearEnd(e.target);
@@ -611,6 +614,10 @@ function openGalleryModal(item) {
 // in-flight maybeEmbedRecording (still awaiting the API) bails on resume.
 function resetGalleryModalVideo() {
     galleryModalToken++;
+    if (galleryModalAutoplayObserver) {
+        galleryModalAutoplayObserver.disconnect();
+        galleryModalAutoplayObserver = null;
+    }
     if (galleryModalPlayer) {
         try { galleryModalPlayer.destroy(); } catch (e) {}
         galleryModalPlayer = null;
@@ -631,14 +638,68 @@ async function maybeEmbedRecording(videoId, container) {
     const mount = document.createElement('div');
     container.appendChild(mount);
     container.classList.remove('hidden');
+    let ready = false;
+    let wantsPlay = false;
+    const play = (p) => {
+        // Muted is the only autoplay browsers reliably allow; the recordings are
+        // silent anyway.
+        try { p.mute(); p.playVideo(); } catch (e) {}
+    };
     galleryModalPlayer = createNearEndPlayer(mount, videoId, {
         autoplay: false,
+        // The modal autoplays, so it plays the print through from the top; the
+        // Latest tab still opens on the finished board.
+        nearEnd: false,
+        onReady: (p) => {
+            if (token !== galleryModalToken) return;
+            ready = true;
+            if (wantsPlay) play(p);
+        },
         onError: () => {
             // Deleted / not embeddable — hide the video area entirely.
             if (token !== galleryModalToken) return;
             resetGalleryModalVideo();
         },
     });
+
+    // Start playback once the embed is fully in view — immediately if it already
+    // is when the modal opens. Fires once, then the observer is dropped so a
+    // user pause isn't undone by scrolling away and back.
+    startWhenFullyVisible(container, () => {
+        if (token !== galleryModalToken || !galleryModalPlayer) return;
+        if (ready) play(galleryModalPlayer);
+        else wantsPlay = true;
+    });
+}
+
+// Invoke `onVisible` once `el` is fully within the viewport. An embed taller
+// than the viewport can never reach ratio 1, so anything that fills the visible
+// area counts as fully in view. No IntersectionObserver -> play right away.
+function startWhenFullyVisible(el, onVisible) {
+    if (galleryModalAutoplayObserver) {
+        galleryModalAutoplayObserver.disconnect();
+        galleryModalAutoplayObserver = null;
+    }
+    if (!('IntersectionObserver' in window)) {
+        onVisible();
+        return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            const h = entry.boundingClientRect.height;
+            const viewportH = window.innerHeight || document.documentElement.clientHeight;
+            const full = entry.intersectionRatio >= 0.99 ||
+                (h > viewportH && entry.intersectionRect.height >= viewportH - 1);
+            if (entry.isIntersecting && full) {
+                observer.disconnect();
+                if (galleryModalAutoplayObserver === observer) galleryModalAutoplayObserver = null;
+                onVisible();
+                return;
+            }
+        }
+    }, { threshold: [0, 0.5, 0.9, 0.99, 1] });
+    galleryModalAutoplayObserver = observer;
+    observer.observe(el);
 }
 
 function closeGalleryModal() {
