@@ -245,6 +245,12 @@ def main() -> int:
                 log.warning(f"[backfill] #{gid} failed; leaving {path} on disk")
                 failed += 1
                 continue
+            # Same best-effort thumbnail the daemon sets on a first-time upload
+            # (snapshot photo + "Watch it print!" banner). The site's
+            # gallery/<id>/image.jpg fallback makes this work long after any
+            # local snapshot copy is gone. Skipped on the prior_id path — the
+            # daemon already attempted it when it uploaded.
+            ys.set_video_thumbnail(youtube, video_id, gid)
 
         if not ys._post_video_id(gid, video_id):
             # Keep the recording AND the sidecar so the next run retries the
