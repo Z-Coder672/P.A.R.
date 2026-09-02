@@ -138,7 +138,7 @@ def run_consent(prompt_line: str):
     """
     client_config = ys._load_client_secrets()
     flow = InstalledAppFlow.from_client_config(client_config, ys.YT_SCOPES)
-    return flow.run_local_server(
+    creds = flow.run_local_server(
         port=0,
         access_type="offline",
         prompt="consent",
@@ -148,6 +148,41 @@ def run_consent(prompt_line: str):
             f">>> If the browser didn't open, use this URL:\n\n{{url}}\n"
         ),
     )
+    # Credentials.to_json() does NOT carry refresh_token_expires_in, so the only
+    # place the grant's lifetime is ever visible is the raw token response —
+    # grab it here or lose it. Returned as a dict; only the lifetime field is
+    # ever logged (see report_grant_lifetime), never the token values.
+    raw = {}
+    try:
+        session = getattr(flow, "oauth2session", None)
+        raw = dict(getattr(session, "token", None) or {})
+    except Exception as e:
+        log.warning(f"[setup] could not read the raw token response: {e!r}")
+    return creds, raw
+
+
+def report_grant_lifetime(raw: dict, label: str) -> None:
+    """Say out loud whether this grant carries the Testing-status 7-day clock.
+
+    Google returns refresh_token_expires_in ONLY while the app's publishing
+    status is Testing (external). Once the app is published the field is absent
+    and the refresh token has no fixed expiry. This is the difference stated by
+    the server at issuance, which beats inferring it from a post-mortem a week
+    later.
+    """
+    exp = raw.get("refresh_token_expires_in")
+    if exp is None:
+        log.info(f"[setup] {label}: no refresh_token_expires_in in the token "
+                 f"response — this grant has NO fixed expiry (published app)")
+        return
+    try:
+        days = float(exp) / 86400.0
+    except (TypeError, ValueError):
+        log.warning(f"[setup] {label}: refresh_token_expires_in={exp!r} (unparseable)")
+        return
+    log.warning(f"[setup] {label}: refresh_token_expires_in={exp}s ({days:.2f} days) "
+                f"— the Testing-status clock STILL APPLIES; the app is not "
+                f"published, or this consent predates the publish")
 
 
 def do_token(kind: str, step: str, expect_handle: str | None, playlist_id: str) -> bool:
@@ -189,7 +224,8 @@ def do_token(kind: str, step: str, expect_handle: str | None, playlist_id: str) 
         log.info(f"[setup] skipped {kind} token")
         return False
 
-    creds = run_consent(prompt_line)
+    creds, raw_token = run_consent(prompt_line)
+    report_grant_lifetime(raw_token, f"{kind} token")
     youtube = build("youtube", "v3", credentials=creds)
 
     try:
