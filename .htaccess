@@ -3,7 +3,7 @@
 # are never fetched by a browser and can be fully denied. Emails live encrypted
 # ABOVE the document root (see lib/private_store.php); these rules are a second
 # line of defense in case a file ever lands inside the served tree.
-<FilesMatch "(^\.env$|^\.DS_Store$|^router\.php$|\.log$|\.flag$|\.enc$|^email\.key$|^queue\.txt$|^mod_queue\.txt$|^latest-video\.json$|^(pending|info)\.json$)">
+<FilesMatch "(^\.env$|^\.DS_Store$|^router\.php$|\.log$|\.flag$|\.enc$|^email\.key$|^queue\.txt$|^mod_queue\.txt$|^qr-visits\.txt$|^latest-video\.json$|^(pending|info)\.json$)">
     Require all denied
 </FilesMatch>
 
@@ -14,6 +14,14 @@
     RewriteRule ^locks(/|$)       - [F,L]
     RewriteRule ^lib(/|$)         - [F,L]
     RewriteRule ^par-private(/|$) - [F,L]
+
+    # QR-code visits carry ?q=1 — count them, then serve the SPA. Only fire on
+    # the SPA routes (not existing files/endpoints) so a stray ?q=1 on an asset
+    # or PHP endpoint is ignored.
+    RewriteCond %{QUERY_STRING} (^|&)q=1(&|$)
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ qr-count.php [L]
 
     # If the requested URI is exactly /gallery or /gallery/, route to SPA
     RewriteRule ^gallery/?$ index.html [L]

@@ -12,7 +12,13 @@ if (php_sapi_name() === 'cli-server') {
     if (file_exists(__DIR__ . $requested) && is_file(__DIR__ . $requested)) {
         return false;
     }
-    
+
+    // QR-code visits carry ?q=1 — count them, then serve the SPA.
+    if (isset($_GET['q']) && $_GET['q'] === '1') {
+        require __DIR__ . '/qr-count.php';
+        exit;
+    }
+
     // Everything else → index.html for client-side routing
     require __DIR__ . '/index.html';
 }
