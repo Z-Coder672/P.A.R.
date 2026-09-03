@@ -51,6 +51,7 @@ if (isset($_GET['stats'])) {
 // --- Increment (atomic, fail-open) -----------------------------------------
 // Never let a counter problem block the page: any FS error just skips the
 // bump and still serves the site.
+$counted = false;
 $fh = @fopen($counterFile, 'c+');
 if ($fh !== false) {
     if (flock($fh, LOCK_EX)) {
@@ -61,9 +62,13 @@ if ($fh !== false) {
         fwrite($fh, (string) $count);
         fflush($fh);
         flock($fh, LOCK_UN);
+        $counted = true;
     }
     fclose($fh);
 }
+// Boolean-only diagnostic (never the number): confirms the route fired and the
+// file was writable, without leaking the count.
+header('X-QR-Counted: ' . ($counted ? '1' : '0'));
 
 // --- Serve the normal single-page app --------------------------------------
 require __DIR__ . '/index.html';
