@@ -2111,7 +2111,7 @@ int displayBitmap(uint8_t* bitmap) {
 //   * a daily VL53L4CD standoff scan of all 666 cells at 10:00 local, whose
 //     results + completion date are written to flash so a reboot doesn't
 //     re-run (or skip) it,
-//   * a night sleep from 20:00 to 10:00 during which the rig ingests nothing.
+//   * a night sleep from 20:30 to 10:00 during which the rig ingests nothing.
 //
 // The board is assumed to be powered 24/7, so this is a *schedule*, not a
 // power-management feature — nothing here uses deep sleep. Deep sleep would
@@ -2140,7 +2140,8 @@ const time_t TIME_VALID_FLOOR = 1735689600;
 // sleep covers [NIGHT_START_HOUR, LIDAR_SCAN_HOUR), so waking always lands on
 // the scan check.
 const int LIDAR_SCAN_HOUR  = 10;   // 10:00 am
-const int NIGHT_START_HOUR = 20;   // 8:00 pm
+const int NIGHT_START_HOUR = 20;   // 8:30 pm
+const int NIGHT_START_MIN  = 30;
 // A scan still owed for today is only STARTED before this hour. The sweep runs
 // ~50 min, and a late boot shouldn't spend the evening scanning and then print
 // into the night — at/after 18:00 the rig sleeps to 10:00 and scans then.
@@ -2212,10 +2213,12 @@ bool timeWaitForSync(unsigned long timeout_ms) {
   return false;
 }
 
-// 20:00 .. 09:59 local. Written as one predicate so the post-print check and
+// 20:30 .. 09:59 local. Written as one predicate so the post-print check and
 // the boot-time check can never disagree about where the night boundary is.
-static inline bool isNightHour(int hour) {
-  return hour >= NIGHT_START_HOUR || hour < LIDAR_SCAN_HOUR;
+static inline bool isNightHour(int hour, int minute) {
+  bool afterStart = hour > NIGHT_START_HOUR ||
+                    (hour == NIGHT_START_HOUR && minute >= NIGHT_START_MIN);
+  return afterStart || hour < LIDAR_SCAN_HOUR;
 }
 
 // ---------------------------------------------------------------- lidar scan
@@ -2736,7 +2739,7 @@ bool cadenceGate() {
   // sleepUntilMorning() — e.g. the 17 h backstop firing after SNTP stepped the
   // clock backwards — lands straight back in sleep instead of falling through
   // to a scan and a poll at 04:00.
-  while (isNightHour(t.tm_hour) ||
+  while (isNightHour(t.tm_hour, t.tm_min) ||
          (!lidarScanDoneOn(t) && t.tm_hour >= LIDAR_SCAN_CUTOFF_HOUR)) {
     sleepUntilMorning();
     if (!localNow(t)) return false;         // woke with no trusted clock: hold parked
@@ -2749,7 +2752,7 @@ bool cadenceGate() {
     // The sweep runs ~50 min (review F4): re-verify before letting the caller
     // poll — a mid-scan SNTP step could have landed us inside the night
     // window. Returning false re-enters this gate, which then sleeps.
-    if (!localNow(t) || isNightHour(t.tm_hour)) return false;
+    if (!localNow(t) || isNightHour(t.tm_hour, t.tm_min)) return false;
   }
   return true;
 }
@@ -3299,7 +3302,7 @@ void runPendingJob(uint8_t* bitmap, const char* fallbackId) {
   // rig never starts a ~1 h job it would finish deep into the evening and
   // then immediately start another.
   struct tm nowT;
-  if (localNow(nowT) && isNightHour(nowT.tm_hour)) {
+  if (localNow(nowT) && isNightHour(nowT.tm_hour, nowT.tm_min)) {
     sleepUntilMorning();
   } else {
     // Post-display linger: paces polling and lets the board settle before the
