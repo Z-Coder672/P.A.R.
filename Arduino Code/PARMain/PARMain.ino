@@ -74,7 +74,12 @@ struct LidarScanRecord {
   // (year, yday) above, which still mean "a full sweep finished" and are still
   // stamped only at the end -- so a partial record can never read as done.
   uint16_t rowsDone;                    // visit-rows completed, 0..GRID_H
-  uint16_t pad2;
+  // 1 = row 0's cells are PROJECTED, not measured (LIDAR_SKIP_TOP_ROW). This
+  // reuses what was reserved padding rather than appending a field, so the
+  // layout -- and therefore CADENCE_VERSION -- is unchanged: every record ever
+  // written zeroed this byte pair, and 0 is exactly the right value for a
+  // record whose top row was really measured. Costs no re-scan on upgrade.
+  uint16_t topRowProjected;
   int32_t  progYear;                    // day the partial sweep belongs to
   int32_t  progYday;
   uint16_t dist10[GRID_H * GRID_W];     // trimmed mean, tenths of a mm; 0 = none
@@ -2111,7 +2116,7 @@ int displayBitmap(uint8_t* bitmap) {
 //   * a daily VL53L4CD standoff scan of all 666 cells at 10:00 local, whose
 //     results + completion date are written to flash so a reboot doesn't
 //     re-run (or skip) it,
-//   * a night sleep from 20:00 to 10:00 during which the rig ingests nothing.
+//   * a night sleep from 20:30 to 10:00 during which the rig ingests nothing.
 //
 // The board is assumed to be powered 24/7, so this is a *schedule*, not a
 // power-management feature — nothing here uses deep sleep. Deep sleep would
@@ -2140,7 +2145,8 @@ const time_t TIME_VALID_FLOOR = 1735689600;
 // sleep covers [NIGHT_START_HOUR, LIDAR_SCAN_HOUR), so waking always lands on
 // the scan check.
 const int LIDAR_SCAN_HOUR  = 10;   // 10:00 am
-const int NIGHT_START_HOUR = 20;   // 8:00 pm
+const int NIGHT_START_HOUR = 20;   // 8:30 pm
+const int NIGHT_START_MIN  = 30;
 // A scan still owed for today is only STARTED before this hour. The sweep runs
 // ~50 min, and a late boot shouldn't spend the evening scanning and then print
 // into the night — at/after 18:00 the rig sleeps to 10:00 and scans then.
@@ -2212,10 +2218,12 @@ bool timeWaitForSync(unsigned long timeout_ms) {
   return false;
 }
 
-// 20:00 .. 09:59 local. Written as one predicate so the post-print check and
+// 20:30 .. 09:59 local. Written as one predicate so the post-print check and
 // the boot-time check can never disagree about where the night boundary is.
-static inline bool isNightHour(int hour) {
-  return hour >= NIGHT_START_HOUR || hour < LIDAR_SCAN_HOUR;
+static inline bool isNightHour(int hour, int minute) {
+  bool afterStart = hour > NIGHT_START_HOUR ||
+                    (hour == NIGHT_START_HOUR && minute >= NIGHT_START_MIN);
+  return afterStart || hour < LIDAR_SCAN_HOUR;
 }
 
 // ---------------------------------------------------------------- lidar scan
@@ -2250,6 +2258,37 @@ const float SCAN_X_MAX = 0.0f;
 static inline float clampScanX(float x) { return x > SCAN_X_MAX ? SCAN_X_MAX : x; }
 static inline float lidarTargetX(int y, int x) { return clampScanX(grid[y][x].x + LIDAR_OFFSET_X); }
 static inline float lidarTargetY(int y, int x) { return clampScanY(grid[y][x].y + LIDAR_OFFSET_Y); }
+
+// TOP ROW (y=0) IS NOT LIDAR-SCANNED. The colour sensor sits +8 mm above the
+// flip head and clears row 0 fine (scanGrid is untouched), but the lidar sits
+// +14 mm, and at that height the head JAMS against the frame across the
+// right-hand end of the row. Row 0's lidar target is (X 0.0, Y -0.2) at col 36
+// -- hard into the corner -- and because cellAt makes row 0 an EVEN row it
+// sweeps L->R, so the sweep *ends* row 0 sitting in exactly that corner.
+//
+// A jam does not necessarily raise ALARM: the steppers just skip, silently
+// corrupting every later cell until the y==8 rehome. So the row is not visited
+// at the lidar Y at all; its standoff is PROJECTED per column instead (see
+// projectSkippedTopRow) so the stored record stays dense at 666 cells.
+//
+// This mirrors LIDAR_SKIP_TOP_ROW in ScanColorLidarTest, which got the same
+// change on 2026-08-26. PARMain was missed then -- the session's note claimed
+// PARMain "only consumes LIDAR_FIT_CMM, it doesn't measure", but
+// runDailyLidarScan had already landed two weeks earlier (1d35db5, 2026-08-12).
+// Set to 0 to restore the measurement if the interference is ever removed.
+#define LIDAR_SKIP_TOP_ROW 1
+static inline bool lidarRowSkipped(int y) {
+#if LIDAR_SKIP_TOP_ROW
+  return y == 0;
+#else
+  (void)y;
+  return false;
+#endif
+}
+// First row the sweep actually visits. Row 0 is the only skippable row, so this
+// is all the loop bounds need -- the serpentine visit order is unchanged below
+// it, and rowsDone keeps counting from 0 so the resume arithmetic still works.
+const int LIDAR_FIRST_ROW = LIDAR_SKIP_TOP_ROW ? 1 : 0;
 
 // Bring the ranger up. Boot init is flaky (it failed roughly half of observed
 // power-ons on the bench, then ran a full 71-minute pass flawlessly once up),
@@ -2475,7 +2514,137 @@ static inline bool lidarScanDoneOn(const struct tm& t) {
   return cadenceRecValid && cadenceRec.year == t.tm_year && cadenceRec.yday == t.tm_yday;
 }
 
-// One full lidar standoff sweep of all 666 cells, then persist.
+// ------------------------------------------------- skipped top-row projection
+// Row 0 is never measured (see LIDAR_SKIP_TOP_ROW), so fill it per column by
+// least-squares fitting a polynomial in row index to that column's measured
+// cells and evaluating it at y=0 -- the on-device form of the "project the
+// per-column fit onto y=0" rule ScanColorLidarTest applies offline.
+//
+// !! THE FIT IS LINEAR, NOT CUBIC, AND THAT IS DELIBERATE. Do not "restore" the
+// !! cubic to match the offline analysis: that cubic is fit to a SMOOTHED,
+// !! multi-pass-averaged per-column curve, while this one gets a single sweep's
+// !! raw cells, where CLAUDE.md puts per-cell noise at sd ~2.88 mm against only
+// !! ~2.05 mm of real structure. Extrapolating one step past the end of the
+// !! fitted range amplifies that noise hard, and it amplifies with the degree.
+// !!
+// !! Measured on the shipped LIDAR_FIT_CMM table as ground truth (fit rows
+// !! 1..17, project to row 0, 300 trials of added Gaussian per-cell noise),
+// !! mean |error| in mm:
+// !!
+// !!            noise sd:   0.00    1.00    2.88  <- 2.88 is the documented one
+// !!   hold nearest row         0.12    0.81    2.31
+// !!   LINEAR  (shipped)        0.75    0.84    1.37   <- best where it counts
+// !!   quadratic                0.06    0.65    1.88
+// !!   cubic                    0.09    0.98    2.82   <- WORST, and worse than
+// !!                                                      not projecting at all
+// !!
+// !! The cubic only wins on noise-free data, which is the one thing a single
+// !! raw sweep is not. Linear also matches CLAUDE.md's own finding that these
+// !! sweeps support "a one-parameter tilt across 666 cells" and no significant
+// !! higher-order term. Set LIDAR_PROJ_DEGREE to 2 or 3 to change it.
+//
+// NOT table-anchored, deliberately: filling row 0 from LIDAR_FIT_CMM's own row 0
+// plus the column's measured offset scores better still, but these records are
+// what the offline re-fit CONSUMES to rebuild that table -- so anchoring would
+// feed the old table's row 0 back into its own replacement. The record stays
+// self-contained even though it costs accuracy.
+//
+// The fit is CENTRED (t = y - 9) purely for conditioning: uncentred over
+// y in [1,17] the normal matrix spans ~10^7, where the solve starts losing
+// digits. Centred, t spans [-8,8].
+//
+// GUARDED regardless: if the projection lands outside the column's own measured
+// range (plus a margin), or the column has too few points, or the solve is
+// singular, we hold the nearest measured row instead -- a worse estimate, but a
+// bounded one.
+#define LIDAR_PROJ_DEGREE 1                  // 1 = linear (see the table above)
+const int    LIDAR_PROJ_MIN_POINTS   = 8;    // of the 17 rows below the top
+const uint16_t LIDAR_PROJ_MARGIN_T10 = 50;   // 5.0 mm of slack past the column's range
+const int    LIDAR_PROJ_TERMS        = LIDAR_PROJ_DEGREE + 1;
+
+// Gauss-Jordan with partial pivoting on the augmented normal equations, sized
+// for the largest degree we allow. Returns false if the system is singular (a
+// column with too little spread in y).
+static bool lidarSolveFit(double A[4][5], double out[4], int m) {
+  for (int c = 0; c < m; c++) {
+    int piv = c;
+    for (int r = c + 1; r < m; r++) if (fabs(A[r][c]) > fabs(A[piv][c])) piv = r;
+    if (fabs(A[piv][c]) < 1e-9) return false;
+    if (piv != c) for (int k = c; k <= m; k++) { double t = A[c][k]; A[c][k] = A[piv][k]; A[piv][k] = t; }
+    for (int r = 0; r < m; r++) {
+      if (r == c) continue;
+      double f = A[r][c] / A[c][c];
+      for (int k = c; k <= m; k++) A[r][k] -= f * A[c][k];
+    }
+  }
+  for (int c = 0; c < m; c++) out[c] = A[c][m] / A[c][c];
+  return true;
+}
+
+// Fill row 0 of cadenceRec.dist10 in place. Call ONLY after a sweep that ran to
+// completion -- on a partial record the columns below are themselves partial,
+// and projecting from them would silently invent a top row out of a half sweep.
+void projectSkippedTopRow() {
+#if LIDAR_SKIP_TOP_ROW
+  const double T0 = 0.0 - 9.0;             // the centred abscissa of row 0
+  int projected = 0, held = 0;
+
+  for (int x = 0; x < GRID_W; x++) {
+    double S[7] = {0, 0, 0, 0, 0, 0, 0};   // sum t^k, k = 0..2*degree
+    double B[4] = {0, 0, 0, 0};            // sum v*t^k, k = 0..degree
+    int n = 0;
+    uint16_t vmin = 0xFFFF, vmax = 0, nearest = 0;
+
+    for (int y = LIDAR_FIRST_ROW; y < GRID_H; y++) {
+      uint16_t v = cadenceRec.dist10[y * GRID_W + x];
+      if (v == 0) continue;                // cell returned no samples
+      double t = (double)y - 9.0, p = 1.0;
+      for (int k = 0; k < 2 * LIDAR_PROJ_DEGREE + 1; k++) { S[k] += p; p *= t; }
+      p = 1.0;
+      for (int k = 0; k < LIDAR_PROJ_TERMS; k++) { B[k] += (double)v * p; p *= t; }
+      if (nearest == 0) nearest = v;       // rows ascend, so this is the lowest y
+      if (v < vmin) vmin = v;
+      if (v > vmax) vmax = v;
+      n++;
+    }
+
+    if (n == 0) { cadenceRec.dist10[x] = 0; continue; }   // nothing to go on
+
+    uint16_t out = 0;
+    if (n >= LIDAR_PROJ_MIN_POINTS) {
+      double A[4][5];
+      for (int i = 0; i < LIDAR_PROJ_TERMS; i++) {
+        for (int j = 0; j < LIDAR_PROJ_TERMS; j++) A[i][j] = S[i + j];
+        A[i][LIDAR_PROJ_TERMS] = B[i];
+      }
+      double c[4];
+      if (lidarSolveFit(A, c, LIDAR_PROJ_TERMS)) {
+        double v = 0.0, p = 1.0;
+        for (int k = 0; k < LIDAR_PROJ_TERMS; k++) { v += c[k] * p; p *= T0; }
+        double lo = (double)vmin - (double)LIDAR_PROJ_MARGIN_T10;
+        double hi = (double)vmax + (double)LIDAR_PROJ_MARGIN_T10;
+        if (v >= lo && v <= hi && v > 0.0 && v < 65535.0) out = (uint16_t)(v + 0.5);
+      }
+    }
+    if (out == 0) { out = nearest; held++; } else { projected++; }
+    cadenceRec.dist10[x] = out;
+  }
+
+  // pad2 doubles as the "row 0 is synthetic" flag -- see the struct note. It is
+  // set only when at least one column was filled, so a record whose top row is
+  // genuinely absent still reads 0.
+  cadenceRec.topRowProjected = (projected + held) > 0 ? 1 : 0;
+  plog::logf("cadence: top row projected (deg%d fit %d, held %d of %d cols)",
+             LIDAR_PROJ_DEGREE,
+             projected, held, GRID_W);
+#endif
+}
+
+// One full lidar standoff sweep, then persist. 629 cells are MEASURED (rows
+// 1..17); row 0 is skipped at the lidar Y because the head jams there, and its
+// 37 cells are PROJECTED afterwards by projectSkippedTopRow() so the stored
+// record is still dense at 666. cellsOk counts only the measured ones, and
+// topRowProjected flags the synthetic row.
 //
 // Motion conventions are the same ones scanGrid() obeys, and for the same
 // reasons: the flip arm is parked at REST for the whole pass (a dropped arm
@@ -2511,11 +2680,15 @@ void runDailyLidarScan(const struct tm& day) {
   // and the sweep converges even if the underlying fault comes back. Resume
   // only within the SAME local day: a checkpoint from yesterday describes a
   // board that has been printed on since, so it is not partial data any more.
-  int startRow = 0;
+  // LIDAR_FIRST_ROW, not 0: row 0 is never visited at the lidar Y. rowsDone
+  // still counts from row 0, so a resume checkpoint is >= LIDAR_FIRST_ROW+1
+  // already and the max() below only ever bites on the fresh path.
+  int startRow = LIDAR_FIRST_ROW;
   if (cadenceRecValid && cadenceRec.sensorOk &&
       cadenceRec.progYear == day.tm_year && cadenceRec.progYday == day.tm_yday &&
       cadenceRec.rowsDone > 0 && cadenceRec.rowsDone < GRID_H) {
     startRow = (int)cadenceRec.rowsDone;
+    if (startRow < LIDAR_FIRST_ROW) startRow = LIDAR_FIRST_ROW;
     plog::logf("cadence: resuming lidar scan at row %d/%d (%lu cells already measured)",
                startRow, GRID_H, (unsigned long)cadenceRec.cellsOk);
   } else {
@@ -2537,6 +2710,9 @@ void runDailyLidarScan(const struct tm& day) {
     // arm's position is the one thing a 50-minute sweep must not get wrong.
     writeServoUs(SERVO_US_REST, SERVO_50_DEG_SETTLE_MS);
 
+#if LIDAR_SKIP_TOP_ROW
+    plog::log("cadence: row 0 lidar SKIPPED (jams at lidar Y; projected after the sweep)");
+#endif
     const int N = GRID_W * GRID_H;
     const int i0 = startRow * GRID_W;      // serpentine visit index of the resume row
     int y0, x0;
@@ -2593,6 +2769,9 @@ void runDailyLidarScan(const struct tm& day) {
       if (!last) waitForMotion();
     }
     cadenceRec.rowsDone = GRID_H;          // sweep complete
+    // Only now, on a sweep that actually ran to the end -- the columns the fit
+    // reads have to be complete before row 0 is extrapolated from them.
+    projectSkippedTopRow();
   } else {
     // The date is still stamped. A dead ranger must not put the rig into a
     // retry loop that spends the whole day re-attempting a 50-minute sweep;
@@ -2736,7 +2915,7 @@ bool cadenceGate() {
   // sleepUntilMorning() — e.g. the 17 h backstop firing after SNTP stepped the
   // clock backwards — lands straight back in sleep instead of falling through
   // to a scan and a poll at 04:00.
-  while (isNightHour(t.tm_hour) ||
+  while (isNightHour(t.tm_hour, t.tm_min) ||
          (!lidarScanDoneOn(t) && t.tm_hour >= LIDAR_SCAN_CUTOFF_HOUR)) {
     sleepUntilMorning();
     if (!localNow(t)) return false;         // woke with no trusted clock: hold parked
@@ -2749,7 +2928,7 @@ bool cadenceGate() {
     // The sweep runs ~50 min (review F4): re-verify before letting the caller
     // poll — a mid-scan SNTP step could have landed us inside the night
     // window. Returning false re-enters this gate, which then sleeps.
-    if (!localNow(t) || isNightHour(t.tm_hour)) return false;
+    if (!localNow(t) || isNightHour(t.tm_hour, t.tm_min)) return false;
   }
   return true;
 }
@@ -3299,7 +3478,7 @@ void runPendingJob(uint8_t* bitmap, const char* fallbackId) {
   // rig never starts a ~1 h job it would finish deep into the evening and
   // then immediately start another.
   struct tm nowT;
-  if (localNow(nowT) && isNightHour(nowT.tm_hour)) {
+  if (localNow(nowT) && isNightHour(nowT.tm_hour, nowT.tm_min)) {
     sleepUntilMorning();
   } else {
     // Post-display linger: paces polling and lets the board settle before the
