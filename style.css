@@ -1659,6 +1659,37 @@ body.modal-open {
     display: block;
 }
 
+/* "Watch on YouTube" link shown under every embedded recording, always — a
+   blocker- and future-proof way to reach the video when the embed can't play. */
+.video-watch-link {
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+    padding: 0.55rem 1.2rem;
+    font-size: 0.95rem;
+    font-weight: 700;
+    border-radius: 8px;
+    text-decoration: none;
+    background-color: #02b2d9;
+    color: #001014;
+    transition: background-color 0.2s ease, transform 0.2s ease;
+}
+
+.video-watch-link:hover {
+    background-color: #29c6e8;
+    transform: translateY(-2px);
+}
+
+.video-watch-link i {
+    font-size: 1.15em;
+}
+
+.video-watch-link.hidden {
+    display: none;
+}
+
 .gallery-modal-pending a {
     color: #02b2d9;
     text-decoration: none;

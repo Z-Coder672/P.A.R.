@@ -155,6 +155,14 @@ function loadYouTubeIframeApi() {
 // loadYouTubeIframeApi() must have resolved first.
 function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError, onReady, nearEnd = true } = {}) {
     let seeked = false;
+    // Once the player has reported ready, the video is confirmed loaded and
+    // embeddable. A later onError is then almost always a content blocker
+    // killing YouTube's telemetry pings (generate_204 / youtubei log_event) —
+    // the media itself keeps playing — NOT an unavailable video. We pass this
+    // flag to onError so callers can ignore post-ready errors and leave a
+    // working player alone instead of tearing it down (which is what made every
+    // gallery recording flash on for ~0.5s then vanish behind an ad blocker).
+    let readyFired = false;
     const seekNearEnd = (p) => {
         if (seeked || !nearEnd) return;
         const dur = p.getDuration();
@@ -175,6 +183,7 @@ function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError, onRe
         },
         events: {
             onReady: (e) => {
+                readyFired = true;
                 seekNearEnd(e.target);
                 if (autoplay) e.target.playVideo();
                 if (typeof onReady === 'function') onReady(e.target);
@@ -182,7 +191,8 @@ function createNearEndPlayer(mountEl, videoId, { autoplay = false, onError, onRe
             onStateChange: (e) => {
                 if (e.data === YT.PlayerState.PLAYING) seekNearEnd(e.target);
             },
-            onError: () => { if (typeof onError === 'function') onError(); },
+            // afterReady=true => player already initialized; treat as non-fatal.
+            onError: () => { if (typeof onError === 'function') onError(readyFired); },
         },
     });
 }
@@ -299,8 +309,12 @@ async function loadLatestRecording() {
     wrapper.className = 'latest-iframe-wrapper';
     const caption = document.createElement('p');
     caption.className = 'latest-caption';
+    // Persistent watch link under the embed; href set per-candidate in tryNext.
+    const watchLink = youtubeWatchLink('');
+    watchLink.classList.add('hidden');
     container.appendChild(wrapper);
     container.appendChild(caption);
+    container.appendChild(watchLink);
 
     // Embed the newest candidate; if its video is gone / not embeddable
     // (onError), destroy it and fall through to the next-newest recording.
@@ -312,17 +326,28 @@ async function loadLatestRecording() {
             latestVideoPlayer = null;
         }
         wrapper.innerHTML = '';
+        watchLink.classList.add('hidden');
         if (idx >= candidates.length) {
             renderEmpty();
             return;
         }
         const it = candidates[idx++];
         caption.textContent = it.name || 'Latest P.A.R. recording';
+        // Always offer a direct watch link under the embed.
+        watchLink.href = 'https://www.youtube.com/watch?v=' + encodeURIComponent(it.video_id);
+        watchLink.classList.remove('hidden');
         const mount = document.createElement('div');
         wrapper.appendChild(mount);
         latestVideoPlayer = createNearEndPlayer(mount, it.video_id, {
             autoplay: true,
-            onError: () => { if (token === latestVideoToken) setTimeout(tryNext, 0); },
+            // A post-ready error is almost always a content blocker killing
+            // telemetry; the video keeps playing, so leave it. Only skip to the
+            // next recording when the error fires before the player loaded (the
+            // video is actually gone / not embeddable).
+            onError: (afterReady) => {
+                if (afterReady) return;
+                if (token === latestVideoToken) setTimeout(tryNext, 0);
+            },
         });
     };
     tryNext();
@@ -495,6 +520,7 @@ function openQueueModal(item) {
     const noSnapshotEl = document.getElementById('galleryModalNoSnapshot');
     const pendingEl = document.getElementById('galleryModalPending');
     const queueEl = document.getElementById('galleryModalQueue');
+    const watchEl = document.getElementById('galleryModalWatch');
     const artistEl = document.getElementById('galleryModalArtist');
 
     imgEl.classList.add('hidden');
@@ -503,6 +529,11 @@ function openQueueModal(item) {
     noSnapshotEl.classList.add('hidden');
     pendingEl.classList.add('hidden');
     queueEl.classList.add('hidden');
+    // Queue items never have a recording; clear any embed + link left over from
+    // a previously-viewed gallery entry (same modal DOM).
+    resetGalleryModalVideo();
+    watchEl.classList.add('hidden');
+    watchEl.removeAttribute('href');
 
     nameEl.textContent = item.name || '(unnamed)';
     setGalleryModalArtist(artistEl, item.artist);
@@ -565,6 +596,7 @@ function openGalleryModal(item) {
     const pendingEl = document.getElementById('galleryModalPending');
     const queueEl = document.getElementById('galleryModalQueue');
     const videoEl = document.getElementById('galleryModalVideo');
+    const watchEl = document.getElementById('galleryModalWatch');
     const artistEl = document.getElementById('galleryModalArtist');
 
     nameEl.textContent = '';
@@ -575,6 +607,8 @@ function openGalleryModal(item) {
     noSnapshotEl.classList.add('hidden');
     pendingEl.classList.add('hidden');
     queueEl.classList.add('hidden');
+    watchEl.classList.add('hidden');
+    watchEl.removeAttribute('href');
     resetGalleryModalVideo();
 
     nameEl.textContent = item.name || '(unnamed)';
@@ -606,6 +640,9 @@ function openGalleryModal(item) {
     }
 
     if (item.video_id && /^[A-Za-z0-9_-]{11}$/.test(item.video_id)) {
+        // Always show the watch link below the embed, then try to embed.
+        watchEl.href = 'https://www.youtube.com/watch?v=' + encodeURIComponent(item.video_id);
+        watchEl.classList.remove('hidden');
         maybeEmbedRecording(item.video_id, videoEl);
     }
 }
@@ -627,6 +664,21 @@ function resetGalleryModalVideo() {
         videoEl.innerHTML = '';
         videoEl.classList.add('hidden');
     }
+}
+
+// A "Watch on YouTube" link shown UNDER every embedded recording, always. The
+// embed is the happy path, but a content blocker or a future YouTube change can
+// break it with no reliable signal to the page — so rather than detect failure,
+// we just always give the viewer a link straight to the watch page (which keeps
+// working when an embed doesn't). Points at videoId's watch URL.
+function youtubeWatchLink(videoId) {
+    const link = document.createElement('a');
+    link.className = 'video-watch-link';
+    link.href = 'https://www.youtube.com/watch?v=' + encodeURIComponent(videoId);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.innerHTML = '<i class="fa-brands fa-youtube"></i> Watch on YouTube';
+    return link;
 }
 
 async function maybeEmbedRecording(videoId, container) {
@@ -655,9 +707,14 @@ async function maybeEmbedRecording(videoId, container) {
             ready = true;
             if (wantsPlay) play(p);
         },
-        onError: () => {
-            // Deleted / not embeddable — hide the video area entirely.
+        onError: (afterReady) => {
             if (token !== galleryModalToken) return;
+            // Error AFTER the player loaded => almost certainly a content
+            // blocker killing telemetry, not a bad video. Leave the (playing)
+            // embed in place rather than blanking it.
+            if (afterReady) return;
+            // Error BEFORE ready => genuinely deleted / not embeddable; hide the
+            // dead embed. The "Watch on YouTube" link below it stays regardless.
             resetGalleryModalVideo();
         },
     });
