@@ -1,0 +1,4 @@
+# Admin panel. Access control is the PHP session (see lib/admin_auth.php);
+# this only makes /admin/ resolve to index.php.
+DirectoryIndex index.php
+Options -Indexes
