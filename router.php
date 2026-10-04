@@ -8,6 +8,20 @@ if (php_sapi_name() === 'cli-server') {
         exit;
     }
     
+    // A directory with its own index.php (/admin/) — what Apache's
+    // DirectoryIndex does in production. Redirect to the trailing slash first,
+    // as mod_dir would, so the page's relative URLs resolve inside it.
+    // /gallery is a directory too but has no index.php, so it stays an SPA route.
+    $dirIndex = __DIR__ . rtrim($requested, '/') . '/index.php';
+    if ($requested !== '/' && strpos($requested, '..') === false && is_file($dirIndex)) {
+        if (substr($requested, -1) !== '/') {
+            header('Location: ' . $requested . '/', true, 301);
+            exit;
+        }
+        require $dirIndex;
+        exit;
+    }
+
     // Serve actual static files
     if (file_exists(__DIR__ . $requested) && is_file(__DIR__ . $requested)) {
         return false;
