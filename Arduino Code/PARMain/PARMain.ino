@@ -182,10 +182,16 @@ const int SERVO_US_REST = 565;
 // board spans 793..921µs (24.15°..36.56°), mean 853µs — so nothing clamps at
 // SERVO_US_MIN and the reference cell (0,17) lands at 795µs (802µs before
 // RELEASE_EDGE_ROW_TRIM_MM was added; FlipAllTest's comment still cites 802).
-const int SERVO_US_RELEASE = 807;
+// 2026-10-07: lowered 7° in two steps (807 -> 755 -> 734µs, 25.5° -> 18.5°) for the
+// replacement MG90S, whose arm reaches further at the same pulse; the second 2°
+// came after a two-row test at 755 left the top row slightly over-rotated. Older
+// figures in these comments (802/793..921µs etc.) predate this and sit ~73µs high.
+const int SERVO_US_RELEASE = 734;
 // ENGAGE is deliberately NOT lidar-compensated — the 90° stage-1 rotation only
 // has to clear the disc, so it is a fixed 75° (1317µs = 74.97°) everywhere.
-const int SERVO_US_ENGAGE = 1317;  // 75°, uncompensated
+// 2026-10-07: lowered 5° (1317 -> 1265µs, 75° -> 70°) for the replacement MG90S,
+// which stalled at the end of travel at the old pulse.
+const int SERVO_US_ENGAGE = 1265;  // 70°, uncompensated
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 // Lowered arm angles below RELEASE. RELEASE2 (~10° below) is the second-catch

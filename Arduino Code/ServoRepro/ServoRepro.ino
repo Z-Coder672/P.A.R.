@@ -21,8 +21,11 @@ const float Y_TRAVEL = 412.0f;
 
 // ---- Production servo pulse widths / settles (match PARMain.ino) ----
 const int SERVO_US_REST    = 565;
-const int SERVO_US_RELEASE = 1018;  // ≈46° (raised 8° from the prior 936/≈38°)
-const int SERVO_US_ENGAGE  = 1471;
+// 2026-10-07: RELEASE -7° (-73µs) and ENGAGE -5° (-52µs) for the replacement MG90S,
+// whose arm reaches further at the same pulse — the same shift PARMain/FlipAllTest
+// took (807->734, 1317->1265). This sketch is otherwise still on its own older regime.
+const int SERVO_US_RELEASE = 945;
+const int SERVO_US_ENGAGE  = 1419;
 const int SERVO_90_DEG_SETTLE_MS = 300;
 const int SERVO_50_DEG_SETTLE_MS = 100;
 const float FLIP_OFFSET_X = 16.8f;

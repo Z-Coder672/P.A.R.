@@ -20,8 +20,11 @@ const int SERVO_TX_PIN = D9;
 // (MIN_PULSE_WIDTH=544, MAX_PULSE_WIDTH=2400 over 0–180°) so the angles the
 // rig was tuned for stay the same: REST≈2°, RELEASE≈58°, ENGAGE≈90°.
 const int SERVO_US_REST    = 565;
-const int SERVO_US_RELEASE = 1142;  // ≈58° (raised 8° from the prior 1060/≈50°)
-const int SERVO_US_ENGAGE  = 1471;
+// 2026-10-07: RELEASE -7° (-73µs) and ENGAGE -5° (-52µs) for the replacement MG90S,
+// whose arm reaches further at the same pulse — the same shift PARMain/FlipAllTest
+// took (807->734, 1317->1265). This sketch is otherwise still on its own older regime.
+const int SERVO_US_RELEASE = 1069;
+const int SERVO_US_ENGAGE  = 1419;
 const int SERVO_90_DEG_SETTLE_MS  = 300;
 const int SERVO_50_DEG_SETTLE_MS  = 100;
 const float FLIP_OFFSET_X = 16.8f;

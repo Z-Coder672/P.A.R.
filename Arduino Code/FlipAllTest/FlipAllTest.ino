@@ -25,10 +25,16 @@ const int SERVO_US_REST    = 565;
 // chosen so the bottom-left cell (0,17) — standoff 40.31 mm, i.e. -0.19 mm from
 // LIDAR_REF_MM — comes out of compensatedUs() at 802µs = 25.02°, the commanded
 // release angle the rig is tuned for. Uncompensated it is 25.51°.
-const int SERVO_US_RELEASE = 807;
+// 2026-10-07: lowered 7° in two steps (807 -> 755 -> 734µs, 25.5° -> 18.5°) for the
+// replacement MG90S, whose arm reaches further at the same pulse; the second 2°
+// came after a two-row test at 755 left the top row slightly over-rotated. Older
+// figures in these comments (802/793..921µs etc.) predate this and sit ~73µs high.
+const int SERVO_US_RELEASE = 734;
 // ENGAGE is deliberately NOT lidar-compensated — the 90° stage-1 rotation only
 // has to clear the disc, so it is a fixed 75° (1317µs = 74.97°) everywhere.
-const int SERVO_US_ENGAGE  = 1317;  // 75°, uncompensated
+// 2026-10-07: lowered 5° (1317 -> 1265µs, 75° -> 70°) for the replacement MG90S,
+// which stalled at the end of travel at the old pulse.
+const int SERVO_US_ENGAGE  = 1265;  // 70°, uncompensated
 const int SERVO_90_DEG_SETTLE_MS  = 300;
 const int SERVO_50_DEG_SETTLE_MS  = 100;
 // Lowered arm angle ~10° below RELEASE (scan sweep + second-catch pass in
