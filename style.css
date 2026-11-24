@@ -1360,6 +1360,164 @@ body.modal-open {
     color: #cccccc;
 }
 
+/* In The News Tab */
+#news.tab-content.active {
+    align-items: flex-start;
+    justify-content: flex-start;
+    flex-direction: column;
+}
+
+.news-container {
+    width: 100%;
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 1rem 0;
+}
+
+.news-header {
+    margin-bottom: 2rem;
+}
+
+.news-header h2 {
+    color: #02b2d9;
+    margin-bottom: 0.75rem;
+    font-size: 1.6rem;
+}
+
+.news-header p {
+    color: #cccccc;
+}
+
+.news-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.25rem;
+}
+
+.news-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1.5rem;
+    background-color: #141414;
+    border: 1px solid #2a2a2a;
+    border-radius: 10px;
+    transition: border-color 0.2s ease;
+}
+
+.news-card:hover {
+    border-color: #02b2d9;
+}
+
+.news-meta {
+    margin: 0;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #888888;
+}
+
+.news-outlet {
+    color: #02b2d9;
+}
+
+.news-headline {
+    margin: 0;
+    font-size: 1.15rem;
+    line-height: 1.35;
+}
+
+.news-headline a {
+    color: #ffffff;
+    text-decoration: none;
+}
+
+.news-headline a:hover {
+    color: #02b2d9;
+}
+
+.news-quote {
+    margin: 0;
+    padding-left: 0.9rem;
+    border-left: 2px solid #333333;
+    color: #bbbbbb;
+    font-style: italic;
+    line-height: 1.55;
+    flex: 1;
+}
+
+.news-read {
+    align-self: flex-start;
+    color: #02b2d9;
+    font-weight: 700;
+    text-decoration: none;
+}
+
+.news-read i {
+    font-size: 0.8em;
+    margin-left: 0.25rem;
+    transition: transform 0.2s ease;
+}
+
+.news-read:hover i {
+    transform: translateX(3px);
+}
+
+/* "As featured in" strip under the Latest print */
+.home-featured-in {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+    text-decoration: none;
+    color: #777777;
+    font-size: 0.8rem;
+}
+
+.home-featured-in-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+}
+
+.home-featured-in-outlets {
+    color: #999999;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    line-height: 1.6;
+    transition: color 0.2s ease;
+}
+
+.home-featured-in:hover .home-featured-in-outlets {
+    color: #02b2d9;
+}
+
+@media (max-width: 768px) {
+    .news-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .navbar-menu {
+        flex-wrap: wrap;
+        justify-content: center;
+        row-gap: 0.5rem;
+    }
+}
+
+/* Five nav items: tighten on phones so they stay on one row. */
+@media (max-width: 480px) {
+    .navbar-container {
+        padding: 0 0.75rem;
+    }
+
+    .navbar-menu {
+        column-gap: 0.75rem;
+        font-size: 0.9rem;
+    }
+}
+
 /* Gallery Tab */
 #gallery.tab-content.active {
     align-items: flex-start;

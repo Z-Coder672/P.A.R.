@@ -112,6 +112,7 @@ function getActiveTabFromUrl() {
     const pathname = window.location.pathname.replace(/\/$/, '');
     if (pathname === '/upload') return 'upload';
     if (pathname === '/gallery') return 'gallery';
+    if (pathname === '/news') return 'news';
     if (pathname === '/about') return 'about';
     return 'latest';
 }
