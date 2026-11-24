@@ -1402,11 +1402,15 @@ body.modal-open {
     background-color: #141414;
     border: 1px solid #2a2a2a;
     border-radius: 10px;
-    transition: border-color 0.2s ease;
+    position: relative;
+    cursor: pointer;
+    transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
-.news-card:hover {
+.news-card:hover,
+.news-card:has(a:focus-visible) {
     border-color: #02b2d9;
+    transform: translateY(-2px);
 }
 
 .news-meta {
@@ -1433,7 +1437,25 @@ body.modal-open {
     text-decoration: none;
 }
 
-.news-headline a:hover {
+/* Stretched link: the headline's anchor covers the whole card, so the
+   entire card is one link (no nested or duplicate anchors). */
+.news-headline a::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+}
+
+.news-headline a:focus-visible {
+    outline: none;
+}
+
+.news-card:has(a:focus-visible) {
+    outline: 2px solid #02b2d9;
+    outline-offset: 2px;
+}
+
+.news-card:hover .news-headline a {
     color: #02b2d9;
 }
 
@@ -1460,7 +1482,7 @@ body.modal-open {
     transition: transform 0.2s ease;
 }
 
-.news-read:hover i {
+.news-card:hover .news-read i {
     transform: translateX(3px);
 }
 
