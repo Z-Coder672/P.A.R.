@@ -17,6 +17,7 @@
                 <li><a href="/latest" class="nav-link" data-tab="latest">Latest</a></li>
                 <li><a href="/upload" class="nav-link" data-tab="upload">Submit Art</a></li>
                 <li><a href="/gallery" class="nav-link" data-tab="gallery">Gallery</a></li>
+                <li><a href="/news" class="nav-link" data-tab="news">In The News</a></li>
                 <li><a href="/about" class="nav-link" data-tab="about">About</a></li>
             </ul>
         </div>
@@ -55,6 +56,11 @@
             <div class="home-featured reveal">
                 <p class="home-featured-label">Latest print</p>
                 <div class="latest-container"></div>
+                <!-- Sibling of .latest-container, which loadLatestRecording() clears. -->
+                <a href="/news" class="home-featured-in nav-link" data-tab="news">
+                    <span class="home-featured-in-label">As featured in</span>
+                    <span class="home-featured-in-outlets">Hackaday &middot; Arduino Blog &middot; Hackster.io &middot; Makers Army &middot; Open Electronics &middot; Electronics Weekly</span>
+                </a>
             </div>
 
             <!-- Showcase: squisk assembly -->
@@ -288,6 +294,54 @@
                         <div id="galleryModalVideo" class="gallery-modal-video hidden"></div>
                         <a id="galleryModalWatch" class="video-watch-link hidden" target="_blank" rel="noopener noreferrer"><i class="fa-brands fa-youtube"></i> Watch on YouTube</a>
                     </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- In The News Tab (newest first) -->
+        <section id="news" class="tab-content">
+            <div class="news-container">
+                <header class="news-header">
+                    <h2>In The News</h2>
+                    <p>Thanks to all of these outlets for finding P.A.R. and taking the time to write about it!</p>
+                </header>
+                <div class="news-grid">
+                    <article class="news-card">
+                        <p class="news-meta"><span class="news-outlet">Makers Army</span> &middot; <time datetime="2026-10-14">Oct 14, 2026</time></p>
+                        <h3 class="news-headline"><a href="https://makersarmy.com/articles/par-robot-wall-pixel-art" target="_blank" rel="noopener noreferrer">One Robot, 1,000 Printed Parts and a Wall of Pixel Art</a></h3>
+                        <blockquote class="news-quote" cite="https://makersarmy.com/articles/par-robot-wall-pixel-art">&ldquo;It is painfully slow compared with an LED screen. That is the point. Watching the image arrive is the artwork, in the same way a pen plotter is more mesmerising than a page appearing from an office printer.&rdquo;</blockquote>
+                        <a class="news-read" href="https://makersarmy.com/articles/par-robot-wall-pixel-art" target="_blank" rel="noopener noreferrer">Read article <i class="fa-solid fa-arrow-right"></i></a>
+                    </article>
+                    <article class="news-card">
+                        <p class="news-meta"><span class="news-outlet">Open Electronics</span> &middot; <time datetime="2026-09-20">Sep 20, 2026</time></p>
+                        <h3 class="news-headline"><a href="https://www.open-electronics.org/p-a-r-a-robot-that-draws-pixel-art-by-flipping-disks/" target="_blank" rel="noopener noreferrer">P.A.R.: a robot that draws pixel art by flipping disks</a></h3>
+                        <blockquote class="news-quote" cite="https://www.open-electronics.org/p-a-r-a-robot-that-draws-pixel-art-by-flipping-disks/">&ldquo;Assembling the 666 squisks requires patience and precision, but the result is a mechanical display unlike any other.&rdquo;</blockquote>
+                        <a class="news-read" href="https://www.open-electronics.org/p-a-r-a-robot-that-draws-pixel-art-by-flipping-disks/" target="_blank" rel="noopener noreferrer">Read article <i class="fa-solid fa-arrow-right"></i></a>
+                    </article>
+                    <article class="news-card">
+                        <p class="news-meta"><span class="news-outlet">Hackster.io</span> &middot; <time datetime="2026-09">Sep 2026</time></p>
+                        <h3 class="news-headline"><a href="https://www.hackster.io/news/this-flip-squisk-display-is-nothing-like-a-flip-disc-display-864537b23f5f" target="_blank" rel="noopener noreferrer">This &ldquo;Flip-Squisk&rdquo; Display Is Nothing Like a Flip-Disc Display</a></h3>
+                        <blockquote class="news-quote" cite="https://www.hackster.io/news/this-flip-squisk-display-is-nothing-like-a-flip-disc-display-864537b23f5f">&ldquo;It is much slower than a traditional flip-disc display, but that&rsquo;s okay. This is an art piece, not a departure board in a train station that needs a practical refresh rate.&rdquo;</blockquote>
+                        <a class="news-read" href="https://www.hackster.io/news/this-flip-squisk-display-is-nothing-like-a-flip-disc-display-864537b23f5f" target="_blank" rel="noopener noreferrer">Read article <i class="fa-solid fa-arrow-right"></i></a>
+                    </article>
+                    <article class="news-card">
+                        <p class="news-meta"><span class="news-outlet">Electronics Weekly</span> &middot; <time datetime="2026-09-01">Sep 1, 2026</time></p>
+                        <h3 class="news-headline"><a href="https://www.electronicsweekly.com/blogs/gadget-master/displayscreen/pixel-art-robot-offers-one-flipped-squisk-at-a-time-2026-09/" target="_blank" rel="noopener noreferrer">Pixel Art Robot draws one flipped squisk at a time</a></h3>
+                        <blockquote class="news-quote" cite="https://www.electronicsweekly.com/blogs/gadget-master/displayscreen/pixel-art-robot-offers-one-flipped-squisk-at-a-time-2026-09/">&ldquo;There&rsquo;s so much to learn. In my case, what exactly is a flip-squisk?!&rdquo;</blockquote>
+                        <a class="news-read" href="https://www.electronicsweekly.com/blogs/gadget-master/displayscreen/pixel-art-robot-offers-one-flipped-squisk-at-a-time-2026-09/" target="_blank" rel="noopener noreferrer">Read article <i class="fa-solid fa-arrow-right"></i></a>
+                    </article>
+                    <article class="news-card">
+                        <p class="news-meta"><span class="news-outlet">Arduino Blog</span> &middot; <time datetime="2026-08-31">Aug 31, 2026</time></p>
+                        <h3 class="news-headline"><a href="https://blog.arduino.cc/2026/08/31/p-a-r-is-a-flip-squisk-display-that-draws-your-pixel-art/" target="_blank" rel="noopener noreferrer">P.A.R. is a flip-squisk display that draws your pixel art</a></h3>
+                        <blockquote class="news-quote" cite="https://blog.arduino.cc/2026/08/31/p-a-r-is-a-flip-squisk-display-that-draws-your-pixel-art/">&ldquo;Instead, there is a robot behind the display that reaches over to each squisk and physically flips it. There are no solenoids or magnets. That robot is kind of like a pen plotter turned up vertically, with a servo-actuated pin that pushes squisks around.&rdquo;</blockquote>
+                        <a class="news-read" href="https://blog.arduino.cc/2026/08/31/p-a-r-is-a-flip-squisk-display-that-draws-your-pixel-art/" target="_blank" rel="noopener noreferrer">Read article <i class="fa-solid fa-arrow-right"></i></a>
+                    </article>
+                    <article class="news-card">
+                        <p class="news-meta"><span class="news-outlet">Hackaday</span> &middot; <time datetime="2026-08-31">Aug 31, 2026</time></p>
+                        <h3 class="news-headline"><a href="https://hackaday.com/2026/08/31/a-flip-disc-display-that-does-it-slow-and-steady/" target="_blank" rel="noopener noreferrer">A Flip Disc Display That Does It Slow And Steady</a></h3>
+                        <blockquote class="news-quote" cite="https://hackaday.com/2026/08/31/a-flip-disc-display-that-does-it-slow-and-steady/">&ldquo;[Zimm] has built an altogether different kind of flip disc display, though, which gets around this with a complexity all its own.&rdquo;</blockquote>
+                        <a class="news-read" href="https://hackaday.com/2026/08/31/a-flip-disc-display-that-does-it-slow-and-steady/" target="_blank" rel="noopener noreferrer">Read article <i class="fa-solid fa-arrow-right"></i></a>
+                    </article>
                 </div>
             </div>
         </section>
